@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robo-collector-camera"
+version = "0.1.0"
+description = "Minimal RealSense ZMQ camera publisher/client for robot data collection"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.23",
+  "opencv-python>=4.8",
+  "pyzmq>=25",
+  "msgpack>=1.0",
+]
+
+[project.optional-dependencies]
+realsense = [
+  "pyrealsense2>=2.54",
+]
+
+[project.scripts]
+robo-camera-realsense-server = "robo_collector_camera.server_realsense:main"
+robo-camera-viewer = "robo_collector_camera.viewer:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["robo_collector_camera*"]
+

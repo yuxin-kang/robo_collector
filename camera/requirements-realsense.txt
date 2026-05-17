@@ -1,0 +1,6 @@
+numpy>=1.23
+opencv-python>=4.8
+pyzmq>=25
+msgpack>=1.0
+pyrealsense2>=2.54
+

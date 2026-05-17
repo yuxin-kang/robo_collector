@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: robo-collector-camera
+Version: 0.1.0
+Summary: Minimal RealSense ZMQ camera publisher/client for robot data collection
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.23
+Requires-Dist: opencv-python>=4.8
+Requires-Dist: pyzmq>=25
+Requires-Dist: msgpack>=1.0
+Provides-Extra: realsense
+Requires-Dist: pyrealsense2>=2.54; extra == "realsense"
