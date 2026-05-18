@@ -1,3 +1,0 @@
-[console_scripts]
-robo-camera-realsense-server = robo_collector_camera.server_realsense:main
-robo-camera-viewer = robo_collector_camera.viewer:main

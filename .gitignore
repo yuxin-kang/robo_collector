@@ -1,0 +1,88 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python packaging/build artifacts
+*.egg-info/
+.eggs/
+*.egg
+*.whl
+build/
+dist/
+wheelhouse/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+.venv_*/
+venv/
+env/
+
+# Test/type/lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ROS/colcon generated outputs
+install/
+log/
+logs/
+colcon_logs/
+rosbag2_*/
+*.bag
+*.bag.active
+*.db3
+*.mcap
+
+# CMake generated files outside colcon build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Data collection outputs at repository root
+/data/
+/datasets/
+/episodes/
+/recordings/
+/captures/
+/outputs/
+/runs/
+*.parquet
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.zarr/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+
+# Local config/secrets
+.env
+.env.*
+*.local
+*.log
+
+# Editor/OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local agent/runtime state
+.omx/
+
+# Legacy root camera artifacts after moving source package to src/camera/
+/camera/
