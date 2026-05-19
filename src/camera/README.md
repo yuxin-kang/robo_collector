@@ -4,9 +4,9 @@ Minimal RealSense camera publisher/client for G1 data collection.
 
 This module is intentionally small:
 
-- Robot side: read Intel RealSense color/depth frames and publish over ZMQ.
+- Robot side: read one or more Intel RealSense RGB streams and publish a composed packet over ZMQ.
 - Host side: receive latest frame and decode to NumPy arrays.
-- Transport: ZMQ PUB/SUB + msgpack + JPEG for RGB + PNG for depth.
+- Transport: ZMQ PUB/SUB + msgpack + JPEG for RGB.
 
 ## Directory
 
@@ -34,18 +34,30 @@ On the robot Jetson NX:
 cd /path/to/robo_collector/src/camera
 bash scripts/setup_camera_env.sh --server
 source .venv_camera/bin/activate
-bash scripts/run_realsense_server.sh --port 5555
+bash scripts/run_realsense_server.sh --list-devices
 ```
 
-Default output streams:
-
-- `ego_view`: RGB image, JPEG encoded, decoded as `uint8 [H, W, 3]`.
-- `ego_view_depth`: depth image, PNG encoded, decoded as raw depth array.
-
-Disable depth if you only want RGB:
+Dual-camera RGB publisher:
 
 ```bash
-bash scripts/run_realsense_server.sh --port 5555 --no-depth
+bash scripts/run_realsense_server.sh \
+  --camera head:<D405_SERIAL> \
+  --camera ego_view:<D435I_SERIAL> \
+  --port 5555 \
+  --width 640 --height 480 --fps 30 \
+  --jpeg-quality 80 \
+  --no-depth
+```
+
+Output streams:
+
+- `head`: D405 level-view RGB image, JPEG encoded, decoded as `uint8 [H, W, 3]`.
+- `ego_view`: D435i overhead RGB image, JPEG encoded, decoded as `uint8 [H, W, 3]`.
+
+Legacy single-camera mode:
+
+```bash
+bash scripts/run_realsense_server.sh --serial <SERIAL> --port 5555 --no-depth
 ```
 
 ## Host Side: Camera Client
@@ -74,26 +86,29 @@ camera = CameraClient("192.168.123.164", 5555)
 packet = camera.read(timeout_ms=10)
 
 if packet is not None:
-    image = packet["images"]["ego_view"]
-    timestamp_ns = packet["timestamps"]["ego_view"]
+    head = packet["images"]["head"]
+    ego_view = packet["images"]["ego_view"]
+    head_timestamp_sec = packet["timestamps"]["head"]
 ```
 
 ## Message Format
 
 ```python
 {
-    "schema": "robo_collector_camera.v1",
+    "schema": "robo_collector_camera.v2",
     "timestamps": {
-        "ego_view": 1770000000000000000,
-        "ego_view_depth": 1770000000000000000,
+        "head": 1770000000.0,
+        "ego_view": 1770000000.0,
     },
     "images": {
+        "head": b"...jpg bytes...",
         "ego_view": b"...jpg bytes...",
-        "ego_view_depth": b"...png bytes...",
     },
     "metadata": {
-        "camera": "realsense",
-        "serial": "...",
+        "cameras": {
+            "head": {"serial": "<D405_SERIAL>", "device_info": {...}},
+            "ego_view": {"serial": "<D435I_SERIAL>", "device_info": {...}},
+        },
         "width": 640,
         "height": 480,
         "fps": 30,

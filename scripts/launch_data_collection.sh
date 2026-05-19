@@ -4,9 +4,11 @@ set -euo pipefail
 SESSION="robo_data_collection"
 CAMERA_HOST="192.168.123.164"
 CAMERA_PORT="5555"
-CAMERA_STREAM="ego_view"
+CAMERA_STREAM=""
+CAMERA_STREAMS="head,ego_view"
 ROOT_OUTPUT_DIR="outputs"
 DATASET_NAME=""
+FIELD_CONFIG=""
 FPS="50"
 
 while [[ $# -gt 0 ]]; do
@@ -25,6 +27,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --camera-stream)
       CAMERA_STREAM="$2"
+      CAMERA_STREAMS=""
+      shift 2
+      ;;
+    --camera-streams)
+      CAMERA_STREAMS="$2"
       shift 2
       ;;
     --root-output-dir)
@@ -33,6 +40,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dataset-name)
       DATASET_NAME="$2"
+      shift 2
+      ;;
+    --field-config)
+      FIELD_CONFIG="$2"
       shift 2
       ;;
     --fps)
@@ -64,13 +75,22 @@ COLLECTOR_ARGS=(
   "--ros-args"
   "-p" "camera_host:=${CAMERA_HOST}"
   "-p" "camera_port:=${CAMERA_PORT}"
-  "-p" "camera_stream:=${CAMERA_STREAM}"
   "-p" "root_output_dir:=${ROOT_OUTPUT_DIR}"
   "-p" "fps:=${FPS}"
 )
 
+if [[ -n "$CAMERA_STREAMS" ]]; then
+  COLLECTOR_ARGS+=("-p" "camera_streams:=${CAMERA_STREAMS}")
+else
+  COLLECTOR_ARGS+=("-p" "camera_stream:=${CAMERA_STREAM}")
+fi
+
 if [[ -n "$DATASET_NAME" ]]; then
   COLLECTOR_ARGS+=("-p" "dataset_name:=${DATASET_NAME}")
+fi
+
+if [[ -n "$FIELD_CONFIG" ]]; then
+  COLLECTOR_ARGS+=("-p" "field_config_path:=${FIELD_CONFIG}")
 fi
 
 quote_args() {

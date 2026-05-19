@@ -58,6 +58,7 @@ python -m pip install \
   numpy \
   pyzmq \
   msgpack \
+  PyYAML \
   pyarrow
 
 if [[ "$WITH_LEROBOT" == "1" ]]; then

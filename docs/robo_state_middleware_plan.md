@@ -73,6 +73,7 @@ robo_state_msgs/RobotLowState robot_state
 sensor_msgs/Imu imu
 
 float32[29] target_joint_pos
+float32[45] aligned_target_pos
 float32[29] action
 float32[1545] stepit_observation
 float32 observation_l2_error
@@ -85,7 +86,6 @@ string[] missing_optional_fields
 策略输入字段按以下顺序拼接为 `flattened`：
 
 ```text
-float32[435] motion_joint_pos
 float32[90] relative_ori_6d
 float32[45] motion_anchor_lin_vel_b
 float32[45] motion_anchor_ang_vel_b
@@ -95,7 +95,7 @@ float32[290] joint_pos_rel_history
 float32[290] joint_vel_history
 float32[290] action_history
 
-float32[1545] flattened
+float32[1110] flattened
 ```
 
 ### `RobotLowState.msg`
@@ -137,9 +137,9 @@ float32[] foot_force
 /stepit/imu
 /stepit/status
 /stepit/field/last_target_joint_pos
+/stepit/field/aligned_target_pos
 /stepit/field/action
 /stepit/field/observation
-/stepit/field/motion_joint_pos
 /stepit/field/relative_ori_6d
 /stepit/field/motion_anchor_lin_vel_b
 /stepit/field/motion_anchor_ang_vel_b
@@ -152,13 +152,13 @@ float32[] foot_force
 
 ## 节点行为
 
-每次收到 `/stepit/field/last_target_joint_pos`：
+每次收到 `/stepit/field/aligned_target_pos`：
 
-1. 校验 `target_joint_pos` 为 29 维。
+1. 校验 `aligned_target_pos` 为 45 维。
 2. 检查必需字段是否齐全且未超过 `max_cache_age_sec`。
 3. 校验所有 StepIt field 的维度。
-4. 按固定顺序拼接 9 个策略输入字段为 `PolicyState.flattened`，总维度必须为 1545。
-5. 与 `/stepit/field/observation` 计算 `observation_l2_error`。
+4. 按固定顺序拼接 8 个策略状态输入字段为 `PolicyState.flattened`，总维度必须为 1110。
+5. 保留 `/stepit/field/observation` 1545 维 actor 原始输入用于调试。
 6. 发布 `/robo_state/sample`。
 
 错误处理：
@@ -223,11 +223,11 @@ ros2 run robo_state robo_state_node --ros-args \
 
 单元测试：
 
-- 9 个策略输入字段拼接顺序必须等于 1545 维。
+- 8 个策略状态输入字段拼接顺序必须等于 1110 维。
 - `JointState` 按 `*_joint`、`*_cmd`、`*_gain`、foot force 正确拆分。
 - 缺字段时不发布 sample。
 - 维度错误时发布 error status。
-- `observation_l2_error` 计算正确。
+- `/stepit/field/observation` 1545 维原始 actor 输入可保留用于调试。
 
 现场 smoke test：
 
@@ -240,7 +240,8 @@ ros2 topic echo --once /robo_state/status
 ## 验收标准
 
 - `/robo_state/sample` 稳定约 50 Hz。
-- 每条 sample 有 1545 维 `policy_state.flattened`。
+- 每条 sample 有 1110 维 `policy_state.flattened`。
+- 每条 sample 有 45 维 `aligned_target_pos`。
 - 每条 sample 有 29 维 `target_joint_pos`。
 - `RobotLowState.joint_names` 顺序稳定并写入消息。
 - 字段缺失或维度错误时不会发布错误 sample。

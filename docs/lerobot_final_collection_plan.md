@@ -7,7 +7,7 @@
 ## 目标
 
 - 订阅已验证的 `/robo_state/sample`，不再直接订阅 `/stepit/*`。
-- 从 RealSense ZMQ camera server 读取 `ego_view` RGB 帧。
+- 从 RealSense ZMQ camera server 读取 `head` 与 `ego_view` 两路 RGB 帧。
 - 以 50Hz 对齐最新机器人状态和 RGB 图像，写入 LeRobot v2.1 风格数据集。
 - 采集程序启动后默认空等，不创建 episode、不写数据。
 - 只有收到 ROS2 `START` 指令才开始记录 episode。
@@ -67,7 +67,8 @@ ros2 run robo_collector lerobot_collector_node
 | `status_topic` | `/robo_collector/status` | collector 状态 topic |
 | `camera_host` | `192.168.123.164` | camera server 地址 |
 | `camera_port` | `5555` | camera server 端口 |
-| `camera_stream` | `ego_view` | 采集的 RGB stream 名称 |
+| `camera_streams` | `head,ego_view` | 采集的 RGB stream 名称，逗号分隔 |
+| `camera_stream` | 空 | 兼容旧单相机路径；设置后只采这一单路 stream |
 | `dataset_name` | 自动时间戳 | 输出数据集名 |
 | `root_output_dir` | `outputs` | 数据集根输出目录 |
 | `fps` | `50` | episode 写入频率 |
@@ -111,6 +112,9 @@ outputs/<dataset_name>/
     train-000000.parquet
     train-000001.parquet
   videos/
+    observation.images.head/
+      episode_000000.mp4
+      episode_000001.mp4
     observation.images.ego_view/
       episode_000000.mp4
       episode_000001.mp4
@@ -125,7 +129,8 @@ outputs/<dataset_name>/
 
 | 字段 | 维度 | 来源 |
 | --- | --- | --- |
-| `observation.images.ego_view` | decoded `[H, W, 3]` | MP4 video feature，parquet 中按 `{path, timestamp}` 引用 camera server `ego_view` RGB |
+| `observation.images.head` | decoded `[H, W, 3]` | MP4 video feature，parquet 中按 `{path, timestamp}` 引用 D405 平视 RGB |
+| `observation.images.ego_view` | decoded `[H, W, 3]` | MP4 video feature，parquet 中按 `{path, timestamp}` 引用 D435i 俯视 RGB |
 | `observation.state.joint_position` | `29` | `RoboStateSample.robot_state.joint_pos` |
 | `observation.state.joint_velocity` | `29` | `RoboStateSample.robot_state.joint_vel` |
 | `observation.state.joint_torque` | `29` | `RoboStateSample.robot_state.joint_torque` |
@@ -138,7 +143,7 @@ outputs/<dataset_name>/
 
 说明：
 
-- v1 只保存 RGB `ego_view`，不保存 depth。
+- 当前只保存 RGB `head` 与 `ego_view`，不保存 depth。
 - `projected_gravity_or_quat` 当前使用四元数直接落盘；如后续确认 projected gravity 更稳定，可在保持字段语义清晰的前提下迁移。
 - 每帧保存 `timestamp`、`frame_index`、`episode_index`、`index`、`task_index`，用于 LeRobot 数据集索引。
 
@@ -172,6 +177,7 @@ bash scripts/setup_data_collection_env.sh --with-lerobot
 bash scripts/launch_data_collection.sh \
   --camera-host 192.168.123.164 \
   --camera-port 5555 \
+  --camera-streams head,ego_view \
   --root-output-dir outputs \
   --fps 50
 ```

@@ -1,0 +1,12 @@
+target:
+  - aligned_target_pos
+
+state:
+  - relative_ori_6d
+  - motion_anchor_lin_vel_b
+  - motion_anchor_ang_vel_b
+  - ang_vel_history
+  - gravity_history
+  - joint_pos_rel_history
+  - joint_vel_history
+  - action_history

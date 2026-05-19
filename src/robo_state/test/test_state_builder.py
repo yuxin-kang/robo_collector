@@ -1,11 +1,13 @@
 import unittest
 
 from robo_state.state_builder import (
+    ALIGNED_TARGET_POS_DIM,
     DOF,
     OBSERVATION_DIM,
     POLICY_FIELD_SPECS,
     RoboStateAssembler,
     RobotLowStateData,
+    STEPIT_OBSERVATION_DIM,
     ValidationError,
     flatten_policy_fields,
     parse_joint_state,
@@ -52,7 +54,8 @@ class StateBuilderTest(unittest.TestCase):
 
         self.assertIsNone(result.sample)
         self.assertEqual(result.level, "WARN")
-        self.assertIn("action", result.issues)
+        self.assertIn("aligned_target_pos", result.issues)
+        self.assertIn("relative_ori_6d", result.issues)
         self.assertIn("joint_states", result.issues)
 
     def test_dimension_error_rejects_bad_field(self):
@@ -61,7 +64,7 @@ class StateBuilderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "action has dimension 28"):
             assembler.update_field("action", [0.0] * (DOF - 1), 1.0)
 
-    def test_observation_l2_error_is_computed_from_flattened_policy(self):
+    def test_sample_contains_aligned_target_and_selected_policy_fields(self):
         assembler = RoboStateAssembler(max_cache_age_sec=1.0)
         now_sec = 10.0
 
@@ -72,21 +75,23 @@ class StateBuilderTest(unittest.TestCase):
             assembler.update_field(spec.name, values, now_sec)
 
         flattened = flatten_policy_fields(policy_fields)
-        observation = flattened.copy()
-        observation[0] = 3.0
-        observation[1] = 4.0
 
-        assembler.update_field("observation", observation, now_sec)
+        assembler.update_field("observation", [0.0] * STEPIT_OBSERVATION_DIM, now_sec)
         assembler.update_field("action", [0.0] * DOF, now_sec)
         assembler.update_field("target_joint_pos", [0.0] * DOF, now_sec)
+        assembler.update_field(
+            "aligned_target_pos", [1.0] * ALIGNED_TARGET_POS_DIM, now_sec
+        )
         assembler.update_robot_state(RobotLowStateData.zero(), now_sec)
         assembler.update_imu(object(), now_sec)
 
         result = assembler.build_sample(now_sec)
 
         self.assertIsNotNone(result.sample)
-        self.assertAlmostEqual(result.sample.observation_l2_error, 5.0)
+        self.assertEqual(result.sample.aligned_target_pos, [1.0] * 45)
+        self.assertAlmostEqual(result.sample.observation_l2_error, 0.0)
         self.assertEqual(len(result.sample.policy_flattened), OBSERVATION_DIM)
+        self.assertEqual(result.sample.policy_flattened, flattened)
 
 
 def _joint_state_parts():

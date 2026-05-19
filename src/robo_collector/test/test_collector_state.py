@@ -71,6 +71,34 @@ class RecordStateMachineTest(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertEqual(machine.session.task_prompt, "first")
 
+    def test_failed_state_requires_discard(self):
+        machine = RecordStateMachine()
+        machine.handle_command(RecordCommandType.START, task_prompt="record")
+
+        machine.mark_failed("video write failed")
+
+        self.assertEqual(machine.mode, CollectorMode.FAILED)
+        self.assertEqual(machine.failure_reason, "video write failed")
+
+        stop = machine.handle_command(RecordCommandType.STOP)
+        self.assertFalse(stop.accepted)
+        self.assertEqual(machine.mode, CollectorMode.FAILED)
+
+        start = machine.handle_command(RecordCommandType.START, task_prompt="new")
+        self.assertFalse(start.accepted)
+        self.assertEqual(machine.session.task_prompt, "record")
+
+        discard = machine.handle_command(RecordCommandType.DISCARD)
+        self.assertTrue(discard.accepted)
+        self.assertTrue(discard.should_discard)
+        self.assertEqual(machine.mode, CollectorMode.DISCARD)
+
+        machine.mark_discarded()
+
+        self.assertEqual(machine.mode, CollectorMode.IDLE)
+        self.assertEqual(machine.failure_reason, "")
+        self.assertIsNone(machine.session)
+
 
 if __name__ == "__main__":
     unittest.main()

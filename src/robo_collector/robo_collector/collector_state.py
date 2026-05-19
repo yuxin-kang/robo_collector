@@ -10,6 +10,7 @@ class CollectorMode(str, Enum):
     IDLE = "IDLE"
     RECORDING = "RECORDING"
     NEED_TO_SAVE = "NEED_TO_SAVE"
+    FAILED = "FAILED"
     DISCARD = "DISCARD"
 
 
@@ -44,6 +45,7 @@ class RecordStateMachine:
     def __init__(self) -> None:
         self.mode = CollectorMode.IDLE
         self.session: RecordingSession | None = None
+        self.failure_reason = ""
 
     def handle_command(
         self,
@@ -75,16 +77,25 @@ class RecordStateMachine:
             raise RuntimeError(f"cannot mark saved while mode is {self.mode.value}")
         self.mode = CollectorMode.IDLE
         self.session = None
+        self.failure_reason = ""
 
     def mark_discarded(self) -> None:
         if self.mode != CollectorMode.DISCARD:
             raise RuntimeError(f"cannot mark discarded while mode is {self.mode.value}")
         self.mode = CollectorMode.IDLE
         self.session = None
+        self.failure_reason = ""
 
     def mark_save_failed(self) -> None:
         if self.mode != CollectorMode.NEED_TO_SAVE:
             raise RuntimeError(f"cannot mark save failed while mode is {self.mode.value}")
+        self.mark_failed("save failed; discard required")
+
+    def mark_failed(self, reason: str) -> None:
+        if self.mode not in (CollectorMode.RECORDING, CollectorMode.NEED_TO_SAVE):
+            raise RuntimeError(f"cannot mark failed while mode is {self.mode.value}")
+        self.mode = CollectorMode.FAILED
+        self.failure_reason = reason.strip() or "discard required"
 
     def _start(
         self, task_prompt: str, episode_id: str, now_sec: float
@@ -143,7 +154,11 @@ class RecordStateMachine:
         )
 
     def _discard(self) -> CommandResult:
-        if self.mode not in (CollectorMode.RECORDING, CollectorMode.NEED_TO_SAVE):
+        if self.mode not in (
+            CollectorMode.RECORDING,
+            CollectorMode.NEED_TO_SAVE,
+            CollectorMode.FAILED,
+        ):
             return CommandResult(
                 accepted=False,
                 level="WARN",

@@ -30,21 +30,7 @@ class CameraClient:
 
         packed = self.socket.recv()
         packet = msgpack.unpackb(packed, raw=False)
-
-        decoded_images: dict[str, np.ndarray] = {}
-        for name, blob in packet.get("images", {}).items():
-            image = self._decode_image(name, blob)
-            if image is not None:
-                decoded_images[name] = image
-
-        return {
-            "schema": packet.get("schema"),
-            "timestamps": packet.get("timestamps", {}),
-            "images": decoded_images,
-            "metadata": packet.get("metadata", {}),
-            "host": self.host,
-            "port": self.port,
-        }
+        return decode_packet(packet, host=self.host, port=self.port)
 
     def close(self):
         self.socket.close(linger=0)
@@ -62,10 +48,33 @@ class CameraClient:
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
+def decode_packet(
+    packet: dict[str, Any], *, host: str | None = None, port: int | None = None
+) -> dict[str, Any]:
+    """Decode all image blobs in a camera packet."""
+
+    decoded_images: dict[str, np.ndarray] = {}
+    for name, blob in packet.get("images", {}).items():
+        image = CameraClient._decode_image(name, blob)
+        if image is not None:
+            decoded_images[name] = image
+
+    decoded: dict[str, Any] = {
+        "schema": packet.get("schema"),
+        "timestamps": packet.get("timestamps", {}),
+        "images": decoded_images,
+        "metadata": packet.get("metadata", {}),
+    }
+    if host is not None:
+        decoded["host"] = host
+    if port is not None:
+        decoded["port"] = port
+    return decoded
+
+
 def read_once(host: str, port: int = 5555, timeout_ms: int = 3000) -> dict[str, Any] | None:
     client = CameraClient(host, port)
     try:
         return client.read(timeout_ms=timeout_ms)
     finally:
         client.close()
-

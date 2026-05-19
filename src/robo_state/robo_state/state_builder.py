@@ -10,7 +10,10 @@ from typing import Any, Mapping, Sequence
 DOF = 29
 ACTION_DIM = DOF
 TARGET_JOINT_POS_DIM = DOF
-OBSERVATION_DIM = 1545
+ALIGNED_TARGET_POS_DIM = 45
+POLICY_STATE_DIM = 1110
+STEPIT_OBSERVATION_DIM = 1545
+OBSERVATION_DIM = POLICY_STATE_DIM
 
 JOINT_SUFFIX = "_joint"
 CMD_SUFFIX = "_cmd"
@@ -24,7 +27,6 @@ class FieldSpec:
 
 
 POLICY_FIELD_SPECS: tuple[FieldSpec, ...] = (
-    FieldSpec("motion_joint_pos", 435),
     FieldSpec("relative_ori_6d", 90),
     FieldSpec("motion_anchor_lin_vel_b", 45),
     FieldSpec("motion_anchor_ang_vel_b", 45),
@@ -38,15 +40,14 @@ POLICY_FIELD_SPECS: tuple[FieldSpec, ...] = (
 POLICY_FIELD_DIMS = {spec.name: spec.dim for spec in POLICY_FIELD_SPECS}
 FIELD_DIMS = {
     "target_joint_pos": TARGET_JOINT_POS_DIM,
+    "aligned_target_pos": ALIGNED_TARGET_POS_DIM,
     "action": ACTION_DIM,
-    "observation": OBSERVATION_DIM,
+    "observation": STEPIT_OBSERVATION_DIM,
     **POLICY_FIELD_DIMS,
 }
 
 REQUIRED_FIELD_NAMES: tuple[str, ...] = (
-    "target_joint_pos",
-    "action",
-    "observation",
+    "aligned_target_pos",
     *(spec.name for spec in POLICY_FIELD_SPECS),
 )
 
@@ -102,6 +103,7 @@ class SampleData:
     robot_state: RobotLowStateData
     imu: Any
     target_joint_pos: list[float]
+    aligned_target_pos: list[float]
     action: list[float]
     stepit_observation: list[float]
     observation_l2_error: float
@@ -263,11 +265,11 @@ class RoboStateAssembler:
         policy_fields = self._policy_fields_with_defaults(missing_optional_fields)
         flattened = flatten_policy_fields(policy_fields)
         observation = self._field_or_default(
-            "observation", OBSERVATION_DIM, missing_optional_fields
+            "observation", STEPIT_OBSERVATION_DIM, missing_optional_fields
         )
         l2_error = (
             observation_l2_error(flattened, observation)
-            if self.validate_observation
+            if self.validate_observation and len(flattened) == len(observation)
             else 0.0
         )
 
@@ -278,6 +280,11 @@ class RoboStateAssembler:
             imu=self._imu_or_default(missing_optional_fields),
             target_joint_pos=self._field_or_default(
                 "target_joint_pos", TARGET_JOINT_POS_DIM, missing_optional_fields
+            ),
+            aligned_target_pos=self._field_or_default(
+                "aligned_target_pos",
+                ALIGNED_TARGET_POS_DIM,
+                missing_optional_fields,
             ),
             action=self._field_or_default("action", ACTION_DIM, missing_optional_fields),
             stepit_observation=observation,

@@ -25,13 +25,25 @@ src/camera/
 cd /home/kyx/robot/vla/robo_collector/src/camera
 bash scripts/setup_camera_env.sh --server
 source .venv_camera/bin/activate
-bash scripts/run_realsense_server.sh --port 5555
+bash scripts/run_realsense_server.sh --list-devices
 ```
 
-只发布 RGB：
+双 RealSense RGB 发布：
 
 ```bash
-bash scripts/run_realsense_server.sh --port 5555 --no-depth
+bash scripts/run_realsense_server.sh \
+  --camera head:<D405_SERIAL> \
+  --camera ego_view:<D435I_SERIAL> \
+  --port 5555 \
+  --width 640 --height 480 --fps 30 \
+  --jpeg-quality 80 \
+  --no-depth
+```
+
+兼容单相机旧路径：
+
+```bash
+bash scripts/run_realsense_server.sh --serial <SERIAL> --port 5555 --no-depth
 ```
 
 ## Host Side: 相机客户端
@@ -62,9 +74,10 @@ packet = camera.read(timeout_ms=10)
 
 返回数据中当前约定：
 
-- `images["ego_view"]`：RGB JPEG 解码后的 `uint8 [H, W, 3]`。
-- `images["ego_view_depth"]`：depth PNG 解码后的 depth array。
-- `timestamps[...]`：各路图像时间戳。
+- `images["head"]`：D405 平视 RGB JPEG 解码后的 `uint8 [H, W, 3]`。
+- `images["ego_view"]`：D435i 俯视 RGB JPEG 解码后的 `uint8 [H, W, 3]`。
+- `timestamps[...]`：各路图像时间戳，单位为秒。
+- `metadata["cameras"]`：每路 RealSense 的序列号、设备信息和采集配置。
 
 ## 与机器人状态采集的对齐点
 

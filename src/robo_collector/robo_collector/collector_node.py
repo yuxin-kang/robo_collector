@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -14,105 +13,16 @@ from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from robo_collector_msgs.msg import RecordCommand
 from robo_state_msgs.msg import RoboStateSample
 
+from .camera_cache import CameraFrameCache, parse_camera_streams
 from .collector_state import CollectorMode, RecordStateMachine
+from .field_config import FieldConfigError, load_optional_field_selection
 from .lerobot_dataset import LeRobotV21Writer, RobotFrame
-
-
-@dataclass(frozen=True)
-class CachedCameraFrame:
-    image: Any
-    received_monotonic_sec: float
-    camera_timestamp_ns: int | None
 
 
 @dataclass(frozen=True)
 class CachedStateSample:
     msg: RoboStateSample
     received_monotonic_sec: float
-
-
-class CameraFrameCache:
-    """Background reader for the ZMQ camera client."""
-
-    def __init__(self, host: str, port: int, stream: str, logger: Any) -> None:
-        self.host = host
-        self.port = int(port)
-        self.stream = stream
-        self._logger = logger
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._frame: CachedCameraFrame | None = None
-        self._last_error = ""
-
-    def start(self) -> None:
-        self._thread = threading.Thread(
-            target=self._run, name="robo_collector_camera_reader", daemon=True
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-
-    def latest(self) -> CachedCameraFrame | None:
-        with self._lock:
-            return self._frame
-
-    @property
-    def last_error(self) -> str:
-        with self._lock:
-            return self._last_error
-
-    def _run(self) -> None:
-        try:
-            from robo_collector_camera.client import CameraClient
-        except ImportError as exc:
-            self._record_error(
-                "cannot import CameraClient; run scripts/setup_data_collection_env.sh"
-            )
-            self._logger.error(str(exc))
-            return
-
-        client = CameraClient(self.host, self.port)
-        try:
-            while not self._stop.is_set():
-                packet = client.read(timeout_ms=100)
-                if packet is None:
-                    continue
-                images = packet.get("images", {})
-                image = images.get(self.stream)
-                if image is None:
-                    self._record_error(
-                        f"camera packet missing stream '{self.stream}'"
-                    )
-                    continue
-                timestamps = packet.get("timestamps", {})
-                camera_timestamp = timestamps.get(self.stream)
-                with self._lock:
-                    self._frame = CachedCameraFrame(
-                        image=image,
-                        received_monotonic_sec=time.monotonic(),
-                        camera_timestamp_ns=(
-                            int(camera_timestamp)
-                            if camera_timestamp is not None
-                            else None
-                        ),
-                    )
-                    self._last_error = ""
-        except Exception as exc:  # pragma: no cover - hardware/runtime path
-            self._record_error(f"camera reader stopped: {exc}")
-            self._logger.error(f"camera reader stopped: {exc}")
-        finally:
-            client.close()
-
-    def _record_error(self, message: str) -> None:
-        with self._lock:
-            changed = message != self._last_error
-            self._last_error = message
-        if changed:
-            self._logger.warn(message)
 
 
 class LeRobotCollectorNode(Node):
@@ -126,33 +36,56 @@ class LeRobotCollectorNode(Node):
         self.declare_parameter("status_topic", "/robo_collector/status")
         self.declare_parameter("camera_host", "192.168.123.164")
         self.declare_parameter("camera_port", 5555)
-        self.declare_parameter("camera_stream", "ego_view")
+        self.declare_parameter("camera_stream", "")
+        self.declare_parameter("camera_streams", "head,ego_view")
         self.declare_parameter("dataset_name", "")
         self.declare_parameter("root_output_dir", "outputs")
+        self.declare_parameter("field_config_path", "")
         self.declare_parameter("fps", 50)
         self.declare_parameter("max_state_age_sec", 0.2)
         self.declare_parameter("max_camera_age_sec", 0.2)
 
         self._fps = int(self.get_parameter("fps").value)
+        self._robo_state_topic = str(self.get_parameter("robo_state_topic").value)
         self._max_state_age_sec = float(
             self.get_parameter("max_state_age_sec").value
         )
         self._max_camera_age_sec = float(
             self.get_parameter("max_camera_age_sec").value
         )
-        camera_stream = str(self.get_parameter("camera_stream").value)
+        legacy_camera_stream = str(self.get_parameter("camera_stream").value).strip()
+        if legacy_camera_stream:
+            camera_streams = [legacy_camera_stream]
+        else:
+            camera_streams = parse_camera_streams(
+                self.get_parameter("camera_streams").value
+            )
         dataset_name = str(self.get_parameter("dataset_name").value).strip() or None
+        field_config_path = str(self.get_parameter("field_config_path").value).strip()
+        try:
+            field_selection = load_optional_field_selection(field_config_path)
+        except FieldConfigError as exc:
+            message = f"invalid field_config_path: {exc}"
+            self.get_logger().error(message)
+            raise RuntimeError(message) from exc
 
         self._state_machine = RecordStateMachine()
         self._writer = LeRobotV21Writer(
             str(self.get_parameter("root_output_dir").value),
             dataset_name=dataset_name,
             fps=self._fps,
-            camera_key=f"observation.images.{camera_stream}",
+            camera_keys=[
+                f"observation.images.{stream}" for stream in camera_streams
+            ],
+            field_selection=field_selection,
         )
         self._latest_state: CachedStateSample | None = None
         self._last_warn_message = ""
         self._last_warn_monotonic_sec = 0.0
+        self._last_status_log_message = ""
+        self._last_status_log_monotonic_sec = 0.0
+        self._state_sample_count = 0
+        self._last_state_sample_log_monotonic_sec = 0.0
 
         qos = QoSProfile(depth=10)
         self._status_pub = self.create_publisher(
@@ -160,7 +93,7 @@ class LeRobotCollectorNode(Node):
         )
         self.create_subscription(
             RoboStateSample,
-            str(self.get_parameter("robo_state_topic").value),
+            self._robo_state_topic,
             self._on_state,
             qos_profile_sensor_data,
         )
@@ -174,7 +107,7 @@ class LeRobotCollectorNode(Node):
         self._camera_cache = CameraFrameCache(
             str(self.get_parameter("camera_host").value),
             int(self.get_parameter("camera_port").value),
-            camera_stream,
+            camera_streams,
             self.get_logger(),
         )
         self._camera_cache.start()
@@ -184,7 +117,9 @@ class LeRobotCollectorNode(Node):
         self.get_logger().info(
             "collector ready; waiting for START on "
             f"{self.get_parameter('record_command_topic').value}; "
-            f"dataset root will be {self._writer.root}"
+            f"dataset root will be {self._writer.root}; "
+            f"camera streams={','.join(camera_streams)}; "
+            f"field config={field_config_path or '<legacy all fields>'}"
         )
         self._publish_status(DiagnosticStatus.OK, "IDLE: waiting for START")
 
@@ -193,9 +128,13 @@ class LeRobotCollectorNode(Node):
         return super().destroy_node()
 
     def _on_state(self, msg: RoboStateSample) -> None:
-        self._latest_state = CachedStateSample(
-            msg=msg, received_monotonic_sec=time.monotonic()
+        now = time.monotonic()
+        was_unavailable_or_stale = self._latest_state is None or (
+            now - self._latest_state.received_monotonic_sec > self._max_state_age_sec
         )
+        self._latest_state = CachedStateSample(msg=msg, received_monotonic_sec=now)
+        self._state_sample_count += 1
+        self._log_state_sample_received_throttled(force=was_unavailable_or_stale)
 
     def _on_record_command(self, msg: RecordCommand) -> None:
         result = self._state_machine.handle_command(
@@ -236,21 +175,24 @@ class LeRobotCollectorNode(Node):
         if self._state_machine.mode == CollectorMode.NEED_TO_SAVE:
             self._save_episode()
             return
+        if self._state_machine.mode == CollectorMode.FAILED:
+            self._publish_failed_status_throttled()
+            return
         if self._state_machine.mode != CollectorMode.RECORDING:
             return
 
         now = time.monotonic()
         state = self._latest_state
-        camera = self._camera_cache.latest()
+        camera_bundle = self._camera_cache.latest()
         if state is None:
             self._publish_warn_throttled("missing robo_state sample")
             return
-        if camera is None:
-            self._publish_warn_throttled("missing camera frame")
+        if camera_bundle is None:
+            self._publish_warn_throttled("missing complete camera frame bundle")
             return
 
         state_age = now - state.received_monotonic_sec
-        camera_age = now - camera.received_monotonic_sec
+        camera_age = now - camera_bundle.received_monotonic_sec
         if state_age > self._max_state_age_sec:
             self._publish_warn_throttled(
                 f"stale robo_state sample: {state_age:.3f}s old"
@@ -263,16 +205,27 @@ class LeRobotCollectorNode(Node):
             return
 
         try:
-            self._writer.add_frame(_robot_frame_from_msg(state.msg), camera.image)
+            self._writer.add_frame(
+                _robot_frame_from_msg(state.msg), camera_bundle.images
+            )
         except Exception as exc:
-            self._publish_warn_throttled(f"failed to write frame: {exc}")
+            reason = self._writer.active_failed_reason or str(exc)
+            self._state_machine.mark_failed(reason)
+            self._publish_status(
+                DiagnosticStatus.ERROR,
+                f"recording failed; DISCARD required: {reason}",
+            )
 
     def _save_episode(self) -> None:
         try:
             result = self._writer.save_episode()
         except Exception as exc:
-            self._state_machine.mark_save_failed()
-            self._publish_status(DiagnosticStatus.ERROR, f"save failed: {exc}")
+            reason = self._writer.active_failed_reason or str(exc)
+            self._state_machine.mark_failed(reason)
+            self._publish_status(
+                DiagnosticStatus.ERROR,
+                f"save failed; DISCARD required: {reason}",
+            )
             return
 
         self._state_machine.mark_saved()
@@ -287,26 +240,66 @@ class LeRobotCollectorNode(Node):
 
     def _publish_periodic_status(self) -> None:
         message = self._state_machine.mode.value
+        level = DiagnosticStatus.OK
         if self._state_machine.mode == CollectorMode.RECORDING:
             message = (
                 f"RECORDING episode={self._writer.active_episode_index} "
                 f"frames={self._writer.active_frame_count}"
             )
-        level = DiagnosticStatus.OK
-        camera_warning = self._camera_warning()
-        if camera_warning is not None:
-            level = DiagnosticStatus.WARN
-            message = f"{message}; {camera_warning}"
+        elif self._state_machine.mode == CollectorMode.FAILED:
+            message = (
+                "FAILED: DISCARD required: "
+                f"{self._state_machine.failure_reason}"
+            )
+            level = DiagnosticStatus.ERROR
+        warnings = [
+            warning
+            for warning in (self._state_warning(), self._camera_warning())
+            if warning is not None
+        ]
+        if warnings:
+            if level != DiagnosticStatus.ERROR:
+                level = DiagnosticStatus.WARN
+            message = f"{message}; {'; '.join(warnings)}"
         self._publish_status(level, message)
 
+    def _publish_failed_status_throttled(self) -> None:
+        self._publish_status_throttled(
+            DiagnosticStatus.ERROR,
+            "FAILED: DISCARD required: "
+            f"{self._state_machine.failure_reason}",
+        )
+
     def _publish_warn_throttled(self, message: str) -> None:
+        self._publish_status_throttled(DiagnosticStatus.WARN, message)
+
+    def _publish_status_throttled(self, level: Any, message: str) -> None:
         now = time.monotonic()
         if message != self._last_warn_message or now - self._last_warn_monotonic_sec > 1.0:
             self._last_warn_message = message
             self._last_warn_monotonic_sec = now
-            self._publish_status(DiagnosticStatus.WARN, message)
+            self._publish_status(level, message)
+
+    def _log_state_sample_received_throttled(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if (
+            not force
+            and self._state_sample_count != 1
+            and now - self._last_state_sample_log_monotonic_sec <= 5.0
+        ):
+            return
+        self._last_state_sample_log_monotonic_sec = now
+        self.get_logger().info(
+            "receiving robo_state samples on "
+            f"{self._robo_state_topic}: count={self._state_sample_count}"
+        )
 
     def _publish_status(self, level: Any, message: str) -> None:
+        state_age = ""
+        if self._latest_state is not None:
+            state_age = (
+                f"{time.monotonic() - self._latest_state.received_monotonic_sec:.3f}"
+            )
         status = DiagnosticStatus()
         status.level = _diagnostic_level_value(level)
         status.name = self.get_name()
@@ -320,20 +313,55 @@ class LeRobotCollectorNode(Node):
             KeyValue(key="active_frames", value=str(self._writer.active_frame_count)),
             KeyValue(key="max_state_age_sec", value=str(self._max_state_age_sec)),
             KeyValue(key="max_camera_age_sec", value=str(self._max_camera_age_sec)),
+            KeyValue(
+                key="robo_state_available",
+                value=str(self._latest_state is not None),
+            ),
+            KeyValue(key="robo_state_age_sec", value=state_age),
+            KeyValue(key="camera_streams", value=",".join(self._camera_cache.streams)),
             KeyValue(key="camera_error", value=self._camera_cache.last_error),
         ]
         self._status_pub.publish(status)
+        self._log_status_issue_throttled(status.level, message)
+
+    def _log_status_issue_throttled(self, level: Any, message: str) -> None:
+        level_value = _diagnostic_level_value(level)
+        if level_value == _diagnostic_level_value(DiagnosticStatus.OK):
+            return
+
+        now = time.monotonic()
+        if (
+            message == self._last_status_log_message
+            and now - self._last_status_log_monotonic_sec <= 5.0
+        ):
+            return
+
+        self._last_status_log_message = message
+        self._last_status_log_monotonic_sec = now
+        if level_value == _diagnostic_level_value(DiagnosticStatus.ERROR):
+            self.get_logger().error(message)
+        else:
+            self.get_logger().warn(message)
+
+    def _state_warning(self) -> str | None:
+        state = self._latest_state
+        if state is None:
+            return "robo_state sample unavailable; check robo_state_node status"
+        state_age = time.monotonic() - state.received_monotonic_sec
+        if state_age > self._max_state_age_sec:
+            return f"stale robo_state sample: {state_age:.3f}s old; check robo_state_node"
+        return None
 
     def _camera_warning(self) -> str | None:
         camera_error = self._camera_cache.last_error
         if camera_error:
             return camera_error
-        camera = self._camera_cache.latest()
-        if camera is None:
-            return "camera frame unavailable"
-        camera_age = time.monotonic() - camera.received_monotonic_sec
+        camera_bundle = self._camera_cache.latest()
+        if camera_bundle is None:
+            return "complete camera frame bundle unavailable"
+        camera_age = time.monotonic() - camera_bundle.received_monotonic_sec
         if camera_age > self._max_camera_age_sec:
-            return f"stale camera frame: {camera_age:.3f}s old"
+            return f"stale camera frame bundle: {camera_age:.3f}s old"
         return None
 
     def _now_sec(self) -> float:
@@ -342,6 +370,7 @@ class LeRobotCollectorNode(Node):
 
 def _robot_frame_from_msg(msg: RoboStateSample) -> RobotFrame:
     imu = msg.imu
+    policy_state = msg.policy_state
     return RobotFrame(
         joint_position=[float(value) for value in msg.robot_state.joint_pos],
         joint_velocity=[float(value) for value in msg.robot_state.joint_vel],
@@ -364,6 +393,33 @@ def _robot_frame_from_msg(msg: RoboStateSample) -> RobotFrame:
         ],
         target_joint_pos=[float(value) for value in msg.target_joint_pos],
         policy_action=[float(value) for value in msg.action],
+        aligned_target_pos=[float(value) for value in msg.aligned_target_pos],
+        policy_state={
+            "relative_ori_6d": [
+                float(value) for value in policy_state.relative_ori_6d
+            ],
+            "motion_anchor_lin_vel_b": [
+                float(value) for value in policy_state.motion_anchor_lin_vel_b
+            ],
+            "motion_anchor_ang_vel_b": [
+                float(value) for value in policy_state.motion_anchor_ang_vel_b
+            ],
+            "ang_vel_history": [
+                float(value) for value in policy_state.ang_vel_history
+            ],
+            "gravity_history": [
+                float(value) for value in policy_state.gravity_history
+            ],
+            "joint_pos_rel_history": [
+                float(value) for value in policy_state.joint_pos_rel_history
+            ],
+            "joint_vel_history": [
+                float(value) for value in policy_state.joint_vel_history
+            ],
+            "action_history": [
+                float(value) for value in policy_state.action_history
+            ],
+        },
         joint_names=list(msg.robot_state.joint_names),
     )
 
@@ -392,12 +448,17 @@ def _diagnostic_level_value(level: Any) -> bytes:
 
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
-    node = LeRobotCollectorNode()
+    node: LeRobotCollectorNode | None = None
     try:
+        node = LeRobotCollectorNode()
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

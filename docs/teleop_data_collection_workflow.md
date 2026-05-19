@@ -93,13 +93,19 @@ STEPIT_JOY_NAME=pico \
 cd /home/kyx/robot/vla/robo_collector/src/camera
 bash scripts/setup_camera_env.sh --server
 source .venv_camera/bin/activate
-bash scripts/run_realsense_server.sh --port 5555
+bash scripts/run_realsense_server.sh --list-devices
 ```
 
-只采 RGB 时：
+双 RealSense RGB 采集时：
 
 ```bash
-bash scripts/run_realsense_server.sh --port 5555 --no-depth
+bash scripts/run_realsense_server.sh \
+  --camera head:<D405_SERIAL> \
+  --camera ego_view:<D435I_SERIAL> \
+  --port 5555 \
+  --width 640 --height 480 --fps 30 \
+  --jpeg-quality 80 \
+  --no-depth
 ```
 
 ### 5. 测试相机客户端
