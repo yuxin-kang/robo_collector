@@ -143,6 +143,38 @@ for key in keys:
 PY
 ```
 
+## Convert To GR00T
+
+现有采集输出不会被原地改写。新增脚本会读取一个已有 dataset，并在新的目标目录下生成 Isaac-GR00T 兼容数据集：
+
+```bash
+python scripts/convert_outputs_to_gr00t.py \
+  --source-root outputs \
+  --dataset-name robo_collector_YYYYMMDD_HHMMSS \
+  --dest-root exports \
+  --output-name robo_collector_YYYYMMDD_HHMMSS_gr00t \
+  --action-source aligned_target_pos
+```
+
+参数说明：
+
+- `--source-root`：已有数据集所在父目录
+- `--dataset-name`：已有数据集文件夹名字
+- `--dest-root`：转换后数据集输出父目录
+- `--output-name`：转换后数据集目录名；默认 `<dataset-name>_gr00t`
+- `--action-source`：GR00T `action` 列映射来源，可选 `aligned_target_pos`、`policy_action`、`joint_position`
+  - `policy_action` 只有在 source parquet 本身包含 `action.policy_action` 时可用；默认 YAML 采集配置不会写这个列
+
+当前转换器面向本项目现有 split-field source schema：
+
+- 读取 `observation.state.relative_ori_6d` 等拆分状态列
+- 重新拼成 GR00T 所需的单列 `observation.state`
+- 把选中的 action 列重写成单列 `action`
+- 复制视频到 `videos/chunk-000/observation.images.<camera>/episode_*.mp4`
+- 生成 GR00T 风格 `meta/modality.json`
+
+如果 source dataset 缺少必需状态列，或缺少选中的 action 列，脚本会直接报错退出。
+
 ## Notes
 
 - `Waiting for at least 1 matching subscription(s)...` 通常表示 collector 没启动或当前终端没 source workspace。
