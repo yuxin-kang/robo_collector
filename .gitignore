@@ -84,5 +84,8 @@ compile_commands.json
 # Local agent/runtime state
 .omx/
 
+# Local design notes and development plans
+docs/
+
 # Legacy root camera artifacts after moving source package to src/camera/
 /camera/

@@ -1,26 +1,14 @@
 # Robo Collector
 
-[![Ubuntu 22.04](https://img.shields.io/badge/Ubuntu-22.04-blue.svg?logo=ubuntu)](https://ubuntu.com/)
+[![Ubuntu 22.04 / 24.04](https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-blue.svg?logo=ubuntu)](https://ubuntu.com/)
 [![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-blue.svg)](https://docs.ros.org/en/humble/)
-[![License](https://img.shields.io/github/license/yuxin-kang/robo_collector)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Robo Collector is a ROS 2 data-collection workspace for Unitree G1 teleoperation.
 It normalizes StepIt robot state into `/robo_state/sample`, aligns it with
 RealSense RGB streams such as `head` and `ego_view`, and stores episodes in a
 LeRobot v2.1-style dataset. A conversion utility is also provided for exporting
 existing datasets into an Isaac-GR00T-compatible layout.
-
-
-## Highlights
-
-- ROS 2 middleware that validates and repackages StepIt topics into typed robot
-  state samples.
-- Episode recorder controlled by `/robo_collector/record_command`.
-- Dual RealSense RGB support through a lightweight ZMQ/msgpack camera transport.
-- Configurable state/action field selection through
-  [`configs/collection_fields.yml`](configs/collection_fields.yml).
-- LeRobot v2.1-style parquet/video output with metadata files.
-- Isaac-GR00T export script for downstream whole-body policy training.
 
 The default field configuration is:
 
@@ -49,7 +37,7 @@ robo_collector/
 
 ## Setup
 
-Tested with ROS 2 Humble on Ubuntu 22.04.
+Tested with ROS 2 Humble on Ubuntu 22.04 and Ubuntu 24.04.
 
 ```bash
 git clone https://github.com/yuxin-kang/robo_collector.git
@@ -185,45 +173,6 @@ outputs/robo_collector_YYYYMMDD_HHMMSS/
 Restart the launch script or pass a different `--dataset-name` when you want a
 new dataset directory.
 
-## Check Data
-
-Inspect the latest dataset metadata:
-
-```bash
-latest=$(ls -td outputs/robo_collector_* | head -1)
-cat "$latest/meta/episodes.jsonl"
-```
-
-Check selected parquet field dimensions:
-
-```bash
-python - <<'PY'
-from pathlib import Path
-import pyarrow.parquet as pq
-
-root = Path(sorted(Path("outputs").glob("robo_collector_*"))[-1])
-table = pq.read_table(root / "data/train-000000.parquet")
-row = table.slice(0, 1).to_pylist()[0]
-
-keys = [
-    "action.aligned_target_pos",
-    "observation.state.relative_ori_6d",
-    "observation.state.motion_anchor_lin_vel_b",
-    "observation.state.motion_anchor_ang_vel_b",
-    "observation.state.ang_vel_history",
-    "observation.state.gravity_history",
-    "observation.state.joint_pos_rel_history",
-    "observation.state.joint_vel_history",
-    "observation.state.action_history",
-]
-
-print("dataset:", root)
-print("rows:", table.num_rows)
-for key in keys:
-    print(key, len(row[key]))
-PY
-```
-
 ## Convert to Isaac-GR00T
 
 The converter reads an existing Robo Collector dataset and writes a new
@@ -258,17 +207,6 @@ The converter currently targets this project's split-field source schema:
 
 The script exits with an error if the source dataset lacks required state
 columns or the selected action column.
-
-## Troubleshooting
-
-- `Waiting for at least 1 matching subscription(s)...` usually means the
-  collector is not running or the current terminal has not sourced the ROS
-  workspace.
-- Use `tmux capture-pane -t robo_data_collection:0.1 -p -S -160` to inspect
-  collector logs.
-- The default setup does not install the official `lerobot` package. Install it
-  only when needed with `bash scripts/setup_data_collection_env.sh --with-lerobot`.
-- Stop collection with `tmux kill-session -t robo_data_collection`.
 
 ## Acknowledgement
 
