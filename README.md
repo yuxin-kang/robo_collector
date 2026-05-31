@@ -1,17 +1,59 @@
 # Robo Collector
 
-G1 遥操作数据采集工作区。采集链路把 StepIt 状态整理成 `/robo_state/sample`，再和 RealSense `head`、`ego_view` 图像对齐，保存为 LeRobot v2.1 风格 dataset。
+[![Ubuntu 22.04](https://img.shields.io/badge/Ubuntu-22.04-blue.svg?logo=ubuntu)](https://ubuntu.com/)
+[![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-blue.svg)](https://docs.ros.org/en/humble/)
+[![License](https://img.shields.io/github/license/yuxin-kang/robo_collector)](LICENSE)
 
-当前默认字段配置在 [configs/collection_fields.yml](configs/collection_fields.yml)：
+Robo Collector is a ROS 2 data-collection workspace for Unitree G1 teleoperation.
+It normalizes StepIt robot state into `/robo_state/sample`, aligns it with
+RealSense RGB streams such as `head` and `ego_view`, and stores episodes in a
+LeRobot v2.1-style dataset. A conversion utility is also provided for exporting
+existing datasets into an Isaac-GR00T-compatible layout.
 
-- target: `action.aligned_target_pos`，45 维
-- state: policy 输入状态，合计 1110 维
-- camera、timestamp、episode/frame/task metadata 固定保存
+
+## Highlights
+
+- ROS 2 middleware that validates and repackages StepIt topics into typed robot
+  state samples.
+- Episode recorder controlled by `/robo_collector/record_command`.
+- Dual RealSense RGB support through a lightweight ZMQ/msgpack camera transport.
+- Configurable state/action field selection through
+  [`configs/collection_fields.yml`](configs/collection_fields.yml).
+- LeRobot v2.1-style parquet/video output with metadata files.
+- Isaac-GR00T export script for downstream whole-body policy training.
+
+The default field configuration is:
+
+| Group | Fields |
+| --- | --- |
+| `target` | `action.aligned_target_pos`, 45 dimensions |
+| `state` | Policy input state fields, 1110 dimensions in total |
+| metadata | Camera references, timestamps, episode/frame indices, and task metadata |
+
+## Repository Layout
+
+```text
+robo_collector/
+  configs/collection_fields.yml
+  scripts/
+    setup_data_collection_env.sh
+    launch_data_collection.sh
+    convert_outputs_to_gr00t.py
+  src/
+    camera/                 # RealSense ZMQ publisher/client
+    robo_state_msgs/        # Typed state sample messages
+    robo_state/             # StepIt-to-RoboState normalization node
+    robo_collector_msgs/    # Recording command messages
+    robo_collector/         # Episode writer and collector node
+```
 
 ## Setup
 
+Tested with ROS 2 Humble on Ubuntu 22.04.
+
 ```bash
-cd /home/kyx/robot/vla/robo_collector
+git clone https://github.com/yuxin-kang/robo_collector.git
+cd robo_collector
 
 source /opt/ros/humble/setup.bash
 bash scripts/setup_data_collection_env.sh
@@ -23,25 +65,60 @@ colcon build --symlink-install \
 source install/setup.bash
 ```
 
-如果你用 zsh，把 `setup.bash` 换成 `setup.zsh`。
+If you use `zsh`, source `setup.zsh` instead of `setup.bash`.
 
-确认消息已更新：
+Verify that the generated message interfaces contain the expected fields:
 
 ```bash
 ros2 interface show robo_state_msgs/msg/RoboStateSample | grep aligned_target_pos
 ros2 interface show robo_state_msgs/msg/PolicyState | grep flattened
 ```
 
-期望看到：
+Expected output:
 
 ```text
 float32[45] aligned_target_pos
 float32[1110] flattened
 ```
 
+## Camera Setup
+
+The camera module lives in [`src/camera`](src/camera). On the robot-side machine
+connected to the RealSense cameras:
+
+```bash
+cd /path/to/robo_collector/src/camera
+bash scripts/setup_camera_env.sh --server
+source .venv_camera/bin/activate
+bash scripts/run_realsense_server.sh --list-devices
+```
+
+Start the dual-camera RGB publisher:
+
+```bash
+bash scripts/run_realsense_server.sh \
+  --camera head:<D405_SERIAL> \
+  --camera ego_view:<D435I_SERIAL> \
+  --port 5555 \
+  --width 640 --height 480 --fps 30 \
+  --jpeg-quality 80 \
+  --no-depth
+```
+
+On the collection host, test the client or open the viewer:
+
+```bash
+cd /path/to/robo_collector/src/camera
+bash scripts/setup_camera_env.sh --client
+source .venv_camera/bin/activate
+bash scripts/test_camera_client.sh --host 192.168.123.164 --port 5555
+bash scripts/run_camera_viewer.sh --host 192.168.123.164 --port 5555
+```
+
 ## Launch
 
-启动前需要先手动启动 StepIt、XRT、机器人控制链路和 RealSense camera server。
+Before launching Robo Collector, start the external teleoperation stack: StepIt,
+XRT retargeting, robot control, and the RealSense camera server.
 
 ```bash
 bash scripts/launch_data_collection.sh \
@@ -53,21 +130,21 @@ bash scripts/launch_data_collection.sh \
   --fps 50
 ```
 
-脚本会创建 tmux session：
+The launch script creates a tmux session:
 
 ```bash
 tmux attach -t robo_data_collection
 ```
 
-查看状态：
+Check collector status:
 
 ```bash
 ros2 topic echo --once /robo_collector/status
 ```
 
-## Record
+## Recording Episodes
 
-开始：
+Start a new episode:
 
 ```bash
 ros2 topic pub --once /robo_collector/record_command \
@@ -75,7 +152,7 @@ ros2 topic pub --once /robo_collector/record_command \
   "{command: 1, task_prompt: 'Shake hand with somebody'}"
 ```
 
-保存：
+Stop and save the current episode:
 
 ```bash
 ros2 topic pub --once /robo_collector/record_command \
@@ -83,7 +160,7 @@ ros2 topic pub --once /robo_collector/record_command \
   "{command: 2}"
 ```
 
-丢弃当前 episode：
+Discard the current episode:
 
 ```bash
 ros2 topic pub --once /robo_collector/record_command \
@@ -91,7 +168,8 @@ ros2 topic pub --once /robo_collector/record_command \
   "{command: 3}"
 ```
 
-同一次 launch 下，多次 START/STOP 会追加到同一个 dataset：
+Multiple `START`/`STOP` cycles in the same launch append episodes to the same
+dataset:
 
 ```text
 outputs/robo_collector_YYYYMMDD_HHMMSS/
@@ -104,16 +182,19 @@ outputs/robo_collector_YYYYMMDD_HHMMSS/
   meta/
 ```
 
-如果想每次录制都用新的 dataset，重启 launch 脚本，或传不同的 `--dataset-name`。
+Restart the launch script or pass a different `--dataset-name` when you want a
+new dataset directory.
 
 ## Check Data
+
+Inspect the latest dataset metadata:
 
 ```bash
 latest=$(ls -td outputs/robo_collector_* | head -1)
 cat "$latest/meta/episodes.jsonl"
 ```
 
-检查 parquet 字段长度：
+Check selected parquet field dimensions:
 
 ```bash
 python - <<'PY'
@@ -143,9 +224,10 @@ for key in keys:
 PY
 ```
 
-## Convert To GR00T
+## Convert to Isaac-GR00T
 
-现有采集输出不会被原地改写。新增脚本会读取一个已有 dataset，并在新的目标目录下生成 Isaac-GR00T 兼容数据集：
+The converter reads an existing Robo Collector dataset and writes a new
+Isaac-GR00T-compatible dataset. It does not modify the source dataset in place.
 
 ```bash
 python scripts/convert_outputs_to_gr00t.py \
@@ -156,28 +238,48 @@ python scripts/convert_outputs_to_gr00t.py \
   --action-source aligned_target_pos
 ```
 
-参数说明：
+Arguments:
 
-- `--source-root`：已有数据集所在父目录
-- `--dataset-name`：已有数据集文件夹名字
-- `--dest-root`：转换后数据集输出父目录
-- `--output-name`：转换后数据集目录名；默认 `<dataset-name>_gr00t`
-- `--action-source`：GR00T `action` 列映射来源，可选 `aligned_target_pos`、`policy_action`、`joint_position`
-  - `policy_action` 只有在 source parquet 本身包含 `action.policy_action` 时可用；默认 YAML 采集配置不会写这个列
+- `--source-root`: parent directory of the source dataset.
+- `--dataset-name`: source dataset directory name.
+- `--dest-root`: parent directory for converted datasets.
+- `--output-name`: converted dataset directory name; defaults to
+  `<dataset-name>_gr00t`.
+- `--action-source`: source column for the single GR00T `action` vector. Choices
+  are `aligned_target_pos`, `policy_action`, and `joint_position`.
 
-当前转换器面向本项目现有 split-field source schema：
+The converter currently targets this project's split-field source schema:
 
-- 读取 `observation.state.relative_ori_6d` 等拆分状态列
-- 重新拼成 GR00T 所需的单列 `observation.state`
-- 把选中的 action 列重写成单列 `action`
-- 复制视频到 `videos/chunk-000/observation.images.<camera>/episode_*.mp4`
-- 生成 GR00T 风格 `meta/modality.json`
+- Reads state columns such as `observation.state.relative_ori_6d`.
+- Reconstructs the single `observation.state` column required by GR00T.
+- Rewrites the selected action source into a single `action` column.
+- Copies videos to `videos/chunk-000/observation.images.<camera>/episode_*.mp4`.
+- Generates GR00T-style `meta/modality.json`.
 
-如果 source dataset 缺少必需状态列，或缺少选中的 action 列，脚本会直接报错退出。
+The script exits with an error if the source dataset lacks required state
+columns or the selected action column.
 
-## Notes
+## Troubleshooting
 
-- `Waiting for at least 1 matching subscription(s)...` 通常表示 collector 没启动或当前终端没 source workspace。
-- `tmux capture-pane -t robo_data_collection:0.1 -p -S -160` 可以看 collector 日志。
-- 默认不安装官方 `lerobot`，现场采集不需要它；只有训练/转换工具需要时才运行 `bash scripts/setup_data_collection_env.sh --with-lerobot`。
-- 关闭采集：`tmux kill-session -t robo_data_collection`。
+- `Waiting for at least 1 matching subscription(s)...` usually means the
+  collector is not running or the current terminal has not sourced the ROS
+  workspace.
+- Use `tmux capture-pane -t robo_data_collection:0.1 -p -S -160` to inspect
+  collector logs.
+- The default setup does not install the official `lerobot` package. Install it
+  only when needed with `bash scripts/setup_data_collection_env.sh --with-lerobot`.
+- Stop collection with `tmux kill-session -t robo_data_collection`.
+
+## Acknowledgement
+
+Robo Collector uses [StepIt](https://github.com/chengruiz/stepit) as the
+teleoperation/control framework and as the source of robot state, policy, and
+target topics consumed by the ROS 2 collection pipeline.
+
+This project is also inspired by the dataset conventions and tooling from
+[LeRobot](https://github.com/huggingface/lerobot) and
+[Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T).
+
+## License
+
+This project is released under the [MIT License](LICENSE).

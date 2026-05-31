@@ -4,8 +4,8 @@
   <name>robo_state</name>
   <version>0.1.0</version>
   <description>StepIt robot state normalization node for Robo Collector.</description>
-  <maintainer email="kyx@example.com">kyx</maintainer>
-  <license>Proprietary</license>
+  <maintainer email="yuxin-kang@users.noreply.github.com">Yuxin Kang</maintainer>
+  <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <build_depend>ament_cmake_python</build_depend>
