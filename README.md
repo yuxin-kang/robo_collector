@@ -1,7 +1,7 @@
 # Robo Collector
 
-[![Ubuntu 22.04 / 24.04](https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-blue.svg?logo=ubuntu)](https://ubuntu.com/)
-[![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-blue.svg)](https://docs.ros.org/en/humble/)
+[![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04-blue.svg?logo=ubuntu)](https://ubuntu.com/)
+[![ROS 2 Jazzy](https://img.shields.io/badge/ROS%202-Jazzy-blue.svg)](https://docs.ros.org/en/jazzy/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Robo Collector is a ROS 2 data-collection workspace for Unitree G1 teleoperation.
@@ -37,13 +37,24 @@ robo_collector/
 
 ## Setup
 
-Tested with ROS 2 Humble on Ubuntu 22.04 and Ubuntu 24.04.
+Recommended deployment target: Ubuntu 24.04 with ROS 2 Jazzy.
+The launch script resolves ROS in this order:
+
+1. `ROS_SETUP_PATH`, if exported and points to a valid `setup.bash`
+2. `/opt/ros/$ROS_DISTRO/setup.bash`, if `ROS_DISTRO` is exported
+3. the only installed distro under `/opt/ros`
+
+If you keep multiple ROS distros under `/opt/ros`, export either
+`ROS_SETUP_PATH` or `ROS_DISTRO` before launching.
 
 ```bash
 git clone https://github.com/yuxin-kang/robo_collector.git
 cd robo_collector
 
-source /opt/ros/humble/setup.bash
+export ROS_DISTRO=${ROS_DISTRO:-jazzy}
+export ROS_SETUP_PATH=${ROS_SETUP_PATH:-/opt/ros/$ROS_DISTRO/setup.bash}
+source "$ROS_SETUP_PATH"
+
 bash scripts/setup_data_collection_env.sh
 source .venv_data_collection/bin/activate
 
@@ -53,7 +64,9 @@ colcon build --symlink-install \
 source install/setup.bash
 ```
 
-If you use `zsh`, source `setup.zsh` instead of `setup.bash`.
+If you use `zsh`, source `/opt/ros/$ROS_DISTRO/setup.zsh` and `install/setup.zsh`
+for your interactive shell. `launch_data_collection.sh` still sources
+`setup.bash` internally because it launches worker panes through `bash`.
 
 Verify that the generated message interfaces contain the expected fields:
 
@@ -109,6 +122,9 @@ Before launching Robo Collector, start the external teleoperation stack: StepIt,
 XRT retargeting, robot control, and the RealSense camera server.
 
 ```bash
+export ROS_DISTRO=${ROS_DISTRO:-jazzy}
+export ROS_SETUP_PATH=${ROS_SETUP_PATH:-/opt/ros/$ROS_DISTRO/setup.bash}
+
 bash scripts/launch_data_collection.sh \
   --field-config configs/collection_fields.yml \
   --camera-host 192.168.123.164 \

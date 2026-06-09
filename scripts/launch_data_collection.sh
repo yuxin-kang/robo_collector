@@ -10,6 +10,7 @@ ROOT_OUTPUT_DIR="outputs"
 DATASET_NAME=""
 FIELD_CONFIG=""
 FPS="50"
+PRINT_ROS_SETUP=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -50,6 +51,10 @@ while [[ $# -gt 0 ]]; do
       FPS="$2"
       shift 2
       ;;
+    --print-ros-setup)
+      PRINT_ROS_SETUP=1
+      shift
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 2
@@ -58,6 +63,61 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "$(dirname "$0")/.."
+
+resolve_ros_setup() {
+  local ros_root="${ROBO_COLLECTOR_ROS_ROOT:-/opt/ros}"
+  local setup_path=""
+  local candidates=()
+  local candidate=""
+
+  if [[ -n "${ROS_SETUP_PATH:-}" ]]; then
+    if [[ -f "${ROS_SETUP_PATH}" ]]; then
+      printf '%s\n' "${ROS_SETUP_PATH}"
+      return 0
+    fi
+
+    echo "ROS_SETUP_PATH points to a missing file: ${ROS_SETUP_PATH}" >&2
+    return 1
+  fi
+
+  if [[ -n "${ROS_DISTRO:-}" ]]; then
+    setup_path="${ros_root}/${ROS_DISTRO}/setup.bash"
+    if [[ -f "${setup_path}" ]]; then
+      printf '%s\n' "${setup_path}"
+      return 0
+    fi
+
+    echo "ROS_DISTRO is set to '${ROS_DISTRO}', but ${setup_path} does not exist." >&2
+    return 1
+  fi
+
+  for candidate in "${ros_root}"/*/setup.bash; do
+    [[ -f "${candidate}" ]] || continue
+    candidates+=("${candidate}")
+  done
+
+  if [[ "${#candidates[@]}" -eq 1 ]]; then
+    printf '%s\n' "${candidates[0]}"
+    return 0
+  fi
+
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    echo "Unable to find a ROS 2 setup script under ${ros_root}." >&2
+  else
+    echo "Multiple ROS 2 setup scripts were found under ${ros_root}." >&2
+    printf '  %s\n' "${candidates[@]}" >&2
+  fi
+
+  echo "Export ROS_SETUP_PATH=/opt/ros/<distro>/setup.bash or ROS_DISTRO=<distro> before launching." >&2
+  return 1
+}
+
+ROS_SETUP="$(resolve_ros_setup)"
+
+if [[ "$PRINT_ROS_SETUP" == "1" ]]; then
+  printf '%s\n' "$ROS_SETUP"
+  exit 0
+fi
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required for launch_data_collection.sh" >&2
@@ -69,7 +129,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   exit 1
 fi
 
-COMMON='cd '"$(printf '%q' "$(pwd)")"'; if [[ -f /opt/ros/humble/setup.bash ]]; then source /opt/ros/humble/setup.bash; fi; if [[ -f install/setup.bash ]]; then source install/setup.bash; fi; if [[ -f .venv_data_collection/bin/activate ]]; then source .venv_data_collection/bin/activate; fi'
+COMMON='cd '"$(printf '%q' "$(pwd)")"'; source '"$(printf '%q' "${ROS_SETUP}")"'; if [[ -f install/setup.bash ]]; then source install/setup.bash; fi; if [[ -f .venv_data_collection/bin/activate ]]; then source .venv_data_collection/bin/activate; fi'
 
 COLLECTOR_ARGS=(
   "--ros-args"
@@ -113,6 +173,7 @@ tmux split-window -t "$COLLECTOR_PANE" -v \
   "bash -lc '$COMMON; $VIEWER_CMD'"
 tmux select-layout -t "$SESSION:collector" tiled >/dev/null
 
+echo "Using ROS setup: $ROS_SETUP"
 echo "Started tmux session '$SESSION'. Attach with:"
 echo "  tmux attach -t $SESSION"
 echo "Collector pane:"
