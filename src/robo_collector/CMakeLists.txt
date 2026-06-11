@@ -29,6 +29,9 @@ if(BUILD_TESTING)
     ament_add_pytest_test(test_gr00t_converter test/test_gr00t_converter.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
+    ament_add_pytest_test(test_pi05_converter test/test_pi05_converter.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
   endif()
 endif()
 

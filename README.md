@@ -224,6 +224,39 @@ The converter currently targets this project's split-field source schema:
 The script exits with an error if the source dataset lacks required state
 columns or the selected action column.
 
+## Convert to OpenPI pi0.5
+
+The pi0.5 converter reads an existing Robo Collector dataset and writes a new
+OpenPI-friendly LeRobot v2.1 dataset for the `pi05_g1_finetune` data path.
+
+```bash
+python scripts/convert_outputs_to_pi05.py \
+  --source-root outputs \
+  --dataset-name robo_collector_YYYYMMDD_HHMMSS \
+  --dest-root exports \
+  --output-name robo_collector_YYYYMMDD_HHMMSS_pi05
+```
+
+Arguments:
+
+- `--source-root`: parent directory of the source dataset.
+- `--dataset-name`: source dataset directory name.
+- `--dest-root`: parent directory for converted datasets.
+- `--output-name`: converted dataset directory name; defaults to
+  `<dataset-name>_pi05`.
+- `--state-key`: 29-dim source state column; defaults to
+  `observation.state.joint_position`.
+- `--action-key`: 29-dim source action column; defaults to
+  `action.policy_action`.
+- `--history-window-index`: window to extract when the selected vector column is
+  a flat history vector whose length is a multiple of 29; defaults to `-1`.
+
+The converter writes compact OpenPI keys `head_image`, `ego_image`, `state`,
+`actions`, and `task_index`. Images are decoded from the source videos and
+embedded as PNG-backed Hugging Face image columns in parquet, matching the
+OpenPI G1 LeRobot training layout. It exits with an error if the source dataset
+lacks the required head/ego camera streams or selected 29-dim vector columns.
+
 ## Acknowledgement
 
 Robo Collector uses [StepIt](https://github.com/chengruiz/stepit) as the
