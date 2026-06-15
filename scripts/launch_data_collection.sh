@@ -65,51 +65,7 @@ done
 cd "$(dirname "$0")/.."
 
 resolve_ros_setup() {
-  local ros_root="${ROBO_COLLECTOR_ROS_ROOT:-/opt/ros}"
-  local setup_path=""
-  local candidates=()
-  local candidate=""
-
-  if [[ -n "${ROS_SETUP_PATH:-}" ]]; then
-    if [[ -f "${ROS_SETUP_PATH}" ]]; then
-      printf '%s\n' "${ROS_SETUP_PATH}"
-      return 0
-    fi
-
-    echo "ROS_SETUP_PATH points to a missing file: ${ROS_SETUP_PATH}" >&2
-    return 1
-  fi
-
-  if [[ -n "${ROS_DISTRO:-}" ]]; then
-    setup_path="${ros_root}/${ROS_DISTRO}/setup.bash"
-    if [[ -f "${setup_path}" ]]; then
-      printf '%s\n' "${setup_path}"
-      return 0
-    fi
-
-    echo "ROS_DISTRO is set to '${ROS_DISTRO}', but ${setup_path} does not exist." >&2
-    return 1
-  fi
-
-  for candidate in "${ros_root}"/*/setup.bash; do
-    [[ -f "${candidate}" ]] || continue
-    candidates+=("${candidate}")
-  done
-
-  if [[ "${#candidates[@]}" -eq 1 ]]; then
-    printf '%s\n' "${candidates[0]}"
-    return 0
-  fi
-
-  if [[ "${#candidates[@]}" -eq 0 ]]; then
-    echo "Unable to find a ROS 2 setup script under ${ros_root}." >&2
-  else
-    echo "Multiple ROS 2 setup scripts were found under ${ros_root}." >&2
-    printf '  %s\n' "${candidates[@]}" >&2
-  fi
-
-  echo "Export ROS_SETUP_PATH=/opt/ros/<distro>/setup.bash or ROS_DISTRO=<distro> before launching." >&2
-  return 1
+  bash scripts/resolve_ros_setup.sh
 }
 
 ROS_SETUP="$(resolve_ros_setup)"
