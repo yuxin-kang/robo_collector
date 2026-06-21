@@ -23,6 +23,7 @@ The default field configuration is:
 ```text
 robo_collector/
   configs/collection_fields.yml
+  configs/gesture_trigger_plan.example.yml
   scripts/
     setup_data_collection_env.sh
     launch_data_collection.sh
@@ -190,6 +191,36 @@ outputs/robo_collector_YYYYMMDD_HHMMSS/
 
 Restart the launch script or pass a different `--dataset-name` when you want a
 new dataset directory.
+
+## Gesture-Triggered Multi-Trial Recording
+
+For repeated trials of the same task prompt, run the standalone
+`gesture_trigger_node`. It reads a plan, watches `/robo_state/sample`, publishes
+the existing `RecordCommand` messages, and only advances progress after the
+planned `episode_id` appears in `meta/episodes.jsonl` with a non-empty saved
+trajectory.
+
+Start the normal collector first, then launch the trigger node in another shell:
+
+```bash
+ros2 run robo_collector gesture_trigger_node --ros-args \
+  -p plan_path:=$PWD/configs/gesture_trigger_plan.example.yml
+```
+
+Plan fields:
+
+- `dataset_root`: optional fixed dataset root. Leave it empty to discover the
+  active dataset root from `/robo_collector/status`.
+- `collector.fps`: recording frame rate used to enforce the configured
+  `max_tail_frames` bound.
+- `gesture_source`: which vector to read from `/robo_state/sample`.
+- `references` and `conditions`: calibration targets plus trigger thresholds.
+- `tasks`: one or more prompts, each with its own `target_trials`.
+
+The node publishes operator status on `/gesture_trigger/status` and writes a
+non-authoritative cache log to
+`<dataset_root>/meta/gesture_trigger_progress.json`. On restart, it rebuilds
+progress from `meta/episodes.jsonl` instead of trusting the progress log.
 
 ## Convert to Isaac-GR00T
 

@@ -1,0 +1,50 @@
+version: 1
+plan_id: "handshake_set_a_20260621"
+dataset_root: ""
+progress_path: ""
+
+collector:
+  command_topic: "/robo_collector/record_command"
+  status_topic: "/robo_collector/status"
+  fps: 50.0
+  save_confirm_timeout_sec: 20.0
+  status_timeout_sec: 5.0
+  ready_policy: "wait_for_idle"
+
+gesture_source:
+  topic: "/robo_state/sample"
+  field: "robot_state.joint_pos"
+  indices: [0, 1, 2]
+
+references:
+  ready:
+    vector: [0.0, 0.0, 0.0]
+  start:
+    vector: [0.2, 0.1, 0.0]
+  end:
+    vector: [0.0, -0.1, -0.2]
+
+conditions:
+  task_start_condition:
+    reference_name: "start"
+    threshold_l2: 0.05
+    release_threshold_l2: 0.08
+    stable_samples: 5
+    cooldown_sec: 1.0
+  task_end_condition:
+    reference_name: "end"
+    threshold_l2: 0.05
+    stable_samples: 5
+  return_to_ready_condition:
+    reference_name: "ready"
+    threshold_l2: 0.05
+    stable_samples: 10
+
+tail_bounds:
+  max_detection_latency_sec: 0.2
+  max_tail_frames: 10
+
+tasks:
+  - task_slug: "shake_hand"
+    task_prompt: "Shake hand with somebody"
+    target_trials: 50

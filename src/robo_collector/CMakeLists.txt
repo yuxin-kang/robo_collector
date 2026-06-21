@@ -8,6 +8,7 @@ ament_python_install_package(${PROJECT_NAME})
 
 install(PROGRAMS
   scripts/lerobot_collector_node
+  scripts/gesture_trigger_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -30,6 +31,21 @@ if(BUILD_TESTING)
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
     ament_add_pytest_test(test_pi05_converter test/test_pi05_converter.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_gesture_contract test/test_gesture_contract.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_gesture_metadata test/test_gesture_metadata.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_gesture_detection test/test_gesture_detection.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_gesture_trigger_state test/test_gesture_trigger_state.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_gesture_trigger_node test/test_gesture_trigger_node.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
   endif()
