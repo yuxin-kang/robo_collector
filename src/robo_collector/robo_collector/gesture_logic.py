@@ -15,6 +15,7 @@ from .gesture_plan import GestureCondition, GestureReference, GestureTriggerPlan
 class AttemptState(str, Enum):
     WAITING_READY = "WAITING_READY"
     ARMED = "ARMED"
+    WAITING_START_ACK = "WAITING_START_ACK"
     RECORDING = "RECORDING"
     WAITING_SAVE_METADATA = "WAITING_SAVE_METADATA"
     SAVED = "SAVED"
@@ -128,6 +129,9 @@ class GestureTriggerStateMachine:
         self.target_trials = plan.total_trials
         self.last_error = ""
         self.metadata_match_reason = ""
+        self._start_deadline_sec = 0.0
+        self._next_start_retry_sec = 0.0
+        self._start_attempts = 0
         self._save_deadline_sec = 0.0
 
     def bootstrap(self, snapshot: MetadataSnapshot) -> None:
@@ -145,6 +149,7 @@ class GestureTriggerStateMachine:
         end_triggered: bool = False,
         metadata_snapshot: MetadataSnapshot | None = None,
         collector_mode: str = "",
+        collector_episode_id: str = "",
     ) -> list[TriggerAction]:
         if self.attempt_state == AttemptState.COMPLETE:
             return []
@@ -157,6 +162,13 @@ class GestureTriggerStateMachine:
             self._handle_waiting_save(metadata_snapshot, collector_mode, now_sec)
             return []
 
+        if self.attempt_state == AttemptState.WAITING_START_ACK:
+            return self._handle_waiting_start_ack(
+                collector_mode=collector_mode,
+                collector_episode_id=collector_episode_id,
+                now_sec=now_sec,
+            )
+
         if self.attempt_state == AttemptState.WAITING_READY and ready_triggered:
             self.attempt_state = AttemptState.ARMED
             self.last_error = ""
@@ -166,15 +178,16 @@ class GestureTriggerStateMachine:
             if self.current_attempt is None:
                 self._pause_failed("no current attempt is available for START")
                 return []
-            self.attempt_state = AttemptState.RECORDING
+            self.attempt_state = AttemptState.WAITING_START_ACK
+            self._start_deadline_sec = (
+                now_sec + self._plan.collector.start_confirm_timeout_sec
+            )
+            self._next_start_retry_sec = (
+                now_sec + self._plan.collector.command_retry_interval_sec
+            )
+            self._start_attempts = 1
             self.last_error = ""
-            return [
-                TriggerAction(
-                    command="START",
-                    task_prompt=self.current_attempt.task_prompt,
-                    episode_id=self.current_attempt.episode_id,
-                )
-            ]
+            return [self._current_action("START")]
 
         if self.attempt_state == AttemptState.RECORDING and end_triggered:
             if self.current_attempt is None:
@@ -195,6 +208,67 @@ class GestureTriggerStateMachine:
             ]
 
         return []
+
+    def abort_active_attempt(self, message: str) -> TriggerAction | None:
+        should_stop = self.attempt_state in (
+            AttemptState.WAITING_START_ACK,
+            AttemptState.RECORDING,
+        )
+        action = self._current_action("STOP") if should_stop else None
+        self._pause_failed(message)
+        return action
+
+    def _handle_waiting_start_ack(
+        self,
+        *,
+        collector_mode: str,
+        collector_episode_id: str,
+        now_sec: float,
+    ) -> list[TriggerAction]:
+        if self.current_attempt is None:
+            self._pause_failed("waiting for START acknowledgement without a current attempt")
+            return []
+
+        expected_episode_id = self.current_attempt.episode_id
+        if collector_mode == "RECORDING":
+            if collector_episode_id != expected_episode_id:
+                self._pause_failed(
+                    "collector acknowledged a different episode while waiting for START: "
+                    f"expected {expected_episode_id!r}, got {collector_episode_id!r}"
+                )
+                return []
+            self.attempt_state = AttemptState.RECORDING
+            self.last_error = ""
+            return []
+
+        if collector_mode == "FAILED":
+            self._pause_failed("collector entered FAILED while waiting for START acknowledgement")
+            return []
+
+        if now_sec >= self._start_deadline_sec:
+            stop_action = self._current_action("STOP")
+            self._pause_failed("START acknowledgement timed out")
+            return [stop_action]
+
+        if (
+            now_sec >= self._next_start_retry_sec
+            and self._start_attempts < self._plan.collector.command_max_retries
+        ):
+            self._start_attempts += 1
+            self._next_start_retry_sec = (
+                now_sec + self._plan.collector.command_retry_interval_sec
+            )
+            return [self._current_action("START")]
+        return []
+
+    def _current_action(self, command: str) -> TriggerAction:
+        if self.current_attempt is None:
+            raise RuntimeError(f"cannot create {command} without a current attempt")
+        return TriggerAction(
+            command=command,
+            task_prompt=self.current_attempt.task_prompt,
+            episode_id=self.current_attempt.episode_id,
+        )
 
     def _handle_waiting_save(
         self, snapshot: MetadataSnapshot, collector_mode: str, now_sec: float

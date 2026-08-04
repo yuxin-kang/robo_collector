@@ -4,7 +4,7 @@ try:
     import cv2
     import numpy as np
 
-    from robo_collector_camera.client import decode_packet
+    from robo_collector_camera.client import CameraPacketError, decode_packet
 except ModuleNotFoundError as exc:
     if exc.name not in {"cv2", "numpy"}:
         raise
@@ -28,6 +28,7 @@ class CameraClientDecodeTest(unittest.TestCase):
         packet = {
             "schema": "robo_collector_camera.v2",
             "timestamps": {"head": 1.0, "ego_view": 1.1},
+            "sequences": {"head": 10, "ego_view": 11},
             "images": {
                 "head": _encode_jpeg_rgb(head),
                 "ego_view": _encode_jpeg_rgb(ego_view),
@@ -41,8 +42,42 @@ class CameraClientDecodeTest(unittest.TestCase):
         self.assertEqual(set(decoded["images"]), {"head", "ego_view"})
         self.assertEqual(decoded["images"]["head"].shape, (4, 5, 3))
         self.assertEqual(decoded["images"]["ego_view"].shape, (3, 6, 3))
+        self.assertEqual(decoded["sequences"], {"head": 10, "ego_view": 11})
         self.assertEqual(decoded["host"], "robot")
         self.assertEqual(decoded["port"], 5555)
+
+    def test_rejects_wrong_schema_nonfinite_timestamp_and_invalid_blob(self):
+        assert decode_packet is not None
+        with self.assertRaisesRegex(CameraPacketError, "schema"):
+            decode_packet({"schema": "unknown", "images": {}})
+
+        base = {
+            "schema": "robo_collector_camera.v2",
+            "timestamps": {"head": float("nan")},
+            "sequences": {"head": 0},
+            "images": {"head": b"not-an-image"},
+        }
+        with self.assertRaisesRegex(CameraPacketError, "finite"):
+            decode_packet(base)
+
+        base["timestamps"]["head"] = 1.0
+        with self.assertRaisesRegex(CameraPacketError, "decode"):
+            decode_packet(base)
+
+    def test_rejects_fractional_sequence(self):
+        assert cv2 is not None
+        assert np is not None
+        assert decode_packet is not None
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        with self.assertRaisesRegex(CameraPacketError, "non-negative integer"):
+            decode_packet(
+                {
+                    "schema": "robo_collector_camera.v2",
+                    "timestamps": {"head": 1.0},
+                    "sequences": {"head": 1.0},
+                    "images": {"head": _encode_jpeg_rgb(image)},
+                }
+            )
 
 
 def _encode_jpeg_rgb(image_rgb):

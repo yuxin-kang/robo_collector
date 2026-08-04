@@ -286,11 +286,10 @@ if rclpy is not None:  # pragma: no branch
                 and self._dataset_root
                 and snapshot.dataset_root != self._dataset_root
             ):
-                self._fatal_error = (
+                self._set_fatal_error(
                     "collector dataset_root changed from "
                     f"{self._dataset_root} to {snapshot.dataset_root}"
                 )
-                self.get_logger().error(self._fatal_error)
             self._latest_collector_status = snapshot
 
         def _tick(self) -> None:
@@ -322,6 +321,7 @@ if rclpy is not None:  # pragma: no branch
                 end_triggered=self._end_triggered(now_sec),
                 metadata_snapshot=metadata_snapshot,
                 collector_mode=self._collector_mode(now_sec),
+                collector_episode_id=self._collector_episode_id(now_sec),
             )
             for action in actions:
                 self._publish_action(action)
@@ -475,6 +475,15 @@ if rclpy is not None:  # pragma: no branch
                 return ""
             return self._latest_collector_status.mode
 
+        def _collector_episode_id(self, now_sec: float) -> str:
+            if not collector_status_is_fresh(
+                self._latest_collector_status,
+                now_sec,
+                self._plan.collector.status_timeout_sec,
+            ):
+                return ""
+            return self._latest_collector_status.values.get("episode_id", "")
+
         def _current_gesture_vector(self, now_sec: float) -> list[float] | None:
             sample = self._latest_sample
             if sample is None:
@@ -488,8 +497,7 @@ if rclpy is not None:  # pragma: no branch
                     self._plan.gesture_source.indices,
                 )
             except ValueError as exc:
-                self._fatal_error = str(exc)
-                self.get_logger().error(self._fatal_error)
+                self._set_fatal_error(str(exc))
                 return None
 
         def _update_detector_or_fail(
@@ -504,16 +512,16 @@ if rclpy is not None:  # pragma: no branch
                 now_sec,
             )
             if error:
-                self._fatal_error = error
-                self.get_logger().error(self._fatal_error)
+                self._set_fatal_error(error)
             return result
 
         def _validate_tail_bound(self, now_sec: float) -> None:
             if self._fatal_error:
                 return
             if self._collector_fps <= 0.0:
-                self._fatal_error = "collector_fps must be > 0 to enforce max_tail_frames"
-                self.get_logger().error(self._fatal_error)
+                self._set_fatal_error(
+                    "collector_fps must be > 0 to enforce max_tail_frames"
+                )
                 return
             try:
                 tail_frames = detection_tail_frames(
@@ -521,17 +529,15 @@ if rclpy is not None:  # pragma: no branch
                     self._collector_fps,
                 )
             except ValueError as exc:
-                self._fatal_error = str(exc)
-                self.get_logger().error(self._fatal_error)
+                self._set_fatal_error(str(exc))
                 return
             if tail_frames > self._plan.tail_bounds.max_tail_frames:
-                self._fatal_error = (
+                self._set_fatal_error(
                     "tail bound impossible: "
                     f"latency {self._plan.tail_bounds.max_detection_latency_sec:.3f}s "
                     f"at collector fps {self._collector_fps:g} implies {tail_frames} tail frames, "
                     f"which exceeds max_tail_frames={self._plan.tail_bounds.max_tail_frames}"
                 )
-                self.get_logger().error(self._fatal_error)
 
         def _publish_action(self, action: TriggerAction) -> None:
             msg = RecordCommand()
@@ -616,8 +622,22 @@ if rclpy is not None:  # pragma: no branch
                 current=current,
                 events=self._events,
             )
-            write_progress_log(self._progress_path, progress)
+            try:
+                write_progress_log(self._progress_path, progress)
+            except OSError as exc:
+                message = f"failed to persist gesture progress: {exc}"
+                self._set_fatal_error(message)
+                return
             self._last_progress_signature = signature
+
+        def _set_fatal_error(self, message: str) -> None:
+            if self._fatal_error:
+                return
+            self._fatal_error = message
+            self.get_logger().error(message)
+            stop_action = self._machine.abort_active_attempt(message)
+            if stop_action is not None:
+                self._publish_action(stop_action)
 
         def _current_progress_attempt(self) -> ProgressCurrent | None:
             attempt = self._machine.current_attempt

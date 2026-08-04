@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -15,8 +16,17 @@ from robo_state_msgs.msg import RoboStateSample
 
 from .camera_cache import CameraFrameCache, parse_camera_streams
 from .collector_state import CollectorMode, RecordStateMachine
-from .field_config import FieldConfigError, load_optional_field_selection
+from .field_config import (
+    FieldConfigError,
+    default_field_selection,
+    load_optional_field_selection,
+)
 from .lerobot_dataset import LeRobotV21Writer, RobotFrame
+from .sample_alignment import (
+    message_stamp_sec,
+    selected_missing_inputs,
+    source_timestamp_skew_sec,
+)
 
 
 @dataclass(frozen=True)
@@ -41,9 +51,11 @@ class LeRobotCollectorNode(Node):
         self.declare_parameter("dataset_name", "")
         self.declare_parameter("root_output_dir", "outputs")
         self.declare_parameter("field_config_path", "")
-        self.declare_parameter("fps", 50)
+        self.declare_parameter("fps", 30)
         self.declare_parameter("max_state_age_sec", 0.2)
         self.declare_parameter("max_camera_age_sec", 0.2)
+        self.declare_parameter("max_inter_camera_skew_sec", 0.1)
+        self.declare_parameter("max_state_camera_skew_sec", 0.1)
 
         self._fps = int(self.get_parameter("fps").value)
         self._robo_state_topic = str(self.get_parameter("robo_state_topic").value)
@@ -53,6 +65,21 @@ class LeRobotCollectorNode(Node):
         self._max_camera_age_sec = float(
             self.get_parameter("max_camera_age_sec").value
         )
+        self._max_inter_camera_skew_sec = float(
+            self.get_parameter("max_inter_camera_skew_sec").value
+        )
+        self._max_state_camera_skew_sec = float(
+            self.get_parameter("max_state_camera_skew_sec").value
+        )
+        for name, value in (
+            ("fps", self._fps),
+            ("max_state_age_sec", self._max_state_age_sec),
+            ("max_camera_age_sec", self._max_camera_age_sec),
+            ("max_inter_camera_skew_sec", self._max_inter_camera_skew_sec),
+            ("max_state_camera_skew_sec", self._max_state_camera_skew_sec),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise RuntimeError(f"{name} must be finite and positive")
         legacy_camera_stream = str(self.get_parameter("camera_stream").value).strip()
         if legacy_camera_stream:
             camera_streams = [legacy_camera_stream]
@@ -69,6 +96,7 @@ class LeRobotCollectorNode(Node):
             self.get_logger().error(message)
             raise RuntimeError(message) from exc
 
+        self._field_selection = field_selection or default_field_selection()
         self._state_machine = RecordStateMachine()
         self._writer = LeRobotV21Writer(
             str(self.get_parameter("root_output_dir").value),
@@ -77,7 +105,7 @@ class LeRobotCollectorNode(Node):
             camera_keys=[
                 f"observation.images.{stream}" for stream in camera_streams
             ],
-            field_selection=field_selection,
+            field_selection=self._field_selection,
         )
         self._latest_state: CachedStateSample | None = None
         self._last_warn_message = ""
@@ -86,6 +114,9 @@ class LeRobotCollectorNode(Node):
         self._last_status_log_monotonic_sec = 0.0
         self._state_sample_count = 0
         self._last_state_sample_log_monotonic_sec = 0.0
+        self._last_recorded_camera_identity: (
+            tuple[tuple[str, int | float | None], ...] | None
+        ) = None
 
         qos = QoSProfile(depth=10)
         self._status_pub = self.create_publisher(
@@ -109,6 +140,8 @@ class LeRobotCollectorNode(Node):
             int(self.get_parameter("camera_port").value),
             camera_streams,
             self.get_logger(),
+            max_inter_camera_skew_sec=self._max_inter_camera_skew_sec,
+            expected_fps=self._fps,
         )
         self._camera_cache.start()
 
@@ -154,6 +187,7 @@ class LeRobotCollectorNode(Node):
                     DiagnosticStatus.ERROR, f"failed to start episode: {exc}"
                 )
                 return
+            self._last_recorded_camera_identity = None
             self._publish_status(
                 DiagnosticStatus.OK,
                 f"RECORDING episode {episode_index}: {result.session.task_prompt}",
@@ -204,10 +238,51 @@ class LeRobotCollectorNode(Node):
             )
             return
 
+        if camera_bundle.identity == self._last_recorded_camera_identity:
+            self._publish_warn_throttled("camera frame bundle has already been recorded")
+            return
+
+        missing_selected = selected_missing_inputs(
+            getattr(state.msg, "missing_optional_fields", ()),
+            self._field_selection,
+        )
+        if missing_selected:
+            self._publish_warn_throttled(
+                "selected state/action field(s) missing or stale: "
+                + ",".join(missing_selected)
+            )
+            return
+
+        state_timestamp_sec = message_stamp_sec(state.msg)
+        camera_timestamps_sec = [
+            frame.camera_timestamp_sec for frame in camera_bundle.frames.values()
+        ]
+        source_skew_sec = source_timestamp_skew_sec(
+            state_timestamp_sec, camera_timestamps_sec
+        )
+        if source_skew_sec is None:
+            self._publish_warn_throttled(
+                "state/camera source timestamp unavailable or invalid"
+            )
+            return
+        if source_skew_sec > self._max_state_camera_skew_sec:
+            self._publish_warn_throttled(
+                "state/camera source timestamp skew "
+                f"{source_skew_sec:.3f}s exceeds "
+                f"{self._max_state_camera_skew_sec:.3f}s"
+            )
+            return
+
         try:
             self._writer.add_frame(
-                _robot_frame_from_msg(state.msg), camera_bundle.images
+                _robot_frame_from_msg(state.msg),
+                camera_bundle.images,
+                camera_timestamps_sec={
+                    stream: frame.camera_timestamp_sec
+                    for stream, frame in camera_bundle.frames.items()
+                },
             )
+            self._last_recorded_camera_identity = camera_bundle.identity
         except Exception as exc:
             reason = self._writer.active_failed_reason or str(exc)
             self._state_machine.mark_failed(reason)
@@ -308,6 +383,22 @@ class LeRobotCollectorNode(Node):
         status.values = [
             KeyValue(key="mode", value=self._state_machine.mode.value),
             KeyValue(key="dataset_root", value=str(self._writer.root)),
+            KeyValue(
+                key="episode_id",
+                value=(
+                    self._state_machine.session.episode_id
+                    if self._state_machine.session is not None
+                    else ""
+                ),
+            ),
+            KeyValue(
+                key="task_prompt",
+                value=(
+                    self._state_machine.session.task_prompt
+                    if self._state_machine.session is not None
+                    else ""
+                ),
+            ),
             KeyValue(key="fps", value=str(self._fps)),
             KeyValue(key="active_episode", value=str(self._writer.active_episode_index)),
             KeyValue(key="active_frames", value=str(self._writer.active_frame_count)),
@@ -421,6 +512,7 @@ def _robot_frame_from_msg(msg: RoboStateSample) -> RobotFrame:
             ],
         },
         joint_names=list(msg.robot_state.joint_names),
+        state_timestamp_sec=message_stamp_sec(msg),
     )
 
 

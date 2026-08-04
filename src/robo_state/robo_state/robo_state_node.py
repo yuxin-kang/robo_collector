@@ -36,6 +36,7 @@ class RoboStateNode(Node):
         self.declare_parameter("publish_only_when_complete", True)
         self.declare_parameter("validate_observation", True)
         self.declare_parameter("max_cache_age_sec", 0.2)
+        self.declare_parameter("max_required_skew_sec", 0.2)
 
         self._stepit_ns = self._normalize_namespace(
             str(self.get_parameter("stepit_ns").value)
@@ -46,6 +47,9 @@ class RoboStateNode(Node):
 
         self._assembler = RoboStateAssembler(
             max_cache_age_sec=float(self.get_parameter("max_cache_age_sec").value),
+            max_required_skew_sec=float(
+                self.get_parameter("max_required_skew_sec").value
+            ),
             publish_only_when_complete=bool(
                 self.get_parameter("publish_only_when_complete").value
             ),
@@ -152,14 +156,21 @@ class RoboStateNode(Node):
             robot_state = parse_joint_state(
                 msg.name, msg.position, msg.velocity, msg.effort
             )
+            stamp_sec = self._message_stamp_sec(msg, now_sec)
         except ValidationError as exc:
             self._publish_status(DiagnosticStatus.ERROR, str(exc), ["joint_states"])
             return
-        self._assembler.update_robot_state(robot_state, now_sec)
+        self._assembler.update_robot_state(robot_state, stamp_sec)
 
     def _on_imu(self, msg: Imu) -> None:
         self._log_stepit_input_received("imu")
-        self._assembler.update_imu(msg, self._now_sec())
+        now_sec = self._now_sec()
+        try:
+            self._assembler.update_imu(
+                msg, self._message_stamp_sec(msg, now_sec)
+            )
+        except ValidationError as exc:
+            self._publish_status(DiagnosticStatus.ERROR, str(exc), ["imu"])
 
     def _on_stepit_status(self, msg: DiagnosticStatus) -> None:
         self._log_stepit_input_received("status")
@@ -177,7 +188,9 @@ class RoboStateNode(Node):
             return
 
         msg = self._to_sample_msg(result.sample)
-        msg.header.stamp = self.get_clock().now().to_msg()
+        sample_nanoseconds = round(result.sample.sample_stamp_sec * 1_000_000_000)
+        msg.header.stamp.sec = sample_nanoseconds // 1_000_000_000
+        msg.header.stamp.nanosec = sample_nanoseconds % 1_000_000_000
         msg.header.frame_id = "stepit"
         self._sample_pub.publish(msg)
         self._published_sample_count += 1
@@ -205,7 +218,11 @@ class RoboStateNode(Node):
         msg.aligned_target_pos = sample.aligned_target_pos
         msg.action = sample.action
         msg.stepit_observation = sample.stepit_observation
-        msg.observation_l2_error = float(sample.observation_l2_error)
+        msg.observation_l2_error = (
+            -1.0
+            if sample.observation_l2_error is None
+            else float(sample.observation_l2_error)
+        )
         msg.missing_optional_fields = sample.missing_optional_fields
         return msg
 
@@ -257,6 +274,10 @@ class RoboStateNode(Node):
             KeyValue(
                 key="max_cache_age_sec",
                 value=str(self._assembler.max_cache_age_sec),
+            ),
+            KeyValue(
+                key="max_required_skew_sec",
+                value=str(self._assembler.max_required_skew_sec),
             ),
         ]
         if self._latest_stepit_status is not None:
@@ -362,6 +383,16 @@ class RoboStateNode(Node):
 
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+    @staticmethod
+    def _message_stamp_sec(msg: object, fallback_sec: float) -> float:
+        """Use a sensor source stamp when present; headerless fields use receive time."""
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        if stamp is None:
+            return fallback_sec
+        stamp_sec = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        return stamp_sec if stamp_sec > 0 else fallback_sec
 
 
 def _diagnostic_level_number(level: object) -> int:

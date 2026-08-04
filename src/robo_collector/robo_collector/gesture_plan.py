@@ -24,7 +24,10 @@ class GesturePlanError(ValueError):
 class CollectorPlanConfig:
     command_topic: str = "/robo_collector/record_command"
     status_topic: str = "/robo_collector/status"
-    fps: float = 50.0
+    fps: float = 30.0
+    start_confirm_timeout_sec: float = 5.0
+    command_retry_interval_sec: float = 0.5
+    command_max_retries: int = 5
     save_confirm_timeout_sec: float = 20.0
     status_timeout_sec: float = 5.0
     auto_discard: bool = False
@@ -190,8 +193,20 @@ def _parse_collector(value: Any, *, source: str) -> CollectorPlanConfig:
         command_topic=str(value.get("command_topic", "/robo_collector/record_command")).strip(),
         status_topic=str(value.get("status_topic", "/robo_collector/status")).strip(),
         fps=_positive_float(
-            value.get("fps", 50.0),
+            value.get("fps", 30.0),
             source=f"{source}: collector.fps",
+        ),
+        start_confirm_timeout_sec=_positive_float(
+            value.get("start_confirm_timeout_sec", 5.0),
+            source=f"{source}: collector.start_confirm_timeout_sec",
+        ),
+        command_retry_interval_sec=_positive_float(
+            value.get("command_retry_interval_sec", 0.5),
+            source=f"{source}: collector.command_retry_interval_sec",
+        ),
+        command_max_retries=_positive_int(
+            value.get("command_max_retries", 5),
+            source=f"{source}: collector.command_max_retries",
         ),
         save_confirm_timeout_sec=_positive_float(
             value.get("save_confirm_timeout_sec", 20.0),

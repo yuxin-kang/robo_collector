@@ -65,6 +65,22 @@ class GestureMetadataTest(unittest.TestCase):
                 [
                     {
                         "episode_id": _episode_id(plan.plan_id, "shake_hand", 0, 1),
+                        "tasks": ["Shake hand with somebody"],
+                        "length": 1.5,
+                    }
+                ],
+            )
+            snapshot = scan_plan_metadata(root, plan)
+            self.assertEqual(
+                snapshot.status_for(plan.planned_trials[0]).latest_state,
+                "EMPTY",
+            )
+
+            _write_episodes(
+                root,
+                [
+                    {
+                        "episode_id": _episode_id(plan.plan_id, "shake_hand", 0, 1),
                         "tasks": ["Wave hello"],
                         "length": 5,
                     }
@@ -167,6 +183,33 @@ class GestureMetadataTest(unittest.TestCase):
 
             self.assertIsNone(load_progress_log(path))
 
+    def test_missing_or_empty_media_does_not_mark_trial_success(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_episodes(
+                root,
+                [
+                    {
+                        "episode_id": _episode_id(plan.plan_id, "shake_hand", 0, 1),
+                        "tasks": ["Shake hand with somebody"],
+                        "length": 12,
+                        "data_path": "data/missing.parquet",
+                        "video_paths": {
+                            "observation.images.head": "videos/missing.mp4"
+                        },
+                    }
+                ],
+                create_media=False,
+            )
+
+            status = scan_plan_metadata(root, plan).status_for(
+                plan.planned_trials[0]
+            )
+
+            self.assertFalse(status.complete)
+            self.assertEqual(status.latest_state, "INCOMPLETE_MEDIA")
+
     def test_parse_error_is_reported(self):
         plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
         with TemporaryDirectory() as tmp:
@@ -180,13 +223,39 @@ class GestureMetadataTest(unittest.TestCase):
             self.assertIn("invalid JSONL", snapshot.parse_error)
 
 
-def _write_episodes(root: Path, rows: list[dict]) -> None:
+def _write_episodes(
+    root: Path, rows: list[dict], *, create_media: bool = True
+) -> None:
+    for index, row in enumerate(rows):
+        try:
+            has_frames = int(row.get("length", 0)) > 0
+        except (TypeError, ValueError):
+            has_frames = False
+        if not create_media or not has_frames:
+            continue
+        data_path = str(row.setdefault("data_path", f"data/episode_{index}.parquet"))
+        video_paths = row.setdefault(
+            "video_paths",
+            {
+                "observation.images.head": f"videos/head/episode_{index}.mp4",
+                "observation.images.ego_view": f"videos/ego/episode_{index}.mp4",
+            },
+        )
+        _write_nonempty(root / data_path)
+        for video_path in video_paths.values():
+            _write_nonempty(root / str(video_path))
+
     episodes_path = root / "meta/episodes.jsonl"
     episodes_path.parent.mkdir(parents=True, exist_ok=True)
     episodes_path.write_text(
         "".join(_json_line(row) for row in rows),
         encoding="utf-8",
     )
+
+
+def _write_nonempty(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"test")
 
 
 def _json_line(row: dict) -> str:

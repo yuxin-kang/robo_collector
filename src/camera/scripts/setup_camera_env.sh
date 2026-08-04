@@ -27,6 +27,40 @@ done
 
 cd "$(dirname "$0")/.."
 
+validate_venv_target() {
+  local requested="$1"
+  local project_root
+  local resolved
+  local relative
+  project_root="$(pwd -P)"
+  if [[ -L "$requested" ]]; then
+    echo "Refusing symlink --venv path: $requested" >&2
+    exit 2
+  fi
+  resolved="$(realpath -m -- "$requested")"
+  relative="${resolved#"$project_root"/}"
+
+  if [[ "$resolved" == "$project_root" || "$relative" == "$resolved" || "$relative" == */* ]]; then
+    echo "Refusing unsafe --venv path outside the camera project root: $requested" >&2
+    exit 2
+  fi
+  if [[ "$relative" != ".venv" && "$relative" != .venv_* ]]; then
+    echo "Refusing --venv path without a dedicated .venv/.venv_* name: $requested" >&2
+    exit 2
+  fi
+  if [[ -L "$resolved" ]]; then
+    echo "Refusing symlink --venv path: $requested" >&2
+    exit 2
+  fi
+  if [[ -e "$resolved" && ! -f "$resolved/pyvenv.cfg" ]]; then
+    echo "Refusing to replace existing non-venv directory: $requested" >&2
+    exit 2
+  fi
+  VENV_DIR="$resolved"
+}
+
+validate_venv_target "$VENV_DIR"
+
 create_venv() {
   local venv_dir="$1"
 
@@ -37,7 +71,7 @@ create_venv() {
   echo
   echo "python3 -m venv failed; falling back to user-space virtualenv."
   echo "This avoids requiring sudo/python3-venv on locked-down machines."
-  rm -rf "$venv_dir"
+  rm -rf -- "$venv_dir"
 
   if python3 -m virtualenv --version >/dev/null 2>&1; then
     python3 -m virtualenv "$venv_dir"
@@ -51,7 +85,7 @@ create_venv() {
 }
 
 if [[ ! -x "$VENV_DIR/bin/python" || ! -f "$VENV_DIR/bin/activate" ]]; then
-  rm -rf "$VENV_DIR"
+  rm -rf -- "$VENV_DIR"
   create_venv "$VENV_DIR"
 fi
 
@@ -69,4 +103,4 @@ python -m pip install -e .
 echo
 echo "Camera environment ready."
 echo "Activate with:"
-echo "  source $(pwd)/$VENV_DIR/bin/activate"
+echo "  source $VENV_DIR/bin/activate"

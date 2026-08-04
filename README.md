@@ -134,8 +134,13 @@ bash scripts/launch_data_collection.sh \
   --camera-port 5555 \
   --camera-streams head,ego_view \
   --root-output-dir outputs \
-  --fps 50
+  --fps 30
 ```
+
+The recommended `configs/collection_fields.yml` also stores
+`observation.state.joint_position` and `action.policy_action`, so the same
+source dataset satisfies the default inputs of both the GR00T and OpenPI pi0.5
+converters.
 
 The launch script creates a tmux session:
 

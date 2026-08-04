@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from robo_state.state_builder import (
     ALIGNED_TARGET_POS_DIM,
@@ -10,6 +11,7 @@ from robo_state.state_builder import (
     STEPIT_OBSERVATION_DIM,
     ValidationError,
     flatten_policy_fields,
+    observation_l2_error,
     parse_joint_state,
 )
 
@@ -64,6 +66,97 @@ class StateBuilderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "action has dimension 28"):
             assembler.update_field("action", [0.0] * (DOF - 1), 1.0)
 
+    def test_non_finite_field_value_is_rejected(self):
+        assembler = RoboStateAssembler()
+
+        for non_finite in (float("nan"), float("inf"), float("-inf")):
+            values = [0.0] * DOF
+            values[4] = non_finite
+            with self.subTest(non_finite=non_finite):
+                with self.assertRaisesRegex(ValidationError, "must be finite"):
+                    assembler.update_field("action", values, 1.0)
+
+    def test_non_finite_joint_state_value_is_rejected(self):
+        names, position, velocity, effort = _joint_state_parts()
+        velocity[3] = float("nan")
+
+        with self.assertRaisesRegex(
+            ValidationError, r"joint_states\.velocity\[3\] must be finite"
+        ):
+            parse_joint_state(names, position, velocity, effort)
+
+    def test_non_finite_imu_value_is_rejected(self):
+        assembler = RoboStateAssembler()
+        imu = _imu(linear_acceleration_x=float("inf"))
+
+        with self.assertRaisesRegex(
+            ValidationError, r"imu\.linear_acceleration\.x must be finite"
+        ):
+            assembler.update_imu(imu, 1.0)
+
+    def test_stale_optional_fields_are_defaulted_and_reported(self):
+        assembler = RoboStateAssembler(max_cache_age_sec=0.5)
+        now_sec = 10.0
+        _populate_required_inputs(assembler, now_sec)
+        assembler.update_field("action", [7.0] * DOF, now_sec - 1.0)
+        assembler.update_field("target_joint_pos", [8.0] * DOF, now_sec)
+
+        result = assembler.build_sample(now_sec)
+
+        self.assertIsNotNone(result.sample)
+        self.assertEqual(result.sample.action, [0.0] * DOF)
+        self.assertEqual(result.sample.target_joint_pos, [8.0] * DOF)
+        self.assertIn("action", result.sample.missing_optional_fields)
+
+    def test_required_input_cross_field_skew_rejects_sample(self):
+        assembler = RoboStateAssembler(
+            max_cache_age_sec=1.0, max_required_skew_sec=0.1
+        )
+        _populate_required_inputs(assembler, 10.0)
+        assembler.update_field(
+            POLICY_FIELD_SPECS[0].name,
+            [0.0] * POLICY_FIELD_SPECS[0].dim,
+            9.8,
+        )
+
+        result = assembler.build_sample(10.0)
+
+        self.assertIsNone(result.sample)
+        self.assertEqual(result.issues, ["required_input_skew"])
+        self.assertIn("0.200000s > 0.100000s", result.message)
+
+    def test_aligned_target_receive_time_is_sample_time_anchor(self):
+        assembler = RoboStateAssembler(
+            max_cache_age_sec=1.0, max_required_skew_sec=0.2
+        )
+        _populate_required_inputs(assembler, 10.0, aligned_stamp_sec=9.95)
+
+        result = assembler.build_sample(10.0)
+
+        self.assertIsNotNone(result.sample)
+        self.assertEqual(result.sample.sample_stamp_sec, 9.95)
+
+    def test_mismatched_observation_dimensions_are_not_reported_as_zero_error(self):
+        assembler = RoboStateAssembler(max_cache_age_sec=1.0)
+        now_sec = 10.0
+        _populate_required_inputs(assembler, now_sec)
+        assembler.update_field(
+            "observation", [0.0] * STEPIT_OBSERVATION_DIM, now_sec
+        )
+
+        result = assembler.build_sample(now_sec)
+
+        self.assertIsNotNone(result.sample)
+        self.assertIsNone(result.sample.observation_l2_error)
+        self.assertIn(
+            "observation_l2_error", result.sample.missing_optional_fields
+        )
+        with self.assertRaisesRegex(ValidationError, "cannot compare"):
+            observation_l2_error(
+                [0.0] * OBSERVATION_DIM,
+                [0.0] * STEPIT_OBSERVATION_DIM,
+            )
+
     def test_sample_contains_aligned_target_and_selected_policy_fields(self):
         assembler = RoboStateAssembler(max_cache_age_sec=1.0)
         now_sec = 10.0
@@ -89,7 +182,10 @@ class StateBuilderTest(unittest.TestCase):
 
         self.assertIsNotNone(result.sample)
         self.assertEqual(result.sample.aligned_target_pos, [1.0] * 45)
-        self.assertAlmostEqual(result.sample.observation_l2_error, 0.0)
+        self.assertIsNone(result.sample.observation_l2_error)
+        self.assertIn(
+            "observation_l2_error", result.sample.missing_optional_fields
+        )
         self.assertEqual(len(result.sample.policy_flattened), OBSERVATION_DIM)
         self.assertEqual(result.sample.policy_flattened, flattened)
 
@@ -125,3 +221,33 @@ def _joint_state_parts():
         effort.append(900.0 + i)
 
     return names, position, velocity, effort
+
+
+def _populate_required_inputs(
+    assembler: RoboStateAssembler,
+    stamp_sec: float,
+    *,
+    aligned_stamp_sec: float | None = None,
+) -> None:
+    for spec in POLICY_FIELD_SPECS:
+        assembler.update_field(spec.name, [0.0] * spec.dim, stamp_sec)
+    assembler.update_field(
+        "aligned_target_pos",
+        [0.0] * ALIGNED_TARGET_POS_DIM,
+        stamp_sec if aligned_stamp_sec is None else aligned_stamp_sec,
+    )
+    assembler.update_robot_state(RobotLowStateData.zero(), stamp_sec)
+    assembler.update_imu(_imu(), stamp_sec)
+
+
+def _imu(*, linear_acceleration_x: float = 0.0) -> SimpleNamespace:
+    return SimpleNamespace(
+        orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+        angular_velocity=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+        linear_acceleration=SimpleNamespace(
+            x=linear_acceleration_x, y=0.0, z=0.0
+        ),
+        orientation_covariance=[0.0] * 9,
+        angular_velocity_covariance=[0.0] * 9,
+        linear_acceleration_covariance=[0.0] * 9,
+    )

@@ -1,5 +1,6 @@
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -34,12 +35,23 @@ class FakeFrame:
     shape = (4, 6, 3)
 
 
+class DifferentShapeFrame:
+    shape = (5, 7, 3)
+
+
 class LeRobotV21WriterTest(unittest.TestCase):
     def test_idle_writer_does_not_create_dataset(self):
         with TemporaryDirectory() as tmp:
             writer = _writer(tmp)
 
             self.assertFalse(writer.root.exists())
+
+    def test_writer_requires_integer_fps(self):
+        with TemporaryDirectory() as tmp:
+            for fps in (True, 0, 30.5):
+                with self.subTest(fps=fps):
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        LeRobotV21Writer(tmp, dataset_name="dataset", fps=fps)
 
     def test_save_episode_writes_structure_and_task_annotation(self):
         parquet_rows = {}
@@ -185,6 +197,68 @@ class LeRobotV21WriterTest(unittest.TestCase):
             self.assertEqual(
                 set(modality["observation"]["images"]), {"head", "ego_view"}
             )
+
+    def test_source_timestamps_preserve_real_frame_gaps_and_camera_offsets(self):
+        parquet_rows = {}
+
+        def write_fake_parquet(path, rows):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            parquet_rows[path.name] = rows
+            path.write_text(json.dumps(rows), encoding="utf-8")
+
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp, parquet_writer=write_fake_parquet)
+            writer.start_episode("timed")
+            writer.add_frame(
+                replace(_robot_frame(), state_timestamp_sec=100.00),
+                FakeFrame(),
+                camera_timestamps_sec={"ego_view": 99.98},
+            )
+            writer.add_frame(
+                replace(_robot_frame(), state_timestamp_sec=100.12),
+                FakeFrame(),
+                camera_timestamps_sec={
+                    "observation.images.ego_view": 100.10
+                },
+            )
+
+            writer.save_episode()
+
+            rows = parquet_rows["train-000000.parquet"]
+            self.assertAlmostEqual(rows[0]["timestamp"], 0.02)
+            self.assertAlmostEqual(
+                rows[0]["observation.images.ego_view"]["timestamp"], 0.0
+            )
+            self.assertAlmostEqual(rows[1]["timestamp"], 0.14)
+            self.assertAlmostEqual(
+                rows[1]["observation.images.ego_view"]["timestamp"], 0.12
+            )
+
+    def test_source_timestamps_must_be_finite_and_monotonic(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("timed")
+
+            with self.assertRaisesRegex(
+                ValueError, "state_timestamp_sec must be finite"
+            ):
+                writer.add_frame(
+                    replace(_robot_frame(), state_timestamp_sec=float("nan")),
+                    FakeFrame(),
+                )
+
+            writer.add_frame(
+                replace(_robot_frame(), state_timestamp_sec=100.0),
+                FakeFrame(),
+                camera_timestamps_sec={"ego_view": 100.0},
+            )
+            with self.assertRaisesRegex(ValueError, "state timestamp moved backwards"):
+                writer.add_frame(
+                    replace(_robot_frame(), state_timestamp_sec=99.0),
+                    FakeFrame(),
+                    camera_timestamps_sec={"ego_view": 100.1},
+                )
+            writer.discard_episode()
 
     def test_field_selection_writes_only_selected_robot_fields(self):
         parquet_rows = {}
@@ -421,6 +495,213 @@ class LeRobotV21WriterTest(unittest.TestCase):
                 ValueError, "field selection does not match existing dataset"
             ):
                 _writer(tmp)
+
+    def test_selected_numeric_values_must_be_finite_before_video_write(self):
+        with TemporaryDirectory() as tmp:
+            for invalid_value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(invalid_value=invalid_value):
+                    writer = _writer(
+                        tmp, dataset_name=f"dataset-{str(invalid_value)}"
+                    )
+                    writer.start_episode("invalid numeric value")
+                    frame = _robot_frame()
+                    joint_position = list(frame.joint_position)
+                    joint_position[7] = invalid_value
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"observation\.state\.joint_position\[7\] must be finite",
+                    ):
+                        writer.add_frame(
+                            replace(frame, joint_position=joint_position),
+                            FakeFrame(),
+                        )
+
+                    self.assertEqual(writer.active_frame_count, 0)
+                    self.assertFalse(writer.root.exists())
+
+    def test_joint_names_cannot_change_within_or_across_episodes(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("canonical order")
+            writer.add_frame(_robot_frame(), FakeFrame())
+
+            with self.assertRaisesRegex(
+                ValueError, "joint_names changed from the dataset canonical ordering"
+            ):
+                writer.add_frame(
+                    replace(
+                        _robot_frame(),
+                        joint_names=list(reversed(_robot_frame().joint_names)),
+                    ),
+                    FakeFrame(),
+                )
+
+            self.assertEqual(writer.active_frame_count, 1)
+            writer.save_episode()
+
+            appended_writer = _writer(tmp)
+            appended_writer.start_episode("changed order")
+            with self.assertRaisesRegex(
+                ValueError, "joint_names changed from the dataset canonical ordering"
+            ):
+                appended_writer.add_frame(
+                    replace(
+                        _robot_frame(),
+                        joint_names=list(reversed(_robot_frame().joint_names)),
+                    ),
+                    FakeFrame(),
+                )
+
+    def test_existing_dataset_rejects_camera_shape_change(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("original camera")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            writer.save_episode()
+
+            appended_writer = _writer(tmp)
+            appended_writer.start_episode("different camera shape")
+            with self.assertRaisesRegex(
+                ValueError, "camera shape does not match existing dataset"
+            ):
+                appended_writer.add_frame(
+                    _robot_frame(), DifferentShapeFrame()
+                )
+
+            self.assertEqual(appended_writer.active_frame_count, 0)
+            self.assertFalse(
+                (
+                    appended_writer.root
+                    / "videos/observation.images.ego_view/episode_000001.mp4"
+                ).exists()
+            )
+
+    def test_existing_dataset_rejects_camera_keys_fps_and_robot_type_changes(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("schema")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            writer.save_episode()
+
+            with self.assertRaisesRegex(ValueError, "camera keys do not match"):
+                _writer(tmp, camera_key="observation.images.front")
+            with self.assertRaisesRegex(ValueError, "fps does not match"):
+                LeRobotV21Writer(
+                    tmp,
+                    dataset_name="dataset",
+                    fps=30,
+                    parquet_writer=_write_fake_parquet,
+                    video_sink_factory=FakeVideoSink,
+                )
+            with self.assertRaisesRegex(ValueError, "robot_type does not match"):
+                LeRobotV21Writer(
+                    tmp,
+                    dataset_name="dataset",
+                    fps=50,
+                    robot_type="different_robot",
+                    parquet_writer=_write_fake_parquet,
+                    video_sink_factory=FakeVideoSink,
+                )
+
+    def test_existing_dataset_rejects_robot_feature_shape_change(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("schema")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            writer.save_episode()
+
+            info_path = writer.root / "meta/info.json"
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            info["features"]["action.joint_position"]["shape"] = [DOF - 1]
+            info_path.write_text(json.dumps(info), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "action.joint_position shape mismatch"
+            ):
+                _writer(tmp)
+
+    def test_default_writer_spools_rows_and_streams_parquet(self):
+        calls = []
+        original_stream_writer = lerobot_dataset.write_parquet_pyarrow_stream
+
+        def fake_stream_writer(path, row_spool_path, *, batch_size):
+            rows = [
+                json.loads(line)
+                for line in row_spool_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            calls.append((len(rows), batch_size))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(rows), encoding="utf-8")
+
+        lerobot_dataset.write_parquet_pyarrow_stream = fake_stream_writer
+        try:
+            with TemporaryDirectory() as tmp:
+                writer = LeRobotV21Writer(
+                    tmp,
+                    dataset_name="dataset",
+                    fps=50,
+                    video_sink_factory=FakeVideoSink,
+                )
+                writer.start_episode("spooled")
+                for _ in range(300):
+                    writer.add_frame(_robot_frame(), FakeFrame())
+
+                active = writer._active
+                self.assertIsNotNone(active)
+                self.assertFalse(hasattr(active, "rows"))
+                self.assertEqual(writer.active_frame_count, 300)
+                self.assertTrue(
+                    writer._root_path(active.row_spool_rel_path).exists()
+                )
+
+                result = writer.save_episode()
+
+                self.assertTrue(result.saved)
+                self.assertEqual(calls, [(300, 256)])
+                self.assertFalse((writer.root / ".inprogress").exists())
+        finally:
+            lerobot_dataset.write_parquet_pyarrow_stream = original_stream_writer
+
+    def test_restart_removes_uncommitted_episode_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            abandoned_writer = _writer(tmp)
+            abandoned_writer.start_episode("abandoned")
+            abandoned_writer.add_frame(_robot_frame(), FakeFrame())
+            abandoned_writer._close_row_spool(abandoned_writer._active)
+            for sink in abandoned_writer._active.video_sinks.values():
+                sink.close()
+
+            self.assertTrue(
+                (abandoned_writer.root / ".inprogress").exists()
+            )
+
+            recovered_writer = _writer(tmp)
+
+            self.assertFalse((recovered_writer.root / ".inprogress").exists())
+            self.assertEqual(recovered_writer.start_episode("recovered"), 0)
+
+    def test_dataset_and_camera_paths_cannot_escape_root(self):
+        with TemporaryDirectory() as tmp:
+            for dataset_name in ("../outside", "/tmp/outside"):
+                with self.subTest(dataset_name=dataset_name):
+                    with self.assertRaisesRegex(ValueError, "dataset_name"):
+                        LeRobotV21Writer(
+                            tmp,
+                            dataset_name=dataset_name,
+                            parquet_writer=_write_fake_parquet,
+                            video_sink_factory=FakeVideoSink,
+                        )
+
+            with self.assertRaisesRegex(ValueError, "camera key is not safe"):
+                LeRobotV21Writer(
+                    tmp,
+                    dataset_name="dataset",
+                    camera_key="../outside",
+                    parquet_writer=_write_fake_parquet,
+                    video_sink_factory=FakeVideoSink,
+                )
 
     def test_discard_does_not_keep_episode_files_or_metadata(self):
         with TemporaryDirectory() as tmp:
@@ -662,10 +943,11 @@ def _writer(
     camera_key="observation.images.ego_view",
     camera_keys=None,
     field_selection=None,
+    dataset_name="dataset",
 ):
     return LeRobotV21Writer(
         tmp,
-        dataset_name="dataset",
+        dataset_name=dataset_name,
         fps=50,
         camera_key=camera_key,
         camera_keys=camera_keys,

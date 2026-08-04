@@ -100,6 +100,7 @@ def scan_plan_metadata(dataset_root: str | Path, plan: GestureTriggerPlan) -> Me
         statuses[key] = _classify_trial_attempts(
             trial=trial,
             attempts=attempts,
+            dataset_root=root,
         )
 
     return MetadataSnapshot(
@@ -227,7 +228,10 @@ def _progress_int(value: Any) -> int:
 
 
 def _classify_trial_attempts(
-    *, trial: PlannedTrial, attempts: dict[int, list[dict[str, Any]]]
+    *,
+    trial: PlannedTrial,
+    attempts: dict[int, list[dict[str, Any]]],
+    dataset_root: Path,
 ) -> TrialMetadataStatus:
     if not attempts:
         return TrialMetadataStatus(
@@ -258,7 +262,7 @@ def _classify_trial_attempts(
     successful_attempts: list[tuple[int, dict[str, Any]]] = []
     for attempt_index, rows in sorted(attempts.items()):
         row = rows[0]
-        if _row_is_success(row, trial.task_prompt):
+        if _row_is_success(row, trial.task_prompt, dataset_root):
             successful_attempts.append((attempt_index, row))
 
     if successful_attempts:
@@ -277,7 +281,9 @@ def _classify_trial_attempts(
 
     latest_attempt_index = max(attempts)
     latest_row = attempts[latest_attempt_index][0]
-    latest_state, message = _row_failure_state(latest_row, trial.task_prompt)
+    latest_state, message = _row_failure_state(
+        latest_row, trial.task_prompt, dataset_root
+    )
     return TrialMetadataStatus(
         task_slug=trial.task_slug,
         trial_index=trial.trial_index,
@@ -290,28 +296,69 @@ def _classify_trial_attempts(
     )
 
 
-def _row_is_success(row: dict[str, Any], task_prompt: str) -> bool:
-    tasks = row.get("tasks")
-    if not isinstance(tasks, list) or not tasks:
-        return False
-    if str(tasks[0]).strip() != task_prompt:
-        return False
-    try:
-        return int(row.get("length", 0)) > 0
-    except (TypeError, ValueError):
-        return False
+def _row_is_success(
+    row: dict[str, Any], task_prompt: str, dataset_root: Path
+) -> bool:
+    return _row_failure_state(row, task_prompt, dataset_root)[0] == "SUCCESS"
 
 
-def _row_failure_state(row: dict[str, Any], task_prompt: str) -> tuple[str, str]:
+def _row_failure_state(
+    row: dict[str, Any], task_prompt: str, dataset_root: Path
+) -> tuple[str, str]:
     tasks = row.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         return "TASK_MISMATCH", "metadata row is missing tasks[0]"
     if str(tasks[0]).strip() != task_prompt:
-        return "TASK_MISMATCH", f"metadata task mismatch: expected {task_prompt!r}, got {tasks[0]!r}"
+        return (
+            "TASK_MISMATCH",
+            f"metadata task mismatch: expected {task_prompt!r}, got {tasks[0]!r}",
+        )
+    length = row.get("length", 0)
+    if not isinstance(length, int) or isinstance(length, bool) or length <= 0:
+        return "EMPTY", "metadata row length must be a positive integer"
+
+    data_path = _existing_dataset_file(
+        dataset_root, row.get("data_path"), label="data_path"
+    )
+    if data_path is None:
+        return "INCOMPLETE_MEDIA", "metadata data_path is missing, unsafe, or empty"
+
+    video_paths = row.get("video_paths")
+    if not isinstance(video_paths, dict) or not video_paths:
+        legacy_video_path = row.get("video_path")
+        video_paths = {"default": legacy_video_path} if legacy_video_path else {}
+    if not video_paths:
+        return "INCOMPLETE_MEDIA", "metadata row has no video paths"
+    for camera_key, relative_path in video_paths.items():
+        if (
+            _existing_dataset_file(
+                dataset_root,
+                relative_path,
+                label=f"video_paths[{camera_key}]",
+            )
+            is None
+        ):
+            return (
+                "INCOMPLETE_MEDIA",
+                f"video for {camera_key} is missing, unsafe, or empty",
+            )
+    return "SUCCESS", "metadata and media files are present"
+
+
+def _existing_dataset_file(
+    dataset_root: Path, value: Any, *, label: str
+) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    root = dataset_root.resolve()
+    candidate = (root / value).resolve()
     try:
-        length = int(row.get("length", 0))
-    except (TypeError, ValueError):
-        length = 0
-    if length <= 0:
-        return "EMPTY", "metadata row has length <= 0"
-    return "TASK_MISMATCH", "metadata row did not satisfy success predicate"
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    try:
+        if not candidate.is_file() or candidate.stat().st_size <= 0:
+            return None
+    except OSError:
+        return None
+    return candidate

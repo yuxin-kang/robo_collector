@@ -138,15 +138,29 @@ def field_selection_from_payload(
     if not isinstance(payload, dict):
         raise FieldConfigError(f"{source}: top level must be a mapping")
 
-    allowed_top_level = {"target", "state"}
+    required_top_level = {"target", "state"}
+    allowed_top_level = {*required_top_level, "include_policy_action"}
     actual_top_level = set(payload)
-    if actual_top_level != allowed_top_level:
-        got = (
-            ",".join(str(key) for key in sorted(actual_top_level, key=str))
-            or "<none>"
-        )
+    unknown = actual_top_level - allowed_top_level
+    missing = required_top_level - actual_top_level
+    if unknown or missing:
+        details = []
+        if missing:
+            details.append(
+                "missing=" + ",".join(str(key) for key in sorted(missing))
+            )
+        if unknown:
+            details.append(
+                "unknown=" + ",".join(str(key) for key in sorted(unknown, key=str))
+            )
         raise FieldConfigError(
-            f"{source}: top-level keys must be exactly target,state; got {got}"
+            f"{source}: top-level keys require target,state and optionally "
+            f"include_policy_action; {'; '.join(details)}"
+        )
+    include_policy_action = payload.get("include_policy_action", False)
+    if not isinstance(include_policy_action, bool):
+        raise FieldConfigError(
+            f"{source}: include_policy_action must be a boolean"
         )
 
     target = _parse_group(
@@ -161,7 +175,11 @@ def field_selection_from_payload(
         supported=STATE_FIELD_TO_PARQUET,
         source=source,
     )
-    return FieldSelection(target=target, state=state)
+    return FieldSelection(
+        target=target,
+        state=state,
+        include_policy_action=include_policy_action,
+    )
 
 
 def _parse_group(

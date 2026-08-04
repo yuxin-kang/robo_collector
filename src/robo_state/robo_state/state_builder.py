@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import sqrt
+from math import isfinite, sqrt
 from typing import Any, Mapping, Sequence
 
 
@@ -98,6 +98,7 @@ class RobotLowStateData:
 
 @dataclass(frozen=True)
 class SampleData:
+    sample_stamp_sec: float
     policy_fields: dict[str, list[float]]
     policy_flattened: list[float]
     robot_state: RobotLowStateData
@@ -106,7 +107,7 @@ class SampleData:
     aligned_target_pos: list[float]
     action: list[float]
     stepit_observation: list[float]
-    observation_l2_error: float
+    observation_l2_error: float | None
     missing_optional_fields: list[str]
 
 
@@ -124,7 +125,10 @@ def validate_vector(name: str, values: Sequence[float], expected_dim: int) -> li
         raise ValidationError(
             f"{name} has dimension {actual_dim}; expected {expected_dim}"
         )
-    return [float(value) for value in values]
+    return [
+        _finite_float(f"{name}[{index}]", value)
+        for index, value in enumerate(values)
+    ]
 
 
 def flatten_policy_fields(fields: Mapping[str, Sequence[float]]) -> list[float]:
@@ -148,10 +152,16 @@ def observation_l2_error(
             "cannot compare policy fields and observation with dimensions "
             f"{len(flattened_policy)} and {len(stepit_observation)}"
         )
+    left_values = validate_vector(
+        "flattened_policy", flattened_policy, len(flattened_policy)
+    )
+    right_values = validate_vector(
+        "stepit_observation", stepit_observation, len(stepit_observation)
+    )
     return sqrt(
         sum(
-            (float(left) - float(right)) ** 2
-            for left, right in zip(flattened_policy, stepit_observation)
+            (left - right) ** 2
+            for left, right in zip(left_values, right_values)
         )
     )
 
@@ -174,9 +184,9 @@ def parse_joint_state(
     for index, raw_name in enumerate(names):
         name = str(raw_name)
         row = (
-            float(positions[index]),
-            float(velocities[index]),
-            float(efforts[index]),
+            _finite_float(f"joint_states.position[{index}]", positions[index]),
+            _finite_float(f"joint_states.velocity[{index}]", velocities[index]),
+            _finite_float(f"joint_states.effort[{index}]", efforts[index]),
         )
         if name.endswith(JOINT_SUFFIX):
             _insert_unique(joint_rows, _strip_suffix(name, JOINT_SUFFIX), row, name)
@@ -186,7 +196,7 @@ def parse_joint_state(
             _insert_unique(gain_rows, _strip_suffix(name, GAIN_SUFFIX), row, name)
         else:
             foot_names.append(name)
-            foot_force.append(float(efforts[index]))
+            foot_force.append(row[2])
 
     joint_names = list(joint_rows.keys())
     if len(joint_names) != expected_dof:
@@ -224,10 +234,16 @@ class RoboStateAssembler:
         self,
         *,
         max_cache_age_sec: float = 0.2,
+        max_required_skew_sec: float = 0.2,
         publish_only_when_complete: bool = True,
         validate_observation: bool = True,
     ) -> None:
-        self.max_cache_age_sec = float(max_cache_age_sec)
+        self.max_cache_age_sec = _finite_float(
+            "max_cache_age_sec", max_cache_age_sec
+        )
+        self.max_required_skew_sec = _finite_float(
+            "max_required_skew_sec", max_required_skew_sec
+        )
         self.publish_only_when_complete = bool(publish_only_when_complete)
         self.validate_observation = bool(validate_observation)
         self.fields: dict[str, TimedValue] = {}
@@ -240,19 +256,24 @@ class RoboStateAssembler:
         if name not in FIELD_DIMS:
             raise ValidationError(f"unknown StepIt field {name}")
         vector = validate_vector(name, values, FIELD_DIMS[name])
-        self.fields[name] = TimedValue(vector, float(stamp_sec))
+        self.fields[name] = TimedValue(vector, _timestamp("stamp_sec", stamp_sec))
         return vector
 
     def update_robot_state(
         self, robot_state: RobotLowStateData, stamp_sec: float
     ) -> None:
-        self.robot_state = TimedValue(robot_state, float(stamp_sec))
+        _validate_robot_state(robot_state)
+        self.robot_state = TimedValue(
+            robot_state, _timestamp("joint_states stamp_sec", stamp_sec)
+        )
 
     def update_imu(self, imu: Any, stamp_sec: float) -> None:
-        self.imu = TimedValue(imu, float(stamp_sec))
+        _validate_imu(imu)
+        self.imu = TimedValue(imu, _timestamp("imu stamp_sec", stamp_sec))
 
     def build_sample(self, now_sec: float) -> BuildResult:
-        missing = self._missing_inputs(float(now_sec))
+        now_sec = _timestamp("now_sec", now_sec)
+        missing = self._missing_inputs(now_sec)
         if missing and self.publish_only_when_complete:
             return BuildResult(
                 sample=None,
@@ -261,32 +282,61 @@ class RoboStateAssembler:
                 issues=missing,
             )
 
+        skew_violation = self._required_skew_violation(now_sec)
+        if skew_violation is not None:
+            return BuildResult(
+                sample=None,
+                level="WARN",
+                message=skew_violation,
+                issues=["required_input_skew"],
+            )
+
         missing_optional_fields = missing.copy()
-        policy_fields = self._policy_fields_with_defaults(missing_optional_fields)
+        policy_fields = self._policy_fields_with_defaults(
+            now_sec, missing_optional_fields
+        )
         flattened = flatten_policy_fields(policy_fields)
         observation = self._field_or_default(
-            "observation", STEPIT_OBSERVATION_DIM, missing_optional_fields
+            "observation",
+            STEPIT_OBSERVATION_DIM,
+            now_sec,
+            missing_optional_fields,
         )
-        l2_error = (
-            observation_l2_error(flattened, observation)
-            if self.validate_observation and len(flattened) == len(observation)
-            else 0.0
-        )
+        l2_error: float | None = None
+        if (
+            self.validate_observation
+            and "observation" not in missing_optional_fields
+            and len(flattened) == len(observation)
+        ):
+            l2_error = observation_l2_error(flattened, observation)
+        else:
+            missing_optional_fields.append("observation_l2_error")
 
         sample = SampleData(
+            # aligned_target_pos triggers publication and has no source Header, so
+            # its local receive timestamp is the best available sample-time anchor.
+            sample_stamp_sec=self._aligned_sample_stamp(now_sec),
             policy_fields=policy_fields,
             policy_flattened=flattened,
-            robot_state=self._robot_state_or_default(missing_optional_fields),
-            imu=self._imu_or_default(missing_optional_fields),
+            robot_state=self._robot_state_or_default(
+                now_sec, missing_optional_fields
+            ),
+            imu=self._imu_or_default(now_sec, missing_optional_fields),
             target_joint_pos=self._field_or_default(
-                "target_joint_pos", TARGET_JOINT_POS_DIM, missing_optional_fields
+                "target_joint_pos",
+                TARGET_JOINT_POS_DIM,
+                now_sec,
+                missing_optional_fields,
             ),
             aligned_target_pos=self._field_or_default(
                 "aligned_target_pos",
                 ALIGNED_TARGET_POS_DIM,
+                now_sec,
                 missing_optional_fields,
             ),
-            action=self._field_or_default("action", ACTION_DIM, missing_optional_fields),
+            action=self._field_or_default(
+                "action", ACTION_DIM, now_sec, missing_optional_fields
+            ),
             stepit_observation=observation,
             observation_l2_error=l2_error,
             missing_optional_fields=sorted(set(missing_optional_fields)),
@@ -311,35 +361,89 @@ class RoboStateAssembler:
             return False
         return now_sec - value.stamp_sec > self.max_cache_age_sec
 
-    def _policy_fields_with_defaults(self, missing: list[str]) -> dict[str, list[float]]:
+    def _policy_fields_with_defaults(
+        self, now_sec: float, missing: list[str]
+    ) -> dict[str, list[float]]:
         fields: dict[str, list[float]] = {}
         for spec in POLICY_FIELD_SPECS:
-            fields[spec.name] = self._field_or_default(spec.name, spec.dim, missing)
+            fields[spec.name] = self._field_or_default(
+                spec.name, spec.dim, now_sec, missing
+            )
         return fields
 
     def _field_or_default(
-        self, name: str, dim: int, missing: list[str]
+        self, name: str, dim: int, now_sec: float, missing: list[str]
     ) -> list[float]:
         value = self.fields.get(name)
-        if value is None:
+        if self._is_missing_or_stale(value, now_sec):
             if name not in missing:
                 missing.append(name)
             return [0.0] * dim
+        assert value is not None
         return list(value.value)
 
-    def _robot_state_or_default(self, missing: list[str]) -> RobotLowStateData:
-        if self.robot_state is None:
+    def _robot_state_or_default(
+        self, now_sec: float, missing: list[str]
+    ) -> RobotLowStateData:
+        if self._is_missing_or_stale(self.robot_state, now_sec):
             if "joint_states" not in missing:
                 missing.append("joint_states")
             return RobotLowStateData.zero()
+        assert self.robot_state is not None
         return self.robot_state.value
 
-    def _imu_or_default(self, missing: list[str]) -> Any:
-        if self.imu is None:
+    def _imu_or_default(self, now_sec: float, missing: list[str]) -> Any:
+        if self._is_missing_or_stale(self.imu, now_sec):
             if "imu" not in missing:
                 missing.append("imu")
             return None
+        assert self.imu is not None
         return self.imu.value
+
+    def _required_skew_violation(self, now_sec: float) -> str | None:
+        if self.max_required_skew_sec <= 0:
+            return None
+
+        values = self._required_timed_values(now_sec)
+        if len(values) != len(REQUIRED_FIELD_NAMES) + 2:
+            return None
+
+        oldest_name, oldest = min(values, key=lambda item: item[1].stamp_sec)
+        newest_name, newest = max(values, key=lambda item: item[1].stamp_sec)
+        skew_sec = newest.stamp_sec - oldest.stamp_sec
+        if skew_sec <= self.max_required_skew_sec:
+            return None
+        return (
+            "required inputs exceed max cross-field skew: "
+            f"{skew_sec:.6f}s > {self.max_required_skew_sec:.6f}s "
+            f"({oldest_name} -> {newest_name})"
+        )
+
+    def _required_timed_values(
+        self, now_sec: float
+    ) -> list[tuple[str, TimedValue]]:
+        values = [
+            (name, value)
+            for name in REQUIRED_FIELD_NAMES
+            if not self._is_missing_or_stale(
+                value := self.fields.get(name), now_sec
+            )
+            and value is not None
+        ]
+        if not self._is_missing_or_stale(self.robot_state, now_sec):
+            assert self.robot_state is not None
+            values.append(("joint_states", self.robot_state))
+        if not self._is_missing_or_stale(self.imu, now_sec):
+            assert self.imu is not None
+            values.append(("imu", self.imu))
+        return values
+
+    def _aligned_sample_stamp(self, now_sec: float) -> float:
+        aligned_target = self.fields.get("aligned_target_pos")
+        if self._is_missing_or_stale(aligned_target, now_sec):
+            return now_sec
+        assert aligned_target is not None
+        return aligned_target.stamp_sec
 
 
 def _validate_joint_state_lengths(
@@ -406,3 +510,76 @@ def _columns(
         [rows[name][1] for name in joint_names],
         [rows[name][2] for name in joint_names],
     )
+
+
+def _finite_float(name: str, value: object) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValidationError(f"{name} is not a valid number: {value!r}") from exc
+    if not isfinite(number):
+        raise ValidationError(f"{name} must be finite; got {value!r}")
+    return number
+
+
+def _timestamp(name: str, value: object) -> float:
+    timestamp = _finite_float(name, value)
+    if timestamp < 0:
+        raise ValidationError(f"{name} must be non-negative; got {timestamp}")
+    return timestamp
+
+
+def _validate_robot_state(state: RobotLowStateData) -> None:
+    if len(state.joint_names) != DOF:
+        raise ValidationError(
+            f"joint_states contains {len(state.joint_names)} joints; expected {DOF}"
+        )
+    for field_name in (
+        "joint_pos",
+        "joint_vel",
+        "joint_torque",
+        "cmd_joint_pos",
+        "cmd_joint_vel",
+        "cmd_joint_torque",
+        "kp",
+        "kd",
+        "desired_torque",
+    ):
+        validate_vector(
+            f"joint_states.{field_name}", getattr(state, field_name), DOF
+        )
+    if len(state.foot_names) != len(state.foot_force):
+        raise ValidationError(
+            "joint_states foot name/force length mismatch: "
+            f"{len(state.foot_names)} != {len(state.foot_force)}"
+        )
+    validate_vector(
+        "joint_states.foot_force", state.foot_force, len(state.foot_names)
+    )
+
+
+def _validate_imu(imu: Any) -> None:
+    for group_name, component_names in (
+        ("orientation", ("x", "y", "z", "w")),
+        ("angular_velocity", ("x", "y", "z")),
+        ("linear_acceleration", ("x", "y", "z")),
+    ):
+        group = getattr(imu, group_name, None)
+        if group is None:
+            continue
+        for component_name in component_names:
+            if hasattr(group, component_name):
+                _finite_float(
+                    f"imu.{group_name}.{component_name}",
+                    getattr(group, component_name),
+                )
+
+    for covariance_name in (
+        "orientation_covariance",
+        "angular_velocity_covariance",
+        "linear_acceleration_covariance",
+    ):
+        covariance = getattr(imu, covariance_name, None)
+        if covariance is None:
+            continue
+        validate_vector(f"imu.{covariance_name}", covariance, 9)

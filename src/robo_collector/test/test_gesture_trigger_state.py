@@ -32,6 +32,13 @@ class GestureTriggerStateTest(unittest.TestCase):
 
         actions = machine.step(0.1, start_triggered=True)
         self.assertEqual([action.command for action in actions], ["START"])
+        self.assertEqual(machine.attempt_state, AttemptState.WAITING_START_ACK)
+
+        machine.step(
+            0.15,
+            collector_mode="RECORDING",
+            collector_episode_id=machine.current_attempt.episode_id,
+        )
         self.assertEqual(machine.attempt_state, AttemptState.RECORDING)
 
         actions = machine.step(0.2, end_triggered=True)
@@ -83,6 +90,11 @@ class GestureTriggerStateTest(unittest.TestCase):
         )
         machine.step(0.0, ready_triggered=True)
         machine.step(0.1, start_triggered=True)
+        machine.step(
+            0.15,
+            collector_mode="RECORDING",
+            collector_episode_id=machine.current_attempt.episode_id,
+        )
         machine.step(0.2, end_triggered=True)
 
         duplicate = _snapshot(
@@ -125,6 +137,11 @@ class GestureTriggerStateTest(unittest.TestCase):
         machine.bootstrap(missing)
         machine.step(0.0, ready_triggered=True)
         machine.step(0.1, start_triggered=True)
+        machine.step(
+            0.15,
+            collector_mode="RECORDING",
+            collector_episode_id=machine.current_attempt.episode_id,
+        )
         machine.step(0.2, end_triggered=True)
         machine.step(30.0, metadata_snapshot=missing, collector_mode="IDLE")
 
@@ -172,6 +189,127 @@ class GestureTriggerStateTest(unittest.TestCase):
         self.assertEqual(machine.completed_count, 2)
         self.assertEqual(machine.current_attempt.trial_index, 2)
         self.assertEqual(machine.current_attempt.attempt_index, 1)
+
+    def test_start_waits_for_matching_ack_and_retries(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        machine = GestureTriggerStateMachine(plan)
+        waiting = _snapshot(
+            plan,
+            [
+                TrialMetadataStatus(
+                    task_slug="shake_hand",
+                    trial_index=0,
+                    complete=False,
+                    latest_state="MISSING",
+                    latest_attempt_index=0,
+                    next_attempt_index=1,
+                    message="missing",
+                )
+            ],
+        )
+        machine.bootstrap(waiting)
+        machine.step(0.0, ready_triggered=True)
+
+        first = machine.step(0.1, start_triggered=True)
+        self.assertEqual([action.command for action in first], ["START"])
+        self.assertEqual(machine.attempt_state, AttemptState.WAITING_START_ACK)
+
+        retry = machine.step(0.7, collector_mode="IDLE")
+        self.assertEqual([action.command for action in retry], ["START"])
+        self.assertEqual(machine.attempt_state, AttemptState.WAITING_START_ACK)
+
+        machine.step(
+            0.8,
+            collector_mode="RECORDING",
+            collector_episode_id=machine.current_attempt.episode_id,
+        )
+        self.assertEqual(machine.attempt_state, AttemptState.RECORDING)
+
+    def test_start_ack_for_different_episode_fails_closed(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        machine = GestureTriggerStateMachine(plan)
+        machine.bootstrap(
+            _snapshot(
+                plan,
+                [
+                    TrialMetadataStatus(
+                        task_slug="shake_hand",
+                        trial_index=0,
+                        complete=False,
+                        latest_state="MISSING",
+                        latest_attempt_index=0,
+                        next_attempt_index=1,
+                        message="missing",
+                    )
+                ],
+            )
+        )
+        machine.step(0.0, ready_triggered=True)
+        machine.step(0.1, start_triggered=True)
+        machine.step(
+            0.2,
+            collector_mode="RECORDING",
+            collector_episode_id="another-episode",
+        )
+
+        self.assertEqual(machine.attempt_state, AttemptState.PAUSED_FAILED)
+        self.assertIn("different episode", machine.last_error)
+
+    def test_start_ack_timeout_emits_fail_closed_stop(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        machine = GestureTriggerStateMachine(plan)
+        machine.bootstrap(
+            _snapshot(
+                plan,
+                [
+                    TrialMetadataStatus(
+                        task_slug="shake_hand",
+                        trial_index=0,
+                        complete=False,
+                        latest_state="MISSING",
+                        latest_attempt_index=0,
+                        next_attempt_index=1,
+                        message="missing",
+                    )
+                ],
+            )
+        )
+        machine.step(0.0, ready_triggered=True)
+        machine.step(0.1, start_triggered=True)
+
+        actions = machine.step(6.0, collector_mode="")
+
+        self.assertEqual([action.command for action in actions], ["STOP"])
+        self.assertEqual(machine.attempt_state, AttemptState.PAUSED_FAILED)
+        self.assertIn("timed out", machine.last_error)
+
+    def test_abort_active_attempt_emits_stop(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        machine = GestureTriggerStateMachine(plan)
+        machine.bootstrap(
+            _snapshot(
+                plan,
+                [
+                    TrialMetadataStatus(
+                        task_slug="shake_hand",
+                        trial_index=0,
+                        complete=False,
+                        latest_state="MISSING",
+                        latest_attempt_index=0,
+                        next_attempt_index=1,
+                        message="missing",
+                    )
+                ],
+            )
+        )
+        machine.step(0.0, ready_triggered=True)
+        machine.step(0.1, start_triggered=True)
+
+        action = machine.abort_active_attempt("progress disk full")
+
+        self.assertEqual(action.command, "STOP")
+        self.assertEqual(machine.attempt_state, AttemptState.PAUSED_FAILED)
+        self.assertIn("disk full", machine.last_error)
 
 
 def _snapshot(plan, statuses):

@@ -336,18 +336,22 @@ def main():
 
             images: dict[str, bytes] = {}
             timestamps: dict[str, float] = {}
+            sequences: dict[str, int] = {}
             for stream, frame in frames_by_stream.items():
                 images[stream] = frame.image_jpeg
                 timestamps[stream] = frame.timestamp_sec
+                sequences[stream] = frame.sequence
                 last_sequences[stream] = frame.sequence
                 if args.depth and frame.depth_png is not None:
                     depth_stream = f"{stream}_depth"
                     images[depth_stream] = frame.depth_png
                     timestamps[depth_stream] = frame.timestamp_sec
+                    sequences[depth_stream] = frame.sequence
 
             packet: dict[str, Any] = {
                 "schema": "robo_collector_camera.v2",
                 "timestamps": timestamps,
+                "sequences": sequences,
                 "images": images,
                 "metadata": {
                     "cameras": cameras_metadata,

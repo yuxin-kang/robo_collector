@@ -101,9 +101,32 @@ class FieldConfigTest(unittest.TestCase):
         for payload in cases:
             with self.subTest(payload=payload):
                 with self.assertRaisesRegex(
-                    FieldConfigError, "top-level keys must be exactly"
+                    FieldConfigError, "top-level keys require target,state"
                 ):
                     field_selection_from_payload(payload)
+
+    def test_policy_action_can_be_enabled_explicitly(self):
+        selection = field_selection_from_payload(
+            {
+                "target": ["aligned_target_pos"],
+                "state": ["joint_position"],
+                "include_policy_action": True,
+            }
+        )
+
+        self.assertTrue(selection.include_policy_action)
+        self.assertIn("action.policy_action", selection.robot_parquet_keys)
+
+        with self.assertRaisesRegex(
+            FieldConfigError, "include_policy_action must be a boolean"
+        ):
+            field_selection_from_payload(
+                {
+                    "target": ["aligned_target_pos"],
+                    "state": ["joint_position"],
+                    "include_policy_action": "yes",
+                }
+            )
 
     def test_empty_list_is_rejected(self):
         with self.assertRaisesRegex(

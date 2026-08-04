@@ -9,7 +9,7 @@ CAMERA_STREAMS="head,ego_view"
 ROOT_OUTPUT_DIR="outputs"
 DATASET_NAME=""
 FIELD_CONFIG=""
-FPS="50"
+FPS="30"
 PRINT_ROS_SETUP=0
 
 while [[ $# -gt 0 ]]; do

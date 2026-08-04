@@ -1,7 +1,10 @@
 target:
   - aligned_target_pos
 
+include_policy_action: true
+
 state:
+  - joint_position
   - relative_ori_6d
   - motion_anchor_lin_vel_b
   - motion_anchor_ang_vel_b

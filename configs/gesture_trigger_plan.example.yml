@@ -6,7 +6,10 @@ progress_path: ""
 collector:
   command_topic: "/robo_collector/record_command"
   status_topic: "/robo_collector/status"
-  fps: 50.0
+  fps: 30.0
+  start_confirm_timeout_sec: 5.0
+  command_retry_interval_sec: 0.5
+  command_max_retries: 5
   save_confirm_timeout_sec: 20.0
   status_timeout_sec: 5.0
   ready_policy: "wait_for_idle"
