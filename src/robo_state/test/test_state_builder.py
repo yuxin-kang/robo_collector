@@ -107,6 +107,10 @@ class StateBuilderTest(unittest.TestCase):
         self.assertEqual(result.sample.action, [0.0] * DOF)
         self.assertEqual(result.sample.target_joint_pos, [8.0] * DOF)
         self.assertIn("action", result.sample.missing_optional_fields)
+        self.assertNotIn("action", result.sample.source_timestamps_sec)
+        self.assertEqual(
+            result.sample.source_timestamps_sec["target_joint_pos"], now_sec
+        )
 
     def test_required_input_cross_field_skew_rejects_sample(self):
         assembler = RoboStateAssembler(

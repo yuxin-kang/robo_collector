@@ -109,6 +109,7 @@ class SampleData:
     stepit_observation: list[float]
     observation_l2_error: float | None
     missing_optional_fields: list[str]
+    source_timestamps_sec: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -340,6 +341,7 @@ class RoboStateAssembler:
             stepit_observation=observation,
             observation_l2_error=l2_error,
             missing_optional_fields=sorted(set(missing_optional_fields)),
+            source_timestamps_sec=self._fresh_source_timestamps(now_sec),
         )
         return BuildResult(sample=sample, level="OK", message="publishing", issues=[])
 
@@ -444,6 +446,20 @@ class RoboStateAssembler:
             return now_sec
         assert aligned_target is not None
         return aligned_target.stamp_sec
+
+    def _fresh_source_timestamps(self, now_sec: float) -> dict[str, float]:
+        timestamps = {
+            name: value.stamp_sec
+            for name, value in self.fields.items()
+            if not self._is_missing_or_stale(value, now_sec)
+        }
+        if not self._is_missing_or_stale(self.robot_state, now_sec):
+            assert self.robot_state is not None
+            timestamps["joint_states"] = self.robot_state.stamp_sec
+        if not self._is_missing_or_stale(self.imu, now_sec):
+            assert self.imu is not None
+            timestamps["imu"] = self.imu.stamp_sec
+        return dict(sorted(timestamps.items()))
 
 
 def _validate_joint_state_lengths(

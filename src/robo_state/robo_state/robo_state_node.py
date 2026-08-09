@@ -224,6 +224,8 @@ class RoboStateNode(Node):
             else float(sample.observation_l2_error)
         )
         msg.missing_optional_fields = sample.missing_optional_fields
+        msg.source_timestamp_names = list(sample.source_timestamps_sec)
+        msg.source_timestamps_sec = list(sample.source_timestamps_sec.values())
         return msg
 
     def _to_policy_msg(self, sample: SampleData) -> PolicyState:

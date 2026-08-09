@@ -6,6 +6,7 @@ from robo_collector.sample_alignment import (
     message_stamp_sec,
     required_sample_inputs,
     selected_missing_inputs,
+    selected_source_timestamps_sec,
     source_timestamp_skew_sec,
 )
 
@@ -40,6 +41,42 @@ class SampleAlignmentTest(unittest.TestCase):
         )
         self.assertIsNone(source_timestamp_skew_sec(None, [10.0]))
         self.assertIsNone(source_timestamp_skew_sec(10.0, [float("nan")]))
+
+    def test_selected_source_timestamps_include_selected_action(self):
+        selection = default_field_selection()
+        msg = SimpleNamespace(
+            source_timestamp_names=[
+                "joint_states",
+                "imu",
+                "target_joint_pos",
+                "action",
+            ],
+            source_timestamps_sec=[10.0, 10.01, 10.02, 9.8],
+        )
+
+        timestamps = selected_source_timestamps_sec(msg, selection)
+
+        self.assertIsNotNone(timestamps)
+        self.assertIn("action", timestamps)
+        self.assertAlmostEqual(
+            source_timestamp_skew_sec(
+                next(iter(timestamps.values())),
+                [*list(timestamps.values())[1:], 10.0],
+            ),
+            0.22,
+        )
+
+    def test_selected_source_timestamps_reject_missing_selected_input(self):
+        selection = FieldSelection(
+            target=("aligned_target_pos",),
+            state=("relative_ori_6d",),
+        )
+        msg = SimpleNamespace(
+            source_timestamp_names=["aligned_target_pos"],
+            source_timestamps_sec=[10.0],
+        )
+
+        self.assertIsNone(selected_source_timestamps_sec(msg, selection))
 
     def test_message_stamp_rejects_missing_or_zero_stamp(self):
         valid = SimpleNamespace(

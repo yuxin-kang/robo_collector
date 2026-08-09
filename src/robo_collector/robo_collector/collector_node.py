@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import shutil
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -15,7 +16,13 @@ from robo_collector_msgs.msg import RecordCommand
 from robo_state_msgs.msg import RoboStateSample
 
 from .camera_cache import CameraFrameCache, parse_camera_streams
-from .collector_state import CollectorMode, RecordStateMachine
+from .collector_state import (
+    CollectorMode,
+    CommandFingerprint,
+    CommandReceiptLedger,
+    RecordStateMachine,
+    recording_safety_reason,
+)
 from .field_config import (
     FieldConfigError,
     default_field_selection,
@@ -25,6 +32,7 @@ from .lerobot_dataset import LeRobotV21Writer, RobotFrame
 from .sample_alignment import (
     message_stamp_sec,
     selected_missing_inputs,
+    selected_source_timestamps_sec,
     source_timestamp_skew_sec,
 )
 
@@ -56,6 +64,9 @@ class LeRobotCollectorNode(Node):
         self.declare_parameter("max_camera_age_sec", 0.2)
         self.declare_parameter("max_inter_camera_skew_sec", 0.1)
         self.declare_parameter("max_state_camera_skew_sec", 0.1)
+        self.declare_parameter("max_episode_duration_sec", 600.0)
+        self.declare_parameter("max_episode_frames", 18000)
+        self.declare_parameter("min_free_disk_bytes", 2147483648)
 
         self._fps = int(self.get_parameter("fps").value)
         self._robo_state_topic = str(self.get_parameter("robo_state_topic").value)
@@ -71,15 +82,29 @@ class LeRobotCollectorNode(Node):
         self._max_state_camera_skew_sec = float(
             self.get_parameter("max_state_camera_skew_sec").value
         )
+        self._max_episode_duration_sec = float(
+            self.get_parameter("max_episode_duration_sec").value
+        )
+        self._max_episode_frames = int(
+            self.get_parameter("max_episode_frames").value
+        )
+        self._min_free_disk_bytes = int(
+            self.get_parameter("min_free_disk_bytes").value
+        )
         for name, value in (
             ("fps", self._fps),
             ("max_state_age_sec", self._max_state_age_sec),
             ("max_camera_age_sec", self._max_camera_age_sec),
             ("max_inter_camera_skew_sec", self._max_inter_camera_skew_sec),
             ("max_state_camera_skew_sec", self._max_state_camera_skew_sec),
+            ("max_episode_duration_sec", self._max_episode_duration_sec),
         ):
             if not math.isfinite(value) or value <= 0:
                 raise RuntimeError(f"{name} must be finite and positive")
+        if self._max_episode_frames <= 0:
+            raise RuntimeError("max_episode_frames must be positive")
+        if self._min_free_disk_bytes < 0:
+            raise RuntimeError("min_free_disk_bytes must be non-negative")
         legacy_camera_stream = str(self.get_parameter("camera_stream").value).strip()
         if legacy_camera_stream:
             camera_streams = [legacy_camera_stream]
@@ -112,10 +137,17 @@ class LeRobotCollectorNode(Node):
         self._last_warn_monotonic_sec = 0.0
         self._last_status_log_message = ""
         self._last_status_log_monotonic_sec = 0.0
+        self._last_command_id = ""
+        self._last_command = ""
+        self._last_command_outcome = ""
+        self._last_command_episode_id = ""
+        self._last_episode_id = ""
+        self._last_episode_outcome = ""
+        self._command_receipts = CommandReceiptLedger()
         self._state_sample_count = 0
         self._last_state_sample_log_monotonic_sec = 0.0
         self._last_recorded_camera_identity: (
-            tuple[tuple[str, int | float | None], ...] | None
+            tuple[str, tuple[tuple[str, int | float | None], ...]] | None
         ) = None
 
         qos = QoSProfile(depth=10)
@@ -158,6 +190,13 @@ class LeRobotCollectorNode(Node):
 
     def destroy_node(self) -> bool:
         self._camera_cache.stop()
+        if self._writer.active_episode_index is not None:
+            try:
+                self._writer.discard_episode()
+            except Exception as exc:
+                self.get_logger().error(
+                    f"failed to discard active episode during shutdown: {exc}"
+                )
         return super().destroy_node()
 
     def _on_state(self, msg: RoboStateSample) -> None:
@@ -170,10 +209,56 @@ class LeRobotCollectorNode(Node):
         self._log_state_sample_received_throttled(force=was_unavailable_or_stale)
 
     def _on_record_command(self, msg: RecordCommand) -> None:
+        command_value = int(msg.command)
+        command_id = str(getattr(msg, "command_id", "")).strip()
+        command_episode_id = str(msg.episode_id).strip()
+        command_name = _record_command_name(command_value)
+        fingerprint = CommandFingerprint(
+            command=command_value,
+            task_prompt=str(msg.task_prompt),
+            episode_id=command_episode_id,
+            force=bool(getattr(msg, "force", False)),
+        )
+        replay = self._command_receipts.lookup(command_id, fingerprint)
+        if replay is not None:
+            if replay.disposition == "CONFLICT":
+                self._publish_status(
+                    DiagnosticStatus.ERROR,
+                    "command_id reuse rejected because its payload changed: "
+                    f"{command_id}",
+                )
+                return
+            self._set_command_receipt(
+                command_id=command_id,
+                command=command_name,
+                episode_id=command_episode_id,
+                outcome=replay.outcome,
+            )
+            level = (
+                DiagnosticStatus.ERROR
+                if replay.outcome == "FAILED"
+                or self._state_machine.mode == CollectorMode.FAILED
+                else DiagnosticStatus.WARN
+                if replay.outcome == "REJECTED"
+                else DiagnosticStatus.OK
+            )
+            self._publish_status(
+                level,
+                f"{command_name} duplicate replayed as {replay.outcome}; "
+                f"mode={self._state_machine.mode.value}",
+            )
+            return
+        self._set_command_receipt(
+            command_id=command_id,
+            command=command_name,
+            episode_id=command_episode_id,
+            outcome="RECEIVED",
+        )
         result = self._state_machine.handle_command(
-            int(msg.command),
+            command_value,
             task_prompt=msg.task_prompt,
-            episode_id=msg.episode_id,
+            episode_id=command_episode_id,
+            force=bool(getattr(msg, "force", False)),
             now_sec=self._now_sec(),
         )
         if result.should_start and result.session is not None:
@@ -183,11 +268,19 @@ class LeRobotCollectorNode(Node):
                 )
             except Exception as exc:
                 self._state_machine = RecordStateMachine()
+                self._last_command_outcome = "FAILED"
+                self._command_receipts.remember(
+                    command_id, fingerprint, self._last_command_outcome
+                )
                 self._publish_status(
                     DiagnosticStatus.ERROR, f"failed to start episode: {exc}"
                 )
                 return
             self._last_recorded_camera_identity = None
+            self._last_command_outcome = "SUCCEEDED"
+            self._command_receipts.remember(
+                command_id, fingerprint, self._last_command_outcome
+            )
             self._publish_status(
                 DiagnosticStatus.OK,
                 f"RECORDING episode {episode_index}: {result.session.task_prompt}",
@@ -198,11 +291,29 @@ class LeRobotCollectorNode(Node):
             try:
                 self._writer.discard_episode()
                 self._state_machine.mark_discarded()
+                self._last_command_outcome = "SUCCEEDED"
+                self._last_episode_id = (
+                    result.session.episode_id if result.session is not None else ""
+                )
+                self._last_episode_outcome = "DISCARDED"
                 self._publish_status(DiagnosticStatus.OK, "DISCARD complete; IDLE")
             except Exception as exc:
-                self._publish_status(DiagnosticStatus.ERROR, f"discard failed: {exc}")
+                reason = f"discard failed: {exc}"
+                self._state_machine.mark_discard_failed(reason)
+                self._last_command_outcome = "FAILED"
+                self._publish_status(DiagnosticStatus.ERROR, reason)
+            self._command_receipts.remember(
+                command_id,
+                fingerprint,
+                self._last_command_outcome,
+                replayable=self._last_command_outcome != "FAILED",
+            )
             return
 
+        self._last_command_outcome = "SUCCEEDED" if result.accepted else "REJECTED"
+        self._command_receipts.remember(
+            command_id, fingerprint, self._last_command_outcome
+        )
         self._publish_status(_diagnostic_level(result.level), result.message)
 
     def _record_tick(self) -> None:
@@ -213,6 +324,9 @@ class LeRobotCollectorNode(Node):
             self._publish_failed_status_throttled()
             return
         if self._state_machine.mode != CollectorMode.RECORDING:
+            return
+
+        if self._enforce_recording_safety_limits():
             return
 
         now = time.monotonic()
@@ -253,22 +367,43 @@ class LeRobotCollectorNode(Node):
             )
             return
 
-        state_timestamp_sec = message_stamp_sec(state.msg)
-        camera_timestamps_sec = [
-            frame.camera_timestamp_sec for frame in camera_bundle.frames.values()
-        ]
-        source_skew_sec = source_timestamp_skew_sec(
-            state_timestamp_sec, camera_timestamps_sec
+        selected_timestamps = selected_source_timestamps_sec(
+            state.msg, self._field_selection
         )
-        if source_skew_sec is None:
+        if selected_timestamps is None:
             self._publish_warn_throttled(
-                "state/camera source timestamp unavailable or invalid"
+                "selected state/action source timestamps unavailable or invalid"
             )
             return
-        if source_skew_sec > self._max_state_camera_skew_sec:
+        selected_values = list(selected_timestamps.values())
+        selected_skew_sec = source_timestamp_skew_sec(
+            selected_values[0], selected_values[1:]
+        )
+        if selected_skew_sec is None:
             self._publish_warn_throttled(
-                "state/camera source timestamp skew "
-                f"{source_skew_sec:.3f}s exceeds "
+                "selected state/action source timestamp skew is invalid"
+            )
+            return
+        if selected_skew_sec > self._max_state_camera_skew_sec:
+            self._publish_warn_throttled(
+                "selected state/action source timestamp skew "
+                f"{selected_skew_sec:.3f}s exceeds "
+                f"{self._max_state_camera_skew_sec:.3f}s"
+            )
+            return
+        receive_skew_sec = source_timestamp_skew_sec(
+            state.received_monotonic_sec,
+            [camera_bundle.received_monotonic_sec],
+        )
+        if receive_skew_sec is None:
+            self._publish_warn_throttled(
+                "state/camera local receive timestamp unavailable or invalid"
+            )
+            return
+        if receive_skew_sec > self._max_state_camera_skew_sec:
+            self._publish_warn_throttled(
+                "state/camera local receive-time skew "
+                f"{receive_skew_sec:.3f}s exceeds "
                 f"{self._max_state_camera_skew_sec:.3f}s"
             )
             return
@@ -291,7 +426,70 @@ class LeRobotCollectorNode(Node):
                 f"recording failed; DISCARD required: {reason}",
             )
 
+    def _enforce_recording_safety_limits(self) -> bool:
+        session = self._state_machine.session
+        if session is None:
+            self._state_machine.mark_failed("RECORDING has no active session")
+            self._publish_status(
+                DiagnosticStatus.ERROR,
+                "recording failed; DISCARD required: RECORDING has no active session",
+            )
+            return True
+        try:
+            free_disk_bytes = _free_disk_bytes(self._writer.root_output_dir)
+        except OSError as exc:
+            reason = f"cannot inspect output disk: {exc}"
+            return self._discard_for_safety(reason)
+        reason = recording_safety_reason(
+            elapsed_sec=max(0.0, self._now_sec() - session.started_at_sec),
+            frame_count=self._writer.active_frame_count,
+            max_duration_sec=self._max_episode_duration_sec,
+            max_frames=self._max_episode_frames,
+            free_disk_bytes=free_disk_bytes,
+            min_free_disk_bytes=self._min_free_disk_bytes,
+        )
+        if reason is None:
+            return False
+        return self._discard_for_safety(reason)
+
+    def _discard_for_safety(self, reason: str) -> bool:
+        session = self._state_machine.session
+        if session is None:
+            self._state_machine.mark_failed("RECORDING has no active session")
+            self._publish_status(
+                DiagnosticStatus.ERROR,
+                "recording failed; DISCARD required: RECORDING has no active session",
+            )
+            return True
+        result = self._state_machine.handle_command(
+            RecordCommand.DISCARD,
+            episode_id=session.episode_id,
+            now_sec=self._now_sec(),
+        )
+        if not result.should_discard:
+            failure = f"safety discard command failed: {result.message}"
+            self._state_machine.mark_failed(failure)
+            self._publish_status(
+                DiagnosticStatus.ERROR,
+                f"recording failed; DISCARD required: {failure}",
+            )
+            return True
+        try:
+            self._writer.discard_episode()
+            self._state_machine.mark_discarded()
+        except Exception as exc:
+            failure = f"safety discard failed: {exc}"
+            self._state_machine.mark_discard_failed(failure)
+            self._publish_status(DiagnosticStatus.ERROR, failure)
+            return True
+        self._last_episode_id = session.episode_id
+        self._last_episode_outcome = "DISCARDED"
+        self._last_recorded_camera_identity = None
+        self._publish_status(DiagnosticStatus.WARN, f"SAFETY DISCARD: {reason}; IDLE")
+        return True
+
     def _save_episode(self) -> None:
+        session = self._state_machine.session
         try:
             result = self._writer.save_episode()
         except Exception as exc:
@@ -304,6 +502,8 @@ class LeRobotCollectorNode(Node):
             return
 
         self._state_machine.mark_saved()
+        self._last_episode_id = session.episode_id if session is not None else ""
+        self._last_episode_outcome = "SAVED" if result.saved else "DISCARDED"
         level = DiagnosticStatus.OK if result.saved else DiagnosticStatus.WARN
         self._publish_status(
             level,
@@ -399,6 +599,19 @@ class LeRobotCollectorNode(Node):
                     else ""
                 ),
             ),
+            KeyValue(key="last_command_id", value=self._last_command_id),
+            KeyValue(key="last_command", value=self._last_command),
+            KeyValue(
+                key="last_command_outcome", value=self._last_command_outcome
+            ),
+            KeyValue(
+                key="last_command_episode_id",
+                value=self._last_command_episode_id,
+            ),
+            KeyValue(key="last_episode_id", value=self._last_episode_id),
+            KeyValue(
+                key="last_episode_outcome", value=self._last_episode_outcome
+            ),
             KeyValue(key="fps", value=str(self._fps)),
             KeyValue(key="active_episode", value=str(self._writer.active_episode_index)),
             KeyValue(key="active_frames", value=str(self._writer.active_frame_count)),
@@ -414,6 +627,19 @@ class LeRobotCollectorNode(Node):
         ]
         self._status_pub.publish(status)
         self._log_status_issue_throttled(status.level, message)
+
+    def _set_command_receipt(
+        self,
+        *,
+        command_id: str,
+        command: str,
+        episode_id: str,
+        outcome: str,
+    ) -> None:
+        self._last_command_id = command_id
+        self._last_command = command
+        self._last_command_episode_id = episode_id
+        self._last_command_outcome = outcome
 
     def _log_status_issue_throttled(self, level: Any, message: str) -> None:
         level_value = _diagnostic_level_value(level)
@@ -456,7 +682,7 @@ class LeRobotCollectorNode(Node):
         return None
 
     def _now_sec(self) -> float:
-        return self.get_clock().now().nanoseconds * 1e-9
+        return time.monotonic()
 
 
 def _robot_frame_from_msg(msg: RoboStateSample) -> RobotFrame:
@@ -514,6 +740,23 @@ def _robot_frame_from_msg(msg: RoboStateSample) -> RobotFrame:
         joint_names=list(msg.robot_state.joint_names),
         state_timestamp_sec=message_stamp_sec(msg),
     )
+
+
+def _free_disk_bytes(path: Any) -> int:
+    candidate = path.resolve()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return int(shutil.disk_usage(candidate).free)
+
+
+def _record_command_name(command: int) -> str:
+    if command == int(RecordCommand.START):
+        return "START"
+    if command == int(RecordCommand.STOP):
+        return "STOP"
+    if command == int(RecordCommand.DISCARD):
+        return "DISCARD"
+    return f"UNKNOWN({command})"
 
 
 def _diagnostic_level(level: str) -> bytes:

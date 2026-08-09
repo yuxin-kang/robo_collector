@@ -7,3 +7,5 @@ uint8 DISCARD=3
 uint8 command
 string task_prompt
 string episode_id
+string command_id
+bool force

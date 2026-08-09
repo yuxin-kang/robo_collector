@@ -9,7 +9,7 @@ import msgpack
 import numpy as np
 import zmq
 
-CAMERA_PACKET_SCHEMA = "robo_collector_camera.v2"
+CAMERA_PACKET_SCHEMA = "robo_collector_camera.v3"
 DEFAULT_MAX_PACKET_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_IMAGE_BYTES = 32 * 1024 * 1024
 _STREAM_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -100,6 +100,7 @@ def decode_packet(
     timestamps = _mapping(packet.get("timestamps"), "timestamps")
     sequences = _mapping(packet.get("sequences", {}), "sequences")
     metadata = _mapping(packet.get("metadata", {}), "metadata")
+    session_id = _session_id(packet.get("session_id"))
     if not images:
         raise CameraPacketError("camera packet images must not be empty")
 
@@ -128,6 +129,7 @@ def decode_packet(
 
     decoded: dict[str, Any] = {
         "schema": CAMERA_PACKET_SCHEMA,
+        "session_id": session_id,
         "timestamps": decoded_timestamps,
         "sequences": decoded_sequences,
         "images": decoded_images,
@@ -163,6 +165,12 @@ def _non_negative_int(value: Any, name: str) -> int:
         raise CameraPacketError(f"{name} must be a non-negative integer")
     if value < 0:
         raise CameraPacketError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _session_id(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+        raise CameraPacketError("camera packet session_id is invalid")
     return value
 
 

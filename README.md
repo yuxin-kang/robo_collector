@@ -16,7 +16,7 @@ The default field configuration is:
 | --- | --- |
 | `target` | `action.aligned_target_pos`, 45 dimensions |
 | `state` | Policy input state fields, 1110 dimensions in total |
-| metadata | Camera references, timestamps, episode/frame indices, and task metadata |
+| metadata | Fixed-rate timeline, source timestamps, camera references, episode/frame indices, and task metadata |
 
 ## Repository Layout
 
@@ -78,14 +78,19 @@ Verify that the generated message interfaces contain the expected fields:
 
 ```bash
 ros2 interface show robo_state_msgs/msg/RoboStateSample | grep aligned_target_pos
+ros2 interface show robo_state_msgs/msg/RoboStateSample | grep source_timestamp_names
 ros2 interface show robo_state_msgs/msg/PolicyState | grep flattened
+ros2 interface show robo_collector_msgs/msg/RecordCommand | grep -E 'command_id|force'
 ```
 
 Expected output:
 
 ```text
 float32[45] aligned_target_pos
+string[] source_timestamp_names
 float32[1110] flattened
+string command_id
+bool force
 ```
 
 ## Camera Setup
@@ -134,7 +139,10 @@ bash scripts/launch_data_collection.sh \
   --camera-port 5555 \
   --camera-streams head,ego_view \
   --root-output-dir outputs \
-  --fps 30
+  --fps 30 \
+  --max-episode-duration-sec 600 \
+  --max-episode-frames 18000 \
+  --min-free-disk-bytes 2147483648
 ```
 
 The recommended `configs/collection_fields.yml` also stores
@@ -180,6 +188,24 @@ ros2 topic pub --once /robo_collector/record_command \
   "{command: 3}"
 ```
 
+An empty `episode_id` keeps direct terminal control convenient and targets the
+currently active episode. Automated controllers should send the `episode_id`
+returned in collector status; mismatched STOP/DISCARD commands are rejected.
+They should also reuse one stable `command_id` across retries and confirm the
+matching `last_command_*` status fields. `force: true` is reserved for an
+explicit operator override. If a duration, frame-count, or free-disk limit is
+reached, the collector fail-closes with `SAFETY DISCARD`; it never saves a
+known-incomplete episode.
+
+State/camera admission uses local monotonic receive-time skew, so robot and
+camera hosts do not need synchronized wall clocks for the gate. Original state
+and camera source timestamps are still stored as float64 audit columns;
+inter-camera skew is checked in the camera server's shared clock domain.
+This is a best-effort receive-time gate, not a hard bound on physical capture
+alignment: server encoding and network delay are outside that bound. Experiments
+that require capture-time guarantees should add hardware/PTP synchronization and
+validate the stored source timestamps with a measured clock-offset budget.
+
 Multiple `START`/`STOP` cycles in the same launch append episodes to the same
 dataset:
 
@@ -196,6 +222,16 @@ outputs/robo_collector_YYYYMMDD_HHMMSS/
 
 Restart the launch script or pass a different `--dataset-name` when you want a
 new dataset directory.
+
+Datasets created before `robo_collector_schema_version: 1` used different
+timeline semantics and are intentionally rejected for append. Start a new
+`dataset_name`; no automatic in-place migration is provided because inventing
+source timestamps for old rows would silently corrupt alignment provenance.
+
+Protocol fields in `RecordCommand`, `RoboStateSample`, and camera packet v3 must
+be deployed together. After updating, clean-rebuild the ROS workspace and
+restart both the camera server and collector; mixed message hashes or a v2
+camera server are not wire-compatible.
 
 ## Gesture-Triggered Multi-Trial Recording
 
@@ -218,6 +254,13 @@ Plan fields:
   active dataset root from `/robo_collector/status`.
 - `collector.fps`: recording frame rate used to enforce the configured
   `max_tail_frames` bound.
+- `collector.stop_confirm_timeout_sec`: STOP acknowledgement deadline; STOP is
+  retried idempotently for the current episode.
+- `collector.discard_confirm_timeout_sec`: fail-closed DISCARD acknowledgement
+  deadline; DISCARD is retried for the owned episode before the trigger pauses.
+- `collector.max_recording_duration_sec`: gesture-side fail-closed watchdog; an
+  incomplete attempt is discarded if it runs too long or gesture samples go
+  stale.
 - `gesture_source`: which vector to read from `/robo_state/sample`.
 - `references` and `conditions`: calibration targets plus trigger thresholds.
 - `tasks`: one or more prompts, each with its own `target_trials`.
@@ -226,6 +269,9 @@ The node publishes operator status on `/gesture_trigger/status` and writes a
 non-authoritative cache log to
 `<dataset_root>/meta/gesture_trigger_progress.json`. On restart, it rebuilds
 progress from `meta/episodes.jsonl` instead of trusting the progress log.
+New episode rows include SHA-256/size integrity records. Recovery verifies those
+records before marking a gesture trial complete; dataset metadata updates use a
+durable transaction journal, and only one writer may own a dataset at a time.
 
 ## Convert to Isaac-GR00T
 

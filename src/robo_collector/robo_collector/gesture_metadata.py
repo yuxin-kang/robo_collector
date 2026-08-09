@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +17,9 @@ from .gesture_plan import GestureTriggerPlan, PlannedTrial
 
 PROGRESS_SCHEMA_VERSION = 1
 DEFAULT_PROGRESS_FILENAME = "gesture_trigger_progress.json"
+METADATA_TRANSACTION_FILENAME = ".metadata-transaction.json"
+METADATA_LOCK_FILENAME = ".metadata.lock"
+_FILE_SHA256_CACHE: dict[str, tuple[int, int, int, str]] = {}
 
 
 @dataclass(frozen=True)
@@ -77,7 +83,7 @@ class ProgressLog:
 def scan_plan_metadata(dataset_root: str | Path, plan: GestureTriggerPlan) -> MetadataSnapshot:
     root = Path(dataset_root)
     episodes_path = root / "meta/episodes.jsonl"
-    rows, parse_error = _read_jsonl_rows(episodes_path)
+    rows, parse_error = _read_episode_rows_consistently(root, episodes_path)
 
     rows_by_attempt: dict[tuple[str, int], dict[int, list[dict[str, Any]]]] = {}
     for row in rows:
@@ -109,6 +115,33 @@ def scan_plan_metadata(dataset_root: str | Path, plan: GestureTriggerPlan) -> Me
         statuses=statuses,
         parse_error=parse_error,
     )
+
+
+def _read_episode_rows_consistently(
+    root: Path, episodes_path: Path
+) -> tuple[list[dict[str, Any]], str]:
+    meta_dir = root / "meta"
+    if not meta_dir.exists():
+        return _read_jsonl_rows(episodes_path)
+    lock_fd = os.open(
+        meta_dir / METADATA_LOCK_FILENAME,
+        os.O_RDWR | os.O_CREAT,
+        0o600,
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        transaction_path = meta_dir / METADATA_TRANSACTION_FILENAME
+        if transaction_path.exists():
+            return [], (
+                "metadata transaction is still pending recovery; "
+                f"temporarily refusing to classify {transaction_path}"
+            )
+        return _read_jsonl_rows(episodes_path)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 def default_progress_path(dataset_root: str | Path) -> Path:
@@ -265,6 +298,26 @@ def _classify_trial_attempts(
         if _row_is_success(row, trial.task_prompt, dataset_root):
             successful_attempts.append((attempt_index, row))
 
+    if len(successful_attempts) > 1:
+        attempt_indexes = [attempt_index for attempt_index, _row in successful_attempts]
+        episode_ids = [
+            str(row.get("episode_id", "")).strip()
+            for _attempt_index, row in successful_attempts
+        ]
+        latest_attempt_index = max(attempt_indexes)
+        return TrialMetadataStatus(
+            task_slug=trial.task_slug,
+            trial_index=trial.trial_index,
+            complete=False,
+            latest_state="DUPLICATE",
+            latest_attempt_index=latest_attempt_index,
+            next_attempt_index=latest_attempt_index,
+            message=(
+                "multiple successful attempts exist for one planned trial: "
+                + ", ".join(episode_ids)
+            ),
+        )
+
     if successful_attempts:
         attempt_index, row = successful_attempts[0]
         episode_id = str(row.get("episode_id", "")).strip()
@@ -329,20 +382,32 @@ def _row_failure_state(
         video_paths = {"default": legacy_video_path} if legacy_video_path else {}
     if not video_paths:
         return "INCOMPLETE_MEDIA", "metadata row has no video paths"
+    resolved_video_paths: dict[str, Path] = {}
     for camera_key, relative_path in video_paths.items():
-        if (
-            _existing_dataset_file(
-                dataset_root,
-                relative_path,
-                label=f"video_paths[{camera_key}]",
-            )
-            is None
-        ):
+        video_path = _existing_dataset_file(
+            dataset_root,
+            relative_path,
+            label=f"video_paths[{camera_key}]",
+        )
+        if video_path is None:
             return (
                 "INCOMPLETE_MEDIA",
                 f"video for {camera_key} is missing, unsafe, or empty",
             )
-    return "SUCCESS", "metadata and media files are present"
+        resolved_video_paths[str(camera_key)] = video_path
+
+    integrity = row.get("integrity")
+    if integrity is not None:
+        integrity_error = _artifact_integrity_error(
+            integrity,
+            length=length,
+            data_path=data_path,
+            video_paths=resolved_video_paths,
+        )
+        if integrity_error:
+            return "INCOMPLETE_MEDIA", integrity_error
+        return "SUCCESS", "metadata and artifact integrity verified"
+    return "SUCCESS", "metadata and media files are present (legacy row)"
 
 
 def _existing_dataset_file(
@@ -362,3 +427,83 @@ def _existing_dataset_file(
     except OSError:
         return None
     return candidate
+
+
+def _artifact_integrity_error(
+    integrity: Any,
+    *,
+    length: int,
+    data_path: Path,
+    video_paths: dict[str, Path],
+) -> str:
+    if not isinstance(integrity, dict) or integrity.get("algorithm") != "sha256":
+        return "metadata integrity block is missing or unsupported"
+    data_record = integrity.get("data")
+    if not isinstance(data_record, dict) or data_record.get("rows") != length:
+        return "parquet integrity row count does not match episode length"
+    error = _file_integrity_error(data_path, data_record, label="parquet")
+    if error:
+        return error
+
+    video_records = integrity.get("videos")
+    if not isinstance(video_records, dict):
+        return "metadata integrity block has no video records"
+    if set(video_records) != set(video_paths):
+        return "video integrity keys do not match video_paths"
+    for camera_key, video_path in video_paths.items():
+        record = video_records.get(camera_key)
+        if not isinstance(record, dict) or record.get("frames") != length:
+            return f"video integrity frame count mismatch for {camera_key}"
+        error = _file_integrity_error(
+            video_path, record, label=f"video for {camera_key}"
+        )
+        if error:
+            return error
+    return ""
+
+
+def _file_integrity_error(path: Path, record: dict[str, Any], *, label: str) -> str:
+    expected_size = record.get("size_bytes")
+    expected_digest = record.get("sha256")
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size <= 0
+        or not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+    ):
+        return f"{label} integrity record is invalid"
+    try:
+        stat = path.stat()
+    except OSError:
+        return f"{label} cannot be inspected"
+    if stat.st_size != expected_size:
+        return f"{label} size does not match metadata integrity"
+    try:
+        actual_digest = _cached_file_sha256(
+            str(path.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ino
+        )
+    except OSError:
+        return f"{label} cannot be read for checksum validation"
+    if actual_digest != expected_digest:
+        return f"{label} checksum does not match metadata integrity"
+    return ""
+
+
+def _cached_file_sha256(
+    path: str, size_bytes: int, modified_ns: int, inode: int
+) -> str:
+    cached = _FILE_SHA256_CACHE.get(path)
+    fingerprint = (size_bytes, modified_ns, inode)
+    if cached is not None and cached[:3] == fingerprint:
+        return cached[3]
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as artifact:
+        while True:
+            chunk = artifact.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    value = digest.hexdigest()
+    _FILE_SHA256_CACHE[path] = (*fingerprint, value)
+    return value

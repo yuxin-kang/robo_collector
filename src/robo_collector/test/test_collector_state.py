@@ -2,9 +2,62 @@ import unittest
 
 from robo_collector.collector_state import (
     CollectorMode,
+    CommandFingerprint,
+    CommandReceiptLedger,
     RecordCommandType,
     RecordStateMachine,
+    recording_safety_reason,
 )
+
+
+class CommandReceiptLedgerTest(unittest.TestCase):
+    def setUp(self):
+        self.fingerprint = CommandFingerprint(
+            command=int(RecordCommandType.START),
+            task_prompt="pick up",
+            episode_id="episode-a",
+            force=False,
+        )
+
+    def test_same_command_id_and_payload_replays_terminal_outcome(self):
+        ledger = CommandReceiptLedger()
+        ledger.remember("command-a", self.fingerprint, "SUCCEEDED")
+
+        replay = ledger.lookup("command-a", self.fingerprint)
+
+        self.assertEqual(replay.disposition, "REPLAY")
+        self.assertEqual(replay.outcome, "SUCCEEDED")
+
+    def test_same_command_id_with_different_payload_is_a_conflict(self):
+        ledger = CommandReceiptLedger()
+        ledger.remember("command-a", self.fingerprint, "SUCCEEDED")
+        different = CommandFingerprint(
+            command=int(RecordCommandType.STOP),
+            task_prompt="pick up",
+            episode_id="episode-a",
+            force=False,
+        )
+
+        replay = ledger.lookup("command-a", different)
+
+        self.assertEqual(replay.disposition, "CONFLICT")
+
+    def test_retriable_failure_executes_again_then_replays_success(self):
+        ledger = CommandReceiptLedger()
+        ledger.remember(
+            "command-a",
+            self.fingerprint,
+            "FAILED",
+            replayable=False,
+        )
+        self.assertIsNone(ledger.lookup("command-a", self.fingerprint))
+
+        ledger.remember("command-a", self.fingerprint, "SUCCEEDED")
+
+        self.assertEqual(
+            ledger.lookup("command-a", self.fingerprint).outcome,
+            "SUCCEEDED",
+        )
 
 
 class RecordStateMachineTest(unittest.TestCase):
@@ -62,6 +115,30 @@ class RecordStateMachineTest(unittest.TestCase):
         machine.mark_discarded()
         self.assertEqual(machine.mode, CollectorMode.IDLE)
 
+    def test_failed_discard_can_be_retried(self):
+        machine = RecordStateMachine()
+        machine.handle_command(
+            RecordCommandType.START,
+            task_prompt="walk forward",
+            episode_id="episode-a",
+        )
+        first = machine.handle_command(
+            RecordCommandType.DISCARD,
+            episode_id="episode-a",
+        )
+        self.assertTrue(first.should_discard)
+
+        machine.mark_discard_failed("temporary unlink failure")
+        self.assertEqual(machine.mode, CollectorMode.FAILED)
+
+        retry = machine.handle_command(
+            RecordCommandType.DISCARD,
+            episode_id="episode-a",
+        )
+        self.assertTrue(retry.should_discard)
+        machine.mark_discarded()
+        self.assertEqual(machine.mode, CollectorMode.IDLE)
+
     def test_start_ignored_while_recording(self):
         machine = RecordStateMachine()
         machine.handle_command(RecordCommandType.START, task_prompt="first")
@@ -98,6 +175,89 @@ class RecordStateMachineTest(unittest.TestCase):
         self.assertEqual(machine.mode, CollectorMode.IDLE)
         self.assertEqual(machine.failure_reason, "")
         self.assertIsNone(machine.session)
+
+    def test_stop_and_discard_reject_a_different_episode(self):
+        machine = RecordStateMachine()
+        machine.handle_command(
+            RecordCommandType.START,
+            task_prompt="record",
+            episode_id="episode-a",
+        )
+
+        stop = machine.handle_command(
+            RecordCommandType.STOP,
+            episode_id="episode-b",
+        )
+        discard = machine.handle_command(
+            RecordCommandType.DISCARD,
+            episode_id="episode-b",
+        )
+
+        self.assertFalse(stop.accepted)
+        self.assertFalse(discard.accepted)
+        self.assertEqual(machine.mode, CollectorMode.RECORDING)
+
+    def test_force_can_override_episode_ownership(self):
+        machine = RecordStateMachine()
+        machine.handle_command(
+            RecordCommandType.START,
+            task_prompt="record",
+            episode_id="episode-a",
+        )
+
+        stop = machine.handle_command(
+            RecordCommandType.STOP,
+            episode_id="episode-b",
+            force=True,
+        )
+
+        self.assertTrue(stop.accepted)
+        self.assertTrue(stop.should_save)
+
+    def test_recording_safety_limits_report_the_first_violation(self):
+        self.assertIn(
+            "duration",
+            recording_safety_reason(
+                elapsed_sec=61.0,
+                frame_count=10,
+                max_duration_sec=60.0,
+                max_frames=100,
+                free_disk_bytes=10_000,
+                min_free_disk_bytes=1_000,
+            ),
+        )
+        self.assertIn(
+            "frame",
+            recording_safety_reason(
+                elapsed_sec=1.0,
+                frame_count=100,
+                max_duration_sec=60.0,
+                max_frames=100,
+                free_disk_bytes=10_000,
+                min_free_disk_bytes=1_000,
+            ),
+        )
+        self.assertIn(
+            "disk",
+            recording_safety_reason(
+                elapsed_sec=1.0,
+                frame_count=10,
+                max_duration_sec=60.0,
+                max_frames=100,
+                free_disk_bytes=999,
+                min_free_disk_bytes=1_000,
+            ),
+        )
+        self.assertIsNone(
+            recording_safety_reason(
+                elapsed_sec=1.0,
+                frame_count=10,
+                max_duration_sec=60.0,
+                max_frames=100,
+                free_disk_bytes=10_000,
+                min_free_disk_bytes=1_000,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -57,8 +57,8 @@ class ConversionResult:
 class _EpisodePlan:
     episode_index: int
     global_start_index: int
-    source_rows: list[dict[str, Any]]
-    task_indices: list[int]
+    source_parquet_path: Path
+    frame_count: int
     task_strings: list[str]
     source_video_paths: dict[str, Path]
     image_shapes: dict[str, tuple[int, int, int]]
@@ -140,7 +140,7 @@ def convert_dataset(
                 f"{expected_image_shapes} -> {episode_plan.image_shapes}"
             )
         episode_plans.append(episode_plan)
-        total_frames += len(episode_plan.source_rows)
+        total_frames += episode_plan.frame_count
 
     if not episode_plans or expected_image_shapes is None:
         raise ConversionError("source dataset has no episodes to convert")
@@ -174,6 +174,7 @@ def convert_dataset(
             history_window_index=history_window_index,
             frame_reader_factory=frame_reader_factory,
             image_encoder=image_encoder,
+            task_lookup=task_lookup,
         )
         staging_output.replace(output_dataset)
     except Exception:
@@ -334,44 +335,58 @@ def _preflight_episode(
 ) -> tuple[_EpisodePlan, int]:
     episode_index = int(source_episode["episode_index"])
     parquet_path = _source_parquet_path(source_dataset, source_episode, episode_index)
-    rows = _read_parquet_rows(parquet_path)
-    if not rows:
+    frame_count = _parquet_row_count(parquet_path)
+    if frame_count <= 0:
         raise ConversionError(f"source parquet has no rows: {parquet_path}")
+    row_iterator = _iter_parquet_rows(parquet_path)
+    first_row = next(row_iterator)
 
-    _validate_dense_frame_indices(rows, episode_index=episode_index)
     source_video_paths = _resolve_video_paths(
         source_dataset=source_dataset,
         source_episode=source_episode,
-        first_row=rows[0],
+        first_row=first_row,
         episode_index=episode_index,
     )
     image_shapes = _read_image_shapes(
         source_video_paths=source_video_paths,
         frame_reader_factory=frame_reader_factory,
-        required_frame_count=len(rows),
+        required_frame_count=frame_count,
     )
 
-    task_indices = []
-    for row in rows:
+    task_indices: set[int] = set()
+    rows_seen = 0
+    for row_position, row in enumerate(_prepend_row(first_row, row_iterator)):
+        actual_frame_index = _frame_index(row)
+        if actual_frame_index != row_position:
+            raise ConversionError(
+                f"episode {episode_index} frame_index values must be dense "
+                f"0..N-1 before video sampling; expected {row_position}, "
+                f"got {actual_frame_index}"
+            )
         task_index, next_task_index = _task_index_from_row(
             row,
             task_lookup=task_lookup,
             next_task_index=next_task_index,
         )
-        task_indices.append(task_index)
+        task_indices.add(task_index)
         _vector(row, state_key, history_window_index=history_window_index, name="state")
         _vector(row, action_key, history_window_index=history_window_index, name="action")
+        rows_seen += 1
+    if rows_seen != frame_count:
+        raise ConversionError(
+            f"source parquet row count changed while reading: {parquet_path}"
+        )
 
     task_strings = [
         _task_string_from_index(task_lookup, int(task_index))
-        for task_index in sorted({int(task_index) for task_index in task_indices})
+        for task_index in sorted(task_indices)
     ]
     return (
         _EpisodePlan(
             episode_index=episode_index,
             global_start_index=global_start_index,
-            source_rows=rows,
-            task_indices=task_indices,
+            source_parquet_path=parquet_path,
+            frame_count=frame_count,
             task_strings=task_strings,
             source_video_paths=source_video_paths,
             image_shapes=image_shapes,
@@ -392,26 +407,28 @@ def _materialize_dataset(
     history_window_index: int,
     frame_reader_factory: FrameReaderFactory,
     image_encoder: ImageEncoder,
+    task_lookup: dict[str, int],
 ) -> None:
     meta_dir = staging_output / "meta"
     meta_dir.mkdir(parents=True, exist_ok=False)
     episode_stats_rows: list[dict[str, Any]] = []
 
     for episode_plan in episode_plans:
-        converted_rows, stats = _convert_episode_rows(
-            episode_plan=episode_plan,
-            state_key=state_key,
-            action_key=action_key,
-            history_window_index=history_window_index,
-            frame_reader_factory=frame_reader_factory,
-            image_encoder=image_encoder,
-        )
         dest_data_path = _resolve_path_within_root(
             staging_output,
             str(episode_plan.dest_data_rel_path),
             label=f"dest parquet path for episode {episode_plan.episode_index}",
         )
-        write_parquet(dest_data_path, converted_rows)
+        stats = _convert_episode_to_parquet(
+            episode_plan=episode_plan,
+            dest_data_path=dest_data_path,
+            state_key=state_key,
+            action_key=action_key,
+            history_window_index=history_window_index,
+            frame_reader_factory=frame_reader_factory,
+            image_encoder=image_encoder,
+            task_lookup=task_lookup,
+        )
         episode_stats_rows.append(
             {"episode_index": episode_plan.episode_index, "stats": stats}
         )
@@ -420,7 +437,7 @@ def _materialize_dataset(
         {
             "episode_index": episode_plan.episode_index,
             "tasks": episode_plan.task_strings,
-            "length": len(episode_plan.source_rows),
+            "length": episode_plan.frame_count,
         }
         for episode_plan in episode_plans
     ]
@@ -430,78 +447,110 @@ def _materialize_dataset(
     _write_text(meta_dir / "info.json", _json_content(info))
 
 
-def _convert_episode_rows(
+def _convert_episode_to_parquet(
     *,
     episode_plan: _EpisodePlan,
+    dest_data_path: Path,
     state_key: str,
     action_key: str,
     history_window_index: int,
     frame_reader_factory: FrameReaderFactory,
     image_encoder: ImageEncoder,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    task_lookup: dict[str, int],
+) -> dict[str, Any]:
     readers = _open_frame_readers(episode_plan.source_video_paths, frame_reader_factory)
     image_stats = {
         HEAD_IMAGE_KEY: _ImageStatsAccumulator(),
         EGO_IMAGE_KEY: _ImageStatsAccumulator(),
     }
-    numeric_values: dict[str, list[Any]] = {
-        "state": [],
-        "actions": [],
-        "timestamp": [],
-        "frame_index": [],
-        "episode_index": [],
-        "index": [],
-        "task_index": [],
+    numeric_stats = {
+        key: _NumericStatsAccumulator()
+        for key in (
+            "state",
+            "actions",
+            "timestamp",
+            "frame_index",
+            "episode_index",
+            "index",
+            "task_index",
+        )
     }
-    converted_rows: list[dict[str, Any]] = []
-    try:
-        for row_position, row in enumerate(episode_plan.source_rows):
+
+    def converted_rows():
+        rows_seen = 0
+        for row_position, row in enumerate(
+            _iter_parquet_rows(episode_plan.source_parquet_path)
+        ):
             frame_index = _frame_index(row)
+            if frame_index != row_position:
+                raise ConversionError(
+                    f"episode {episode_plan.episode_index} frame_index changed "
+                    f"after preflight: expected {row_position}, got {frame_index}"
+                )
             head_rgb = _normalize_rgb(readers[HEAD_IMAGE_KEY].read_rgb(frame_index))
             ego_rgb = _normalize_rgb(readers[EGO_IMAGE_KEY].read_rgb(frame_index))
-            _validate_image_shape(HEAD_IMAGE_KEY, head_rgb, episode_plan.image_shapes[HEAD_IMAGE_KEY])
-            _validate_image_shape(EGO_IMAGE_KEY, ego_rgb, episode_plan.image_shapes[EGO_IMAGE_KEY])
+            _validate_image_shape(
+                HEAD_IMAGE_KEY,
+                head_rgb,
+                episode_plan.image_shapes[HEAD_IMAGE_KEY],
+            )
+            _validate_image_shape(
+                EGO_IMAGE_KEY,
+                ego_rgb,
+                episode_plan.image_shapes[EGO_IMAGE_KEY],
+            )
 
             state = _vector(
-                row, state_key, history_window_index=history_window_index, name="state"
+                row,
+                state_key,
+                history_window_index=history_window_index,
+                name="state",
             )
             actions = _vector(
-                row, action_key, history_window_index=history_window_index, name="action"
+                row,
+                action_key,
+                history_window_index=history_window_index,
+                name="action",
             )
             timestamp = float(row["timestamp"])
             output_index = _global_index_for_row(episode_plan, row_position)
-            task_index = int(episode_plan.task_indices[row_position])
+            task_index = _known_task_index_from_row(row, task_lookup)
             output_frame_index = row_position
 
             image_stats[HEAD_IMAGE_KEY].update(head_rgb)
             image_stats[EGO_IMAGE_KEY].update(ego_rgb)
-            numeric_values["state"].append(state)
-            numeric_values["actions"].append(actions)
-            numeric_values["timestamp"].append(timestamp)
-            numeric_values["frame_index"].append(output_frame_index)
-            numeric_values["episode_index"].append(episode_plan.episode_index)
-            numeric_values["index"].append(output_index)
-            numeric_values["task_index"].append(task_index)
+            values = {
+                "state": state,
+                "actions": actions,
+                "timestamp": timestamp,
+                "frame_index": output_frame_index,
+                "episode_index": episode_plan.episode_index,
+                "index": output_index,
+                "task_index": task_index,
+            }
+            for key, value in values.items():
+                numeric_stats[key].update(value)
 
-            converted_rows.append(
-                {
-                    HEAD_IMAGE_KEY: {
-                        "bytes": image_encoder(head_rgb),
-                        "path": f"frame_{output_frame_index:06d}.png",
-                    },
-                    EGO_IMAGE_KEY: {
-                        "bytes": image_encoder(ego_rgb),
-                        "path": f"frame_{output_frame_index:06d}.png",
-                    },
-                    "state": state,
-                    "actions": actions,
-                    "timestamp": timestamp,
-                    "frame_index": output_frame_index,
-                    "episode_index": episode_plan.episode_index,
-                    "index": output_index,
-                    "task_index": task_index,
-                }
+            rows_seen += 1
+            yield {
+                HEAD_IMAGE_KEY: {
+                    "bytes": image_encoder(head_rgb),
+                    "path": f"frame_{output_frame_index:06d}.png",
+                },
+                EGO_IMAGE_KEY: {
+                    "bytes": image_encoder(ego_rgb),
+                    "path": f"frame_{output_frame_index:06d}.png",
+                },
+                **values,
+            }
+        if rows_seen != episode_plan.frame_count:
+            raise ConversionError(
+                "source parquet row count changed between preflight and conversion: "
+                f"{episode_plan.source_parquet_path}"
             )
+
+    try:
+        write_parquet_stream(dest_data_path, converted_rows(), batch_size=16)
     finally:
         for reader in readers.values():
             reader.close()
@@ -510,9 +559,9 @@ def _convert_episode_rows(
         HEAD_IMAGE_KEY: image_stats[HEAD_IMAGE_KEY].to_json(),
         EGO_IMAGE_KEY: image_stats[EGO_IMAGE_KEY].to_json(),
     }
-    for key, values in numeric_values.items():
-        stats[key] = _numeric_stats(values)
-    return converted_rows, stats
+    for key, accumulator in numeric_stats.items():
+        stats[key] = accumulator.to_json()
+    return stats
 
 
 def _dest_data_rel_path(episode_index: int) -> Path:
@@ -693,6 +742,27 @@ def _task_string_from_index(task_lookup: dict[str, int], task_index: int) -> str
     raise ConversionError(f"task_index {task_index} is not present in tasks.jsonl")
 
 
+def _known_task_index_from_row(
+    row: dict[str, Any], task_lookup: dict[str, int]
+) -> int:
+    task_value = row.get(TASK_KEY)
+    if isinstance(task_value, int):
+        task_index = int(task_value)
+        if task_index not in task_lookup.values():
+            raise ConversionError(
+                f"task_index changed after preflight: {task_index}"
+            )
+        return task_index
+    if isinstance(task_value, bytes):
+        task_value = task_value.decode("utf-8")
+    if not isinstance(task_value, str) or not task_value.strip():
+        raise ConversionError(f"{TASK_KEY} must be a non-empty string or int")
+    task = task_value.strip()
+    if task not in task_lookup:
+        raise ConversionError(f"task changed after preflight: {task!r}")
+    return task_lookup[task]
+
+
 def _vector(
     row: dict[str, Any],
     key: str,
@@ -777,7 +847,7 @@ def _source_parquet_path(
     return parquet_path
 
 
-def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
+def _parquet_row_count(path: Path) -> int:
     try:
         import pyarrow.parquet as pq
     except ImportError as exc:
@@ -785,10 +855,32 @@ def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
             "pyarrow is required to convert datasets; run scripts/setup_data_collection_env.sh first"
         ) from exc
 
-    return pq.read_table(path).to_pylist()
+    return int(pq.ParquetFile(path).metadata.num_rows)
+
+
+def _iter_parquet_rows(path: Path, *, batch_size: int = 256):
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "pyarrow is required to convert datasets; run scripts/setup_data_collection_env.sh first"
+        ) from exc
+
+    parquet_file = pq.ParquetFile(path)
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        yield from batch.to_pylist()
+
+
+def _prepend_row(first_row: dict[str, Any], rows):
+    yield first_row
+    yield from rows
 
 
 def write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
+    write_parquet_stream(path, iter(rows))
+
+
+def write_parquet_stream(path: Path, rows, *, batch_size: int = 16) -> None:
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -797,9 +889,6 @@ def write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
             "pyarrow is required to write pi0.5 parquet files; run "
             "scripts/setup_data_collection_env.sh first"
         ) from exc
-
-    if not rows:
-        raise ConversionError("cannot write empty parquet row set")
 
     image_type = pa.struct(
         [
@@ -822,19 +911,31 @@ def write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
         ]
     ).with_metadata({b"huggingface": _huggingface_schema_metadata()})
 
-    columns = {
-        HEAD_IMAGE_KEY: pa.array([row[HEAD_IMAGE_KEY] for row in rows], type=image_type),
-        EGO_IMAGE_KEY: pa.array([row[EGO_IMAGE_KEY] for row in rows], type=image_type),
-        "state": pa.array([row["state"] for row in rows], type=vector_type),
-        "actions": pa.array([row["actions"] for row in rows], type=vector_type),
-        "timestamp": pa.array([row["timestamp"] for row in rows], type=pa.float32()),
-        "frame_index": pa.array([row["frame_index"] for row in rows], type=pa.int64()),
-        "episode_index": pa.array([row["episode_index"] for row in rows], type=pa.int64()),
-        "index": pa.array([row["index"] for row in rows], type=pa.int64()),
-        "task_index": pa.array([row["task_index"] for row in rows], type=pa.int64()),
-    }
+    row_iterator = iter(rows)
+    try:
+        first_row = next(row_iterator)
+    except StopIteration as exc:
+        raise ConversionError("cannot write empty parquet row set") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table(columns, schema=schema), path, compression="snappy")
+    parquet_writer = pq.ParquetWriter(path, schema, compression="snappy")
+    batch = [first_row]
+    try:
+        for row in row_iterator:
+            batch.append(row)
+            if len(batch) < batch_size:
+                continue
+            parquet_writer.write_table(
+                pa.Table.from_pylist(batch, schema=schema),
+                row_group_size=len(batch),
+            )
+            batch.clear()
+        if batch:
+            parquet_writer.write_table(
+                pa.Table.from_pylist(batch, schema=schema),
+                row_group_size=len(batch),
+            )
+    finally:
+        parquet_writer.close()
 
 
 def _huggingface_schema_metadata() -> bytes:
@@ -912,25 +1013,61 @@ class _ImageStatsAccumulator:
         }
 
 
-def _numeric_stats(values: list[Any]) -> dict[str, Any]:
-    if not values:
-        raise ConversionError("cannot compute stats for empty values")
-    try:
-        import numpy as np
-    except ImportError as exc:
-        raise RuntimeError(
-            "numpy is required to compute pi0.5 stats; run scripts/setup_data_collection_env.sh first"
-        ) from exc
+class _NumericStatsAccumulator:
+    def __init__(self) -> None:
+        self._count = 0
+        self._shape: tuple[int, ...] | None = None
+        self._min: Any = None
+        self._max: Any = None
+        self._sum: Any = None
+        self._sum_sq: Any = None
 
-    array = np.asarray(values)
-    keepdims = array.ndim == 1
-    return {
-        "min": np.min(array, axis=0, keepdims=keepdims).tolist(),
-        "max": np.max(array, axis=0, keepdims=keepdims).tolist(),
-        "mean": np.mean(array, axis=0, keepdims=keepdims).tolist(),
-        "std": np.std(array, axis=0, keepdims=keepdims).tolist(),
-        "count": [len(values)],
-    }
+    def update(self, value: Any) -> None:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise RuntimeError(
+                "numpy is required to compute pi0.5 stats; run "
+                "scripts/setup_data_collection_env.sh first"
+            ) from exc
+
+        array = np.asarray(value, dtype=np.float64)
+        shape = tuple(int(size) for size in array.shape)
+        if self._shape is None:
+            self._shape = shape
+            self._min = array.copy()
+            self._max = array.copy()
+            self._sum = array.copy()
+            self._sum_sq = np.square(array)
+        else:
+            if shape != self._shape:
+                raise ConversionError(
+                    f"numeric stat shape changed: {self._shape} -> {shape}"
+                )
+            self._min = np.minimum(self._min, array)
+            self._max = np.maximum(self._max, array)
+            self._sum += array
+            self._sum_sq += np.square(array)
+        self._count += 1
+
+    def to_json(self) -> dict[str, Any]:
+        if self._count <= 0:
+            raise ConversionError("cannot compute stats for empty values")
+        mean = self._sum / self._count
+        variance = (self._sum_sq / self._count) - (mean * mean)
+        variance = variance.clip(min=0.0)
+        return {
+            "min": _numeric_stat_value(self._min),
+            "max": _numeric_stat_value(self._max),
+            "mean": _numeric_stat_value(mean),
+            "std": _numeric_stat_value(variance**0.5),
+            "count": [self._count],
+        }
+
+
+def _numeric_stat_value(value: Any) -> list[Any]:
+    converted = value.tolist()
+    return converted if isinstance(converted, list) else [converted]
 
 
 def _channel_stats_list(values: Any) -> list[list[list[float]]]:

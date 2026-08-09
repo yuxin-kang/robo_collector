@@ -23,21 +23,27 @@ class CachedCameraFrame:
 class CachedCameraBundle:
     frames: dict[str, CachedCameraFrame]
     received_monotonic_sec: float
+    session_id: str
 
     @property
     def images(self) -> dict[str, Any]:
         return {stream: frame.image for stream, frame in self.frames.items()}
 
     @property
-    def identity(self) -> tuple[tuple[str, int | float | None], ...]:
-        return tuple(
-            (
-                stream,
-                frame.sequence
-                if frame.sequence is not None
-                else frame.camera_timestamp_sec,
-            )
-            for stream, frame in sorted(self.frames.items())
+    def identity(
+        self,
+    ) -> tuple[str, tuple[tuple[str, int | float | None], ...]]:
+        return (
+            self.session_id,
+            tuple(
+                (
+                    stream,
+                    frame.sequence
+                    if frame.sequence is not None
+                    else frame.camera_timestamp_sec,
+                )
+                for stream, frame in sorted(self.frames.items())
+            ),
         )
 
 
@@ -76,6 +82,9 @@ class CameraFrameCache:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._bundle: CachedCameraBundle | None = None
+        self._current_session_id = ""
+        self._retired_session_ids: set[str] = set()
+        self._retired_session_order: list[str] = []
         self._last_error = ""
 
     def start(self) -> None:
@@ -112,11 +121,17 @@ class CameraFrameCache:
         images = packet.get("images", {})
         timestamps = packet.get("timestamps", {})
         sequences = packet.get("sequences", {})
+        session_id = packet.get("session_id")
         if not isinstance(images, dict) or not isinstance(timestamps, dict):
             self._record_error("camera packet images/timestamps must be mappings")
             return False
         if not isinstance(sequences, dict):
             self._record_error("camera packet sequences must be a mapping")
+            return False
+        if not isinstance(session_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}", session_id
+        ):
+            self._record_error("camera packet session_id is invalid")
             return False
         if self.expected_fps is not None:
             try:
@@ -181,14 +196,46 @@ class CameraFrameCache:
             )
             return False
         with self._lock:
-            if self._bundle is not None and _bundle_is_not_newer(frames, self._bundle.frames):
+            if (
+                self._current_session_id
+                and session_id != self._current_session_id
+                and session_id in self._retired_session_ids
+            ):
+                self._last_error = (
+                    f"camera packet belongs to retired session {session_id!r}"
+                )
+                return False
+            if (
+                self._bundle is not None
+                and session_id == self._current_session_id
+                and _bundle_is_not_newer(
+                    frames,
+                    self._bundle.frames,
+                    session_id=session_id,
+                    previous_session_id=self._bundle.session_id,
+                )
+            ):
                 self._last_error = "camera packet did not advance stream sequence/timestamp"
                 return False
+            if self._current_session_id and session_id != self._current_session_id:
+                self._retire_session(self._current_session_id)
+            self._current_session_id = session_id
             self._bundle = CachedCameraBundle(
-                frames=frames, received_monotonic_sec=received_at
+                frames=frames,
+                received_monotonic_sec=received_at,
+                session_id=session_id,
             )
             self._last_error = ""
         return True
+
+    def _retire_session(self, session_id: str) -> None:
+        if session_id in self._retired_session_ids:
+            return
+        self._retired_session_ids.add(session_id)
+        self._retired_session_order.append(session_id)
+        if len(self._retired_session_order) > 64:
+            expired = self._retired_session_order.pop(0)
+            self._retired_session_ids.discard(expired)
 
     def _run(self) -> None:
         try:
@@ -299,7 +346,12 @@ def _required_positive_float(value: Any, name: str) -> float:
 def _bundle_is_not_newer(
     frames: dict[str, CachedCameraFrame],
     previous: dict[str, CachedCameraFrame],
+    *,
+    session_id: str,
+    previous_session_id: str,
 ) -> bool:
+    if session_id != previous_session_id:
+        return False
     for stream, frame in frames.items():
         old = previous.get(stream)
         if old is None:

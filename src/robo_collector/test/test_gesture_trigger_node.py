@@ -7,6 +7,8 @@ from robo_collector.gesture_trigger_node import (
     attempt_state_is_armed,
     collector_status_is_fresh,
     detection_tail_frames,
+    diagnostic_level_number,
+    diagnostic_level_value,
     parse_collector_status,
     resolve_dataset_root,
     resolve_progress_path,
@@ -24,7 +26,7 @@ class FakeKeyValue:
 
 @dataclass(frozen=True)
 class FakeDiagnosticStatus:
-    level: int
+    level: object
     message: str
     values: list[FakeKeyValue]
 
@@ -108,6 +110,22 @@ class GestureTriggerNodeHelpersTest(unittest.TestCase):
 
         self.assertTrue(collector_status_is_fresh(snapshot, 12.0, 3.0))
         self.assertFalse(collector_status_is_fresh(snapshot, 14.5, 3.0))
+
+    def test_diagnostic_byte_level_round_trips(self):
+        snapshot = parse_collector_status(
+            FakeDiagnosticStatus(
+                level=b"\x01",
+                message="warning",
+                values=[FakeKeyValue(key="mode", value="IDLE")],
+            ),
+            10.0,
+        )
+
+        self.assertEqual(snapshot.level, 1)
+        self.assertEqual(diagnostic_level_number(bytearray([2])), 2)
+        self.assertEqual(diagnostic_level_value(3), b"\x03")
+        with self.assertRaisesRegex(ValueError, "exactly one byte"):
+            diagnostic_level_number(b"")
 
     def test_armed_flag_only_tracks_armed_state(self):
         self.assertTrue(attempt_state_is_armed(AttemptState.ARMED))

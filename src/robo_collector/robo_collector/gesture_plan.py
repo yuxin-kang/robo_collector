@@ -26,10 +26,13 @@ class CollectorPlanConfig:
     status_topic: str = "/robo_collector/status"
     fps: float = 30.0
     start_confirm_timeout_sec: float = 5.0
+    stop_confirm_timeout_sec: float = 5.0
+    discard_confirm_timeout_sec: float = 5.0
     command_retry_interval_sec: float = 0.5
     command_max_retries: int = 5
     save_confirm_timeout_sec: float = 20.0
     status_timeout_sec: float = 5.0
+    max_recording_duration_sec: float = 300.0
     auto_discard: bool = False
     ready_policy: str = "wait_for_idle"
 
@@ -200,6 +203,14 @@ def _parse_collector(value: Any, *, source: str) -> CollectorPlanConfig:
             value.get("start_confirm_timeout_sec", 5.0),
             source=f"{source}: collector.start_confirm_timeout_sec",
         ),
+        stop_confirm_timeout_sec=_positive_float(
+            value.get("stop_confirm_timeout_sec", 5.0),
+            source=f"{source}: collector.stop_confirm_timeout_sec",
+        ),
+        discard_confirm_timeout_sec=_positive_float(
+            value.get("discard_confirm_timeout_sec", 5.0),
+            source=f"{source}: collector.discard_confirm_timeout_sec",
+        ),
         command_retry_interval_sec=_positive_float(
             value.get("command_retry_interval_sec", 0.5),
             source=f"{source}: collector.command_retry_interval_sec",
@@ -215,6 +226,10 @@ def _parse_collector(value: Any, *, source: str) -> CollectorPlanConfig:
         status_timeout_sec=_positive_float(
             value.get("status_timeout_sec", 5.0),
             source=f"{source}: collector.status_timeout_sec",
+        ),
+        max_recording_duration_sec=_positive_float(
+            value.get("max_recording_duration_sec", 300.0),
+            source=f"{source}: collector.max_recording_duration_sec",
         ),
         auto_discard=auto_discard,
         ready_policy=ready_policy,

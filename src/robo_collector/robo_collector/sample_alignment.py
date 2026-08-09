@@ -46,6 +46,38 @@ def selected_missing_inputs(
     return sorted(required.intersection(str(name) for name in reported_missing))
 
 
+def selected_source_timestamps_sec(
+    msg: Any, selection: FieldSelection
+) -> dict[str, float] | None:
+    names = getattr(msg, "source_timestamp_names", None)
+    values = getattr(msg, "source_timestamps_sec", None)
+    if names is None or values is None:
+        return None
+    try:
+        if len(names) != len(values):
+            return None
+    except TypeError:
+        return None
+
+    timestamps: dict[str, float] = {}
+    for raw_name, raw_value in zip(names, values):
+        name = str(raw_name).strip()
+        if not name or name in timestamps or isinstance(raw_value, bool):
+            return None
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(value) or value <= 0:
+            return None
+        timestamps[name] = value
+
+    required = required_sample_inputs(selection)
+    if not required.issubset(timestamps):
+        return None
+    return {name: timestamps[name] for name in sorted(required)}
+
+
 def message_stamp_sec(msg: Any) -> float | None:
     header = getattr(msg, "header", None)
     stamp = getattr(header, "stamp", None)

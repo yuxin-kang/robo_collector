@@ -5,6 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 import cv2
 import msgpack
@@ -306,6 +307,7 @@ def main():
     )
 
     sent = 0
+    session_id = uuid4().hex
     last_report = time.monotonic()
     last_sequences = {reader.spec.stream: -1 for reader in readers}
 
@@ -349,7 +351,8 @@ def main():
                     sequences[depth_stream] = frame.sequence
 
             packet: dict[str, Any] = {
-                "schema": "robo_collector_camera.v2",
+                "schema": "robo_collector_camera.v3",
+                "session_id": session_id,
                 "timestamps": timestamps,
                 "sequences": sequences,
                 "images": images,

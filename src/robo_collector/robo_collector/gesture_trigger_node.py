@@ -114,10 +114,33 @@ def diagnostic_values_map(msg: Any) -> dict[str, str]:
     return mapped
 
 
+def diagnostic_level_number(level: object) -> int:
+    if isinstance(level, (bytes, bytearray)):
+        if len(level) != 1:
+            raise ValueError("DiagnosticStatus.level must contain exactly one byte")
+        return int(level[0])
+    return int(level)
+
+
+def diagnostic_level_value(level: object) -> bytes:
+    if isinstance(level, bytes):
+        if len(level) != 1:
+            raise ValueError("DiagnosticStatus.level must contain exactly one byte")
+        return level
+    if isinstance(level, bytearray):
+        if len(level) != 1:
+            raise ValueError("DiagnosticStatus.level must contain exactly one byte")
+        return bytes(level)
+    number = int(level)
+    if number < 0 or number > 255:
+        raise ValueError("DiagnosticStatus.level must be between 0 and 255")
+    return bytes([number])
+
+
 def parse_collector_status(msg: Any, received_monotonic_sec: float) -> CollectorStatusSnapshot:
     values = diagnostic_values_map(msg)
     return CollectorStatusSnapshot(
-        level=int(getattr(msg, "level", 0)),
+        level=diagnostic_level_number(getattr(msg, "level", 0)),
         message=str(getattr(msg, "message", "")).strip(),
         mode=values.get("mode", "").strip(),
         dataset_root=values.get("dataset_root", "").strip(),
@@ -297,8 +320,27 @@ if rclpy is not None:  # pragma: no branch
             self._refresh_dataset_root(now_sec)
             self._validate_tail_bound(now_sec)
             if self._fatal_error:
+                previous_state = self._machine.attempt_state
+                actions: list[TriggerAction] = []
+                if (
+                    self._bootstrapped
+                    and self._machine.attempt_state
+                    == AttemptState.WAITING_DISCARD_ACK
+                ):
+                    actions = self._machine.step(
+                        now_sec,
+                        metadata_snapshot=self._metadata_snapshot,
+                        collector_mode=self._collector_mode(now_sec),
+                        collector_episode_id=self._collector_episode_id(now_sec),
+                        **self._collector_receipt_fields(now_sec),
+                    )
+                    for action in actions:
+                        self._publish_action(action)
+                    self._record_state_transition(
+                        previous_state, self._machine.attempt_state
+                    )
                 self._reset_detectors()
-                self._write_progress_log_if_needed()
+                self._write_progress_log_if_needed(force=bool(actions))
                 return
             if not self._dataset_root:
                 self._reset_detectors()
@@ -322,6 +364,8 @@ if rclpy is not None:  # pragma: no branch
                 metadata_snapshot=metadata_snapshot,
                 collector_mode=self._collector_mode(now_sec),
                 collector_episode_id=self._collector_episode_id(now_sec),
+                **self._collector_receipt_fields(now_sec),
+                recording_sample_fresh=self._gesture_sample_is_fresh(now_sec),
             )
             for action in actions:
                 self._publish_action(action)
@@ -484,11 +528,32 @@ if rclpy is not None:  # pragma: no branch
                 return ""
             return self._latest_collector_status.values.get("episode_id", "")
 
+        def _collector_receipt_fields(self, now_sec: float) -> dict[str, str]:
+            if not collector_status_is_fresh(
+                self._latest_collector_status,
+                now_sec,
+                self._plan.collector.status_timeout_sec,
+            ):
+                return {}
+            values = self._latest_collector_status.values
+            return {
+                "collector_last_command_id": values.get("last_command_id", ""),
+                "collector_last_command": values.get("last_command", ""),
+                "collector_last_command_outcome": values.get(
+                    "last_command_outcome", ""
+                ),
+                "collector_last_command_episode_id": values.get(
+                    "last_command_episode_id", ""
+                ),
+                "collector_last_episode_id": values.get("last_episode_id", ""),
+                "collector_last_episode_outcome": values.get(
+                    "last_episode_outcome", ""
+                ),
+            }
+
         def _current_gesture_vector(self, now_sec: float) -> list[float] | None:
             sample = self._latest_sample
-            if sample is None:
-                return None
-            if now_sec - sample.received_monotonic_sec > self._max_sample_age_sec:
+            if not self._gesture_sample_is_fresh(now_sec) or sample is None:
                 return None
             try:
                 return extract_gesture_vector(
@@ -499,6 +564,14 @@ if rclpy is not None:  # pragma: no branch
             except ValueError as exc:
                 self._set_fatal_error(str(exc))
                 return None
+
+        def _gesture_sample_is_fresh(self, now_sec: float) -> bool:
+            sample = self._latest_sample
+            return (
+                sample is not None
+                and now_sec - sample.received_monotonic_sec
+                <= self._max_sample_age_sec
+            )
 
         def _update_detector_or_fail(
             self,
@@ -549,12 +622,17 @@ if rclpy is not None:  # pragma: no branch
                 msg.command = RecordCommand.DISCARD
             msg.task_prompt = action.task_prompt
             msg.episode_id = action.episode_id
+            if hasattr(msg, "command_id"):
+                msg.command_id = action.command_id
+            if hasattr(msg, "force"):
+                msg.force = False
             self._command_pub.publish(msg)
             self._append_event(
                 f"{action.command}_SENT",
                 action.episode_id,
                 {
                     "task_prompt": action.task_prompt,
+                    "command_id": action.command_id,
                 },
             )
 
@@ -635,7 +713,9 @@ if rclpy is not None:  # pragma: no branch
                 return
             self._fatal_error = message
             self.get_logger().error(message)
-            stop_action = self._machine.abort_active_attempt(message)
+            stop_action = self._machine.abort_active_attempt(
+                message, now_sec=time.monotonic()
+            )
             if stop_action is not None:
                 self._publish_action(stop_action)
 
@@ -687,10 +767,14 @@ if rclpy is not None:  # pragma: no branch
             if self._machine.attempt_state in (
                 AttemptState.PAUSED_FAILED,
                 AttemptState.PAUSED_AMBIGUOUS_METADATA,
+                AttemptState.WAITING_DISCARD_ACK,
             ):
                 level = DiagnosticStatus.ERROR
                 message = self._machine.last_error or self._machine.attempt_state.value
-            elif self._machine.attempt_state == AttemptState.WAITING_SAVE_METADATA:
+            elif self._machine.attempt_state in (
+                AttemptState.WAITING_STOP_ACK,
+                AttemptState.WAITING_SAVE_METADATA,
+            ):
                 level = DiagnosticStatus.WARN
                 message = self._machine.metadata_match_reason
             elif self._machine.attempt_state == AttemptState.COMPLETE:
@@ -700,9 +784,9 @@ if rclpy is not None:  # pragma: no branch
                 )
             self._publish_status(level, message)
 
-        def _publish_status(self, level: int, message: str) -> None:
+        def _publish_status(self, level: object, message: str) -> None:
             status = DiagnosticStatus()
-            status.level = int(level)
+            status.level = diagnostic_level_value(level)
             status.name = self.get_name()
             status.hardware_id = "gesture_trigger"
             status.message = message
@@ -783,8 +867,10 @@ if rclpy is not None:  # pragma: no branch
             self._status_pub.publish(status)
             self._log_status_issue_throttled(level, message)
 
-        def _log_status_issue_throttled(self, level: int, message: str) -> None:
-            if int(level) == int(DiagnosticStatus.OK):
+        def _log_status_issue_throttled(self, level: object, message: str) -> None:
+            if diagnostic_level_number(level) == diagnostic_level_number(
+                DiagnosticStatus.OK
+            ):
                 return
             now_sec = time.monotonic()
             if (
@@ -794,7 +880,9 @@ if rclpy is not None:  # pragma: no branch
                 return
             self._last_status_log_message = message
             self._last_status_log_monotonic_sec = now_sec
-            if int(level) == int(DiagnosticStatus.ERROR):
+            if diagnostic_level_number(level) == diagnostic_level_number(
+                DiagnosticStatus.ERROR
+            ):
                 self.get_logger().error(message)
             else:
                 self.get_logger().warn(message)

@@ -26,7 +26,8 @@ class CameraClientDecodeTest(unittest.TestCase):
         ego_view = np.full((3, 6, 3), (0, 255, 0), dtype=np.uint8)
 
         packet = {
-            "schema": "robo_collector_camera.v2",
+            "schema": "robo_collector_camera.v3",
+            "session_id": "server-session-a",
             "timestamps": {"head": 1.0, "ego_view": 1.1},
             "sequences": {"head": 10, "ego_view": 11},
             "images": {
@@ -38,7 +39,8 @@ class CameraClientDecodeTest(unittest.TestCase):
 
         decoded = decode_packet(packet, host="robot", port=5555)
 
-        self.assertEqual(decoded["schema"], "robo_collector_camera.v2")
+        self.assertEqual(decoded["schema"], "robo_collector_camera.v3")
+        self.assertEqual(decoded["session_id"], "server-session-a")
         self.assertEqual(set(decoded["images"]), {"head", "ego_view"})
         self.assertEqual(decoded["images"]["head"].shape, (4, 5, 3))
         self.assertEqual(decoded["images"]["ego_view"].shape, (3, 6, 3))
@@ -52,7 +54,8 @@ class CameraClientDecodeTest(unittest.TestCase):
             decode_packet({"schema": "unknown", "images": {}})
 
         base = {
-            "schema": "robo_collector_camera.v2",
+            "schema": "robo_collector_camera.v3",
+            "session_id": "server-session-a",
             "timestamps": {"head": float("nan")},
             "sequences": {"head": 0},
             "images": {"head": b"not-an-image"},
@@ -72,9 +75,26 @@ class CameraClientDecodeTest(unittest.TestCase):
         with self.assertRaisesRegex(CameraPacketError, "non-negative integer"):
             decode_packet(
                 {
-                    "schema": "robo_collector_camera.v2",
+                    "schema": "robo_collector_camera.v3",
+                    "session_id": "server-session-a",
                     "timestamps": {"head": 1.0},
                     "sequences": {"head": 1.0},
+                    "images": {"head": _encode_jpeg_rgb(image)},
+                }
+            )
+
+    def test_rejects_missing_server_session_id(self):
+        assert cv2 is not None
+        assert np is not None
+        assert decode_packet is not None
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+
+        with self.assertRaisesRegex(CameraPacketError, "session_id"):
+            decode_packet(
+                {
+                    "schema": "robo_collector_camera.v3",
+                    "timestamps": {"head": 1.0},
+                    "sequences": {"head": 1},
                     "images": {"head": _encode_jpeg_rgb(image)},
                 }
             )

@@ -21,6 +21,9 @@ if(BUILD_TESTING)
     ament_add_pytest_test(test_camera_cache test/test_camera_cache.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
+    ament_add_pytest_test(test_sample_alignment test/test_sample_alignment.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
     ament_add_pytest_test(test_field_config test/test_field_config.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )

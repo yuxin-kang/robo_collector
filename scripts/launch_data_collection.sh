@@ -10,6 +10,9 @@ ROOT_OUTPUT_DIR="outputs"
 DATASET_NAME=""
 FIELD_CONFIG=""
 FPS="30"
+MAX_EPISODE_DURATION_SEC="600.0"
+MAX_EPISODE_FRAMES="18000"
+MIN_FREE_DISK_BYTES="2147483648"
 PRINT_ROS_SETUP=0
 
 while [[ $# -gt 0 ]]; do
@@ -49,6 +52,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --fps)
       FPS="$2"
+      shift 2
+      ;;
+    --max-episode-duration-sec)
+      MAX_EPISODE_DURATION_SEC="$2"
+      shift 2
+      ;;
+    --max-episode-frames)
+      MAX_EPISODE_FRAMES="$2"
+      shift 2
+      ;;
+    --min-free-disk-bytes)
+      MIN_FREE_DISK_BYTES="$2"
       shift 2
       ;;
     --print-ros-setup)
@@ -93,6 +108,9 @@ COLLECTOR_ARGS=(
   "-p" "camera_port:=${CAMERA_PORT}"
   "-p" "root_output_dir:=${ROOT_OUTPUT_DIR}"
   "-p" "fps:=${FPS}"
+  "-p" "max_episode_duration_sec:=${MAX_EPISODE_DURATION_SEC}"
+  "-p" "max_episode_frames:=${MAX_EPISODE_FRAMES}"
+  "-p" "min_free_disk_bytes:=${MIN_FREE_DISK_BYTES}"
 )
 
 if [[ -n "$CAMERA_STREAMS" ]]; then

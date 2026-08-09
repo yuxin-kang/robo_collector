@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Sequence
+from uuid import uuid4
 
 from .gesture_episode_id import build_gesture_episode_id
 from .gesture_metadata import MetadataSnapshot
@@ -17,6 +18,8 @@ class AttemptState(str, Enum):
     ARMED = "ARMED"
     WAITING_START_ACK = "WAITING_START_ACK"
     RECORDING = "RECORDING"
+    WAITING_STOP_ACK = "WAITING_STOP_ACK"
+    WAITING_DISCARD_ACK = "WAITING_DISCARD_ACK"
     WAITING_SAVE_METADATA = "WAITING_SAVE_METADATA"
     SAVED = "SAVED"
     PAUSED_FAILED = "PAUSED_FAILED"
@@ -35,6 +38,7 @@ class TriggerAction:
     command: str
     task_prompt: str
     episode_id: str
+    command_id: str
 
 
 @dataclass(frozen=True)
@@ -132,7 +136,16 @@ class GestureTriggerStateMachine:
         self._start_deadline_sec = 0.0
         self._next_start_retry_sec = 0.0
         self._start_attempts = 0
+        self._recording_started_sec = 0.0
+        self._stop_deadline_sec = 0.0
+        self._next_stop_retry_sec = 0.0
+        self._stop_attempts = 0
+        self._discard_deadline_sec = 0.0
+        self._next_discard_retry_sec = 0.0
+        self._discard_attempts = 0
+        self._pending_failure_message = ""
         self._save_deadline_sec = 0.0
+        self._command_ids: dict[str, str] = {}
 
     def bootstrap(self, snapshot: MetadataSnapshot) -> None:
         if snapshot.parse_error:
@@ -150,6 +163,13 @@ class GestureTriggerStateMachine:
         metadata_snapshot: MetadataSnapshot | None = None,
         collector_mode: str = "",
         collector_episode_id: str = "",
+        collector_last_command_id: str = "",
+        collector_last_command: str = "",
+        collector_last_command_outcome: str = "",
+        collector_last_command_episode_id: str = "",
+        collector_last_episode_id: str = "",
+        collector_last_episode_outcome: str = "",
+        recording_sample_fresh: bool = True,
     ) -> list[TriggerAction]:
         if self.attempt_state == AttemptState.COMPLETE:
             return []
@@ -158,16 +178,110 @@ class GestureTriggerStateMachine:
             self._select_next_attempt(metadata_snapshot)
             return []
 
+        if self.attempt_state == AttemptState.WAITING_DISCARD_ACK:
+            return self._handle_waiting_discard_ack(
+                collector_mode=collector_mode,
+                collector_episode_id=collector_episode_id,
+                collector_last_command_id=collector_last_command_id,
+                collector_last_command=collector_last_command,
+                collector_last_command_outcome=collector_last_command_outcome,
+                collector_last_command_episode_id=(
+                    collector_last_command_episode_id
+                ),
+                collector_last_episode_id=collector_last_episode_id,
+                collector_last_episode_outcome=collector_last_episode_outcome,
+                metadata_snapshot=metadata_snapshot,
+                now_sec=now_sec,
+            )
+
         if self.attempt_state == AttemptState.WAITING_SAVE_METADATA and metadata_snapshot is not None:
-            self._handle_waiting_save(metadata_snapshot, collector_mode, now_sec)
-            return []
+            return self._handle_waiting_save(
+                metadata_snapshot,
+                collector_mode,
+                collector_episode_id,
+                now_sec,
+            )
 
         if self.attempt_state == AttemptState.WAITING_START_ACK:
             return self._handle_waiting_start_ack(
                 collector_mode=collector_mode,
                 collector_episode_id=collector_episode_id,
+                collector_last_command_id=collector_last_command_id,
+                collector_last_command=collector_last_command,
+                collector_last_command_outcome=collector_last_command_outcome,
+                collector_last_command_episode_id=(
+                    collector_last_command_episode_id
+                ),
                 now_sec=now_sec,
             )
+
+        if self.attempt_state == AttemptState.WAITING_STOP_ACK:
+            if self.current_attempt is not None and collector_mode == "IDLE":
+                expected_episode_id = self.current_attempt.episode_id
+                if metadata_snapshot is not None and not metadata_snapshot.parse_error:
+                    status = metadata_snapshot.status_for(
+                        PlannedTrial(
+                            self.current_attempt.task_slug,
+                            self.current_attempt.task_prompt,
+                            self.current_attempt.trial_index,
+                        )
+                    )
+                    if status.ambiguous:
+                        self.attempt_state = AttemptState.PAUSED_AMBIGUOUS_METADATA
+                        self.last_error = status.message
+                        self.metadata_match_reason = status.message
+                        return []
+                    if status.complete and status.episode_id == expected_episode_id:
+                        return self._begin_save_reconciliation(
+                            now_sec,
+                            collector_mode,
+                            collector_episode_id,
+                            metadata_snapshot,
+                            "recovered saved metadata after STOP receipt loss",
+                        )
+                if (
+                    collector_last_episode_id == expected_episode_id
+                    and collector_last_episode_outcome == "SAVED"
+                ):
+                    return self._begin_save_reconciliation(
+                        now_sec,
+                        collector_mode,
+                        collector_episode_id,
+                        metadata_snapshot,
+                        "collector reports the episode saved after STOP receipt loss",
+                    )
+                if (
+                    collector_last_episode_id == expected_episode_id
+                    and collector_last_episode_outcome == "DISCARDED"
+                ):
+                    self._pause_failed(
+                        "collector discarded the episode while STOP acknowledgement was pending"
+                    )
+                    return []
+            actions = self._handle_waiting_stop_ack(
+                collector_mode=collector_mode,
+                collector_episode_id=collector_episode_id,
+                collector_last_command_id=collector_last_command_id,
+                collector_last_command=collector_last_command,
+                collector_last_command_outcome=collector_last_command_outcome,
+                collector_last_command_episode_id=(
+                    collector_last_command_episode_id
+                ),
+                now_sec=now_sec,
+            )
+            if (
+                self.attempt_state == AttemptState.WAITING_SAVE_METADATA
+                and metadata_snapshot is not None
+            ):
+                actions.extend(
+                    self._handle_waiting_save(
+                        metadata_snapshot,
+                        collector_mode,
+                        collector_episode_id,
+                        now_sec,
+                    )
+                )
+            return actions
 
         if self.attempt_state == AttemptState.WAITING_READY and ready_triggered:
             self.attempt_state = AttemptState.ARMED
@@ -186,43 +300,130 @@ class GestureTriggerStateMachine:
                 now_sec + self._plan.collector.command_retry_interval_sec
             )
             self._start_attempts = 1
+            self._command_ids["START"] = uuid4().hex
             self.last_error = ""
             return [self._current_action("START")]
 
-        if self.attempt_state == AttemptState.RECORDING and end_triggered:
+        if self.attempt_state == AttemptState.RECORDING:
             if self.current_attempt is None:
-                self._pause_failed("no current attempt is available for STOP")
+                self._pause_failed("recording without a current attempt")
                 return []
-            self.attempt_state = AttemptState.WAITING_SAVE_METADATA
-            self._save_deadline_sec = (
-                now_sec + self._plan.collector.save_confirm_timeout_sec
-            )
-            self.last_error = ""
-            self.metadata_match_reason = "waiting for metadata save confirmation"
-            return [
-                TriggerAction(
-                    command="STOP",
-                    task_prompt=self.current_attempt.task_prompt,
-                    episode_id=self.current_attempt.episode_id,
+            expected_episode_id = self.current_attempt.episode_id
+            if collector_mode == "RECORDING" and collector_episode_id not in (
+                "",
+                expected_episode_id,
+            ):
+                self._pause_failed(
+                    "collector switched to a different episode while recording: "
+                    f"expected {expected_episode_id!r}, got {collector_episode_id!r}"
                 )
-            ]
+                return []
+            if collector_mode == "FAILED":
+                return self._begin_discard(
+                    "collector entered FAILED while recording", now_sec
+                )
+            if collector_mode == "IDLE":
+                if (
+                    collector_last_episode_id == expected_episode_id
+                    and collector_last_episode_outcome == "SAVED"
+                ):
+                    return self._begin_save_reconciliation(
+                        now_sec,
+                        collector_mode,
+                        collector_episode_id,
+                        metadata_snapshot,
+                        "collector saved the episode outside the gesture STOP path",
+                    )
+                if (
+                    collector_last_episode_id == expected_episode_id
+                    and collector_last_episode_outcome == "DISCARDED"
+                ):
+                    self._pause_failed(
+                        "collector discarded the active episode while gesture recording"
+                    )
+                    return []
+                self._pause_failed(
+                    "collector returned to IDLE before the gesture STOP command"
+                )
+                return []
+            if collector_mode == "NEED_TO_SAVE":
+                if collector_episode_id not in ("", expected_episode_id):
+                    self._pause_failed(
+                        "collector is saving a different episode while gesture recording"
+                    )
+                    return []
+                return self._begin_save_reconciliation(
+                    now_sec,
+                    collector_mode,
+                    collector_episode_id,
+                    metadata_snapshot,
+                    "collector is saving after an external STOP command",
+                )
+            if (
+                now_sec - self._recording_started_sec
+                >= self._plan.collector.max_recording_duration_sec
+            ):
+                return self._begin_discard(
+                    "maximum recording duration exceeded", now_sec
+                )
+            if not recording_sample_fresh:
+                return self._begin_discard(
+                    "gesture sample became missing or stale while recording",
+                    now_sec,
+                )
+            if end_triggered:
+                return self._begin_stop(now_sec)
 
         return []
 
-    def abort_active_attempt(self, message: str) -> TriggerAction | None:
-        should_stop = self.attempt_state in (
+    def _begin_save_reconciliation(
+        self,
+        now_sec: float,
+        collector_mode: str,
+        collector_episode_id: str,
+        metadata_snapshot: MetadataSnapshot | None,
+        reason: str,
+    ) -> list[TriggerAction]:
+        self.attempt_state = AttemptState.WAITING_SAVE_METADATA
+        self._save_deadline_sec = (
+            now_sec + self._plan.collector.save_confirm_timeout_sec
+        )
+        self.metadata_match_reason = reason
+        if metadata_snapshot is None:
+            return []
+        return self._handle_waiting_save(
+            metadata_snapshot,
+            collector_mode,
+            collector_episode_id,
+            now_sec,
+        )
+
+    def abort_active_attempt(
+        self, message: str, now_sec: float = 0.0
+    ) -> TriggerAction | None:
+        if self.attempt_state == AttemptState.WAITING_DISCARD_ACK:
+            return None
+        should_discard = self.attempt_state in (
             AttemptState.WAITING_START_ACK,
             AttemptState.RECORDING,
+            AttemptState.WAITING_STOP_ACK,
+            AttemptState.WAITING_SAVE_METADATA,
         )
-        action = self._current_action("STOP") if should_stop else None
-        self._pause_failed(message)
-        return action
+        if not should_discard:
+            self._pause_failed(message)
+            return None
+        actions = self._begin_discard(message, now_sec)
+        return actions[0] if actions else None
 
     def _handle_waiting_start_ack(
         self,
         *,
         collector_mode: str,
         collector_episode_id: str,
+        collector_last_command_id: str,
+        collector_last_command: str,
+        collector_last_command_outcome: str,
+        collector_last_command_episode_id: str,
         now_sec: float,
     ) -> list[TriggerAction]:
         if self.current_attempt is None:
@@ -230,6 +431,18 @@ class GestureTriggerStateMachine:
             return []
 
         expected_episode_id = self.current_attempt.episode_id
+        expected_command_id = self._current_action("START").command_id
+        matching_receipt = (
+            collector_last_command_id == expected_command_id
+            and collector_last_command == "START"
+            and collector_last_command_episode_id == expected_episode_id
+        )
+        if matching_receipt and collector_last_command_outcome in {
+            "FAILED",
+            "REJECTED",
+        }:
+            self._pause_failed("collector rejected or failed the START command")
+            return []
         if collector_mode == "RECORDING":
             if collector_episode_id != expected_episode_id:
                 self._pause_failed(
@@ -237,18 +450,32 @@ class GestureTriggerStateMachine:
                     f"expected {expected_episode_id!r}, got {collector_episode_id!r}"
                 )
                 return []
-            self.attempt_state = AttemptState.RECORDING
-            self.last_error = ""
-            return []
+            if (
+                matching_receipt
+                and collector_last_command_outcome == "SUCCEEDED"
+            ):
+                self.attempt_state = AttemptState.RECORDING
+                self._recording_started_sec = now_sec
+                self.last_error = ""
+                return []
 
         if collector_mode == "FAILED":
-            self._pause_failed("collector entered FAILED while waiting for START acknowledgement")
+            if (
+                matching_receipt
+                and collector_last_command_outcome == "SUCCEEDED"
+                and collector_episode_id in ("", expected_episode_id)
+            ):
+                return self._begin_discard(
+                    "collector failed after accepting the owned START command",
+                    now_sec,
+                )
+            self._pause_failed(
+                "collector entered FAILED before START ownership was confirmed"
+            )
             return []
 
         if now_sec >= self._start_deadline_sec:
-            stop_action = self._current_action("STOP")
-            self._pause_failed("START acknowledgement timed out")
-            return [stop_action]
+            return self._begin_discard("START acknowledgement timed out", now_sec)
 
         if (
             now_sec >= self._next_start_retry_sec
@@ -261,6 +488,209 @@ class GestureTriggerStateMachine:
             return [self._current_action("START")]
         return []
 
+    def _begin_stop(self, now_sec: float) -> list[TriggerAction]:
+        if self.current_attempt is None:
+            self._pause_failed("no current attempt is available for STOP")
+            return []
+        self.attempt_state = AttemptState.WAITING_STOP_ACK
+        self._stop_deadline_sec = (
+            now_sec + self._plan.collector.stop_confirm_timeout_sec
+        )
+        self._next_stop_retry_sec = (
+            now_sec + self._plan.collector.command_retry_interval_sec
+        )
+        self._stop_attempts = 1
+        self._command_ids["STOP"] = uuid4().hex
+        self.last_error = ""
+        self.metadata_match_reason = "waiting for STOP acknowledgement"
+        return [self._current_action("STOP")]
+
+    def _handle_waiting_stop_ack(
+        self,
+        *,
+        collector_mode: str,
+        collector_episode_id: str,
+        collector_last_command_id: str,
+        collector_last_command: str,
+        collector_last_command_outcome: str,
+        collector_last_command_episode_id: str,
+        now_sec: float,
+    ) -> list[TriggerAction]:
+        if self.current_attempt is None:
+            self._pause_failed("waiting for STOP acknowledgement without a current attempt")
+            return []
+
+        expected_episode_id = self.current_attempt.episode_id
+        expected_command_id = self._current_action("STOP").command_id
+        matching_receipt = (
+            collector_last_command_id == expected_command_id
+            and collector_last_command == "STOP"
+            and collector_last_command_episode_id == expected_episode_id
+        )
+        if collector_mode == "RECORDING" and collector_episode_id not in (
+            "",
+            expected_episode_id,
+        ):
+            self._pause_failed(
+                "collector switched to a different episode while waiting for STOP: "
+                f"expected {expected_episode_id!r}, got {collector_episode_id!r}"
+            )
+            return []
+        if collector_mode in ("NEED_TO_SAVE", "IDLE"):
+            if (
+                collector_mode == "NEED_TO_SAVE"
+                and collector_episode_id
+                and collector_episode_id != expected_episode_id
+            ):
+                self._pause_failed(
+                    "collector acknowledged STOP for a different episode: "
+                    f"expected {expected_episode_id!r}, got {collector_episode_id!r}"
+                )
+                return []
+            if (
+                matching_receipt
+                and collector_last_command_outcome == "SUCCEEDED"
+            ):
+                self.attempt_state = AttemptState.WAITING_SAVE_METADATA
+                self._save_deadline_sec = (
+                    now_sec + self._plan.collector.save_confirm_timeout_sec
+                )
+                self.metadata_match_reason = "waiting for metadata save confirmation"
+                return []
+        if collector_mode == "FAILED":
+            return self._begin_discard(
+                "collector entered FAILED while waiting for STOP acknowledgement",
+                now_sec,
+            )
+        if matching_receipt and collector_last_command_outcome in {
+            "FAILED",
+            "REJECTED",
+        }:
+            return self._begin_discard(
+                "collector rejected or failed the owned STOP command",
+                now_sec,
+            )
+        if now_sec >= self._stop_deadline_sec:
+            return self._begin_discard("STOP acknowledgement timed out", now_sec)
+        if (
+            now_sec >= self._next_stop_retry_sec
+            and self._stop_attempts < self._plan.collector.command_max_retries
+        ):
+            self._stop_attempts += 1
+            self._next_stop_retry_sec = (
+                now_sec + self._plan.collector.command_retry_interval_sec
+            )
+            return [self._current_action("STOP")]
+        return []
+
+    def _begin_discard(
+        self, message: str, now_sec: float
+    ) -> list[TriggerAction]:
+        if self.current_attempt is None:
+            self._pause_failed(message)
+            return []
+        self.attempt_state = AttemptState.WAITING_DISCARD_ACK
+        self._discard_deadline_sec = (
+            now_sec + self._plan.collector.discard_confirm_timeout_sec
+        )
+        self._next_discard_retry_sec = (
+            now_sec + self._plan.collector.command_retry_interval_sec
+        )
+        self._discard_attempts = 1
+        self._command_ids["DISCARD"] = uuid4().hex
+        self._pending_failure_message = message
+        self.last_error = message
+        self.metadata_match_reason = "waiting for DISCARD acknowledgement"
+        return [self._current_action("DISCARD")]
+
+    def _handle_waiting_discard_ack(
+        self,
+        *,
+        collector_mode: str,
+        collector_episode_id: str,
+        collector_last_command_id: str,
+        collector_last_command: str,
+        collector_last_command_outcome: str,
+        collector_last_command_episode_id: str,
+        collector_last_episode_id: str,
+        collector_last_episode_outcome: str,
+        metadata_snapshot: MetadataSnapshot | None,
+        now_sec: float,
+    ) -> list[TriggerAction]:
+        if self.current_attempt is None:
+            self._pause_failed("waiting for DISCARD acknowledgement without an attempt")
+            return []
+
+        expected_episode_id = self.current_attempt.episode_id
+        expected_command_id = self._current_action("DISCARD").command_id
+        if (
+            collector_mode in ("RECORDING", "NEED_TO_SAVE", "FAILED", "DISCARD")
+            and collector_episode_id
+            and collector_episode_id != expected_episode_id
+        ):
+            self._pause_failed(
+                "collector switched to a different episode while waiting for DISCARD: "
+                f"expected {expected_episode_id!r}, got {collector_episode_id!r}"
+            )
+            return []
+        if (
+            collector_last_episode_id == expected_episode_id
+            and collector_last_episode_outcome == "SAVED"
+        ):
+            self.attempt_state = AttemptState.PAUSED_AMBIGUOUS_METADATA
+            self.last_error = (
+                "collector saved the episode while DISCARD acknowledgement was pending; "
+                "manual metadata reconciliation is required"
+            )
+            self.metadata_match_reason = self.last_error
+            return []
+        discard_acknowledged = (
+            collector_mode == "IDLE"
+            and collector_last_command_id == expected_command_id
+            and collector_last_command == "DISCARD"
+            and collector_last_command_outcome == "SUCCEEDED"
+            and collector_last_command_episode_id == expected_episode_id
+        ) or (
+            collector_mode == "IDLE"
+            and collector_last_episode_id == expected_episode_id
+            and collector_last_episode_outcome == "DISCARDED"
+        )
+        if discard_acknowledged:
+            if metadata_snapshot is not None:
+                status = metadata_snapshot.status_for(
+                    PlannedTrial(
+                        self.current_attempt.task_slug,
+                        self.current_attempt.task_prompt,
+                        self.current_attempt.trial_index,
+                    )
+                )
+                if status.complete and status.episode_id == expected_episode_id:
+                    self.attempt_state = AttemptState.PAUSED_AMBIGUOUS_METADATA
+                    self.last_error = (
+                        "DISCARD was acknowledged but matching saved metadata exists; "
+                        "manual reconciliation is required"
+                    )
+                    self.metadata_match_reason = self.last_error
+                    return []
+            self._pause_failed(self._pending_failure_message)
+            return []
+        if now_sec >= self._discard_deadline_sec:
+            self._pause_failed(
+                "DISCARD acknowledgement timed out: "
+                + (self._pending_failure_message or "active attempt may still exist")
+            )
+            return []
+        if (
+            now_sec >= self._next_discard_retry_sec
+            and self._discard_attempts < self._plan.collector.command_max_retries
+        ):
+            self._discard_attempts += 1
+            self._next_discard_retry_sec = (
+                now_sec + self._plan.collector.command_retry_interval_sec
+            )
+            return [self._current_action("DISCARD")]
+        return []
+
     def _current_action(self, command: str) -> TriggerAction:
         if self.current_attempt is None:
             raise RuntimeError(f"cannot create {command} without a current attempt")
@@ -268,19 +698,29 @@ class GestureTriggerStateMachine:
             command=command,
             task_prompt=self.current_attempt.task_prompt,
             episode_id=self.current_attempt.episode_id,
+            command_id=self._command_ids[command],
         )
 
     def _handle_waiting_save(
-        self, snapshot: MetadataSnapshot, collector_mode: str, now_sec: float
-    ) -> None:
+        self,
+        snapshot: MetadataSnapshot,
+        collector_mode: str,
+        collector_episode_id: str,
+        now_sec: float,
+    ) -> list[TriggerAction]:
         if snapshot.parse_error:
             self.metadata_match_reason = snapshot.parse_error
             if now_sec >= self._save_deadline_sec:
-                self._pause_failed(snapshot.parse_error)
-            return
+                return self._discard_owned_save_timeout(
+                    snapshot.parse_error,
+                    collector_mode,
+                    collector_episode_id,
+                    now_sec,
+                )
+            return []
         if self.current_attempt is None:
             self._pause_failed("waiting for save confirmation without a current attempt")
-            return
+            return []
         status = snapshot.status_for(
             PlannedTrial(
                 self.current_attempt.task_slug,
@@ -294,41 +734,87 @@ class GestureTriggerStateMachine:
         if status.ambiguous:
             self.attempt_state = AttemptState.PAUSED_AMBIGUOUS_METADATA
             self.last_error = status.message
-            return
+            return []
 
         if status.complete:
+            if status.episode_id != self.current_attempt.episode_id:
+                self.metadata_match_reason = (
+                    "successful metadata belongs to a different attempt: "
+                    f"expected {self.current_attempt.episode_id!r}, "
+                    f"got {status.episode_id!r}"
+                )
+                if status.latest_attempt_index > self.current_attempt.attempt_index:
+                    self.attempt_state = AttemptState.PAUSED_AMBIGUOUS_METADATA
+                    self.last_error = self.metadata_match_reason
+                elif now_sec >= self._save_deadline_sec:
+                    self._pause_failed(self.metadata_match_reason)
+                return []
             if collector_mode == "FAILED":
                 self._pause_failed("collector entered FAILED while waiting for metadata save")
-                return
+                return []
             if collector_mode == "IDLE":
                 self.attempt_state = AttemptState.SAVED
                 self.last_error = ""
-                return
+                return []
             if now_sec >= self._save_deadline_sec:
                 self._pause_failed(
                     "metadata saved but collector did not return to IDLE before timeout"
                 )
-            return
+            return []
 
         if status.latest_attempt_index == self.current_attempt.attempt_index and status.latest_state in (
             "EMPTY",
             "TASK_MISMATCH",
         ):
             self._pause_failed(status.message)
-            return
+            return []
 
         if status.latest_attempt_index > self.current_attempt.attempt_index:
             self._pause_failed(
                 "metadata advanced beyond the current attempt; manual reconciliation required"
             )
-            return
+            return []
 
         if collector_mode == "FAILED":
-            self._pause_failed("collector entered FAILED while waiting for metadata save")
-            return
+            if collector_episode_id in ("", self.current_attempt.episode_id):
+                return self._begin_discard(
+                    "collector entered FAILED while waiting for metadata save",
+                    now_sec,
+                )
+            self._pause_failed(
+                "collector entered FAILED for a different episode while waiting for metadata save"
+            )
+            return []
 
         if now_sec >= self._save_deadline_sec:
-            self._pause_failed("save confirmation timed out without matching metadata")
+            return self._discard_owned_save_timeout(
+                "save confirmation timed out without matching metadata",
+                collector_mode,
+                collector_episode_id,
+                now_sec,
+            )
+        return []
+
+    def _discard_owned_save_timeout(
+        self,
+        message: str,
+        collector_mode: str,
+        collector_episode_id: str,
+        now_sec: float,
+    ) -> list[TriggerAction]:
+        if self.current_attempt is None:
+            self._pause_failed(message)
+            return []
+        if collector_mode in {"RECORDING", "NEED_TO_SAVE", "FAILED", "DISCARD"}:
+            if collector_episode_id in ("", self.current_attempt.episode_id):
+                return self._begin_discard(message, now_sec)
+            self._pause_failed(
+                message
+                + "; collector reports a different active episode, so it was not discarded"
+            )
+            return []
+        self._pause_failed(message)
+        return []
 
     def _select_next_attempt(self, snapshot: MetadataSnapshot) -> None:
         self.completed_count = snapshot.completed_count
@@ -366,6 +852,7 @@ class GestureTriggerStateMachine:
                 ),
             )
             self.attempt_state = AttemptState.WAITING_READY
+            self._command_ids.clear()
             self.last_error = ""
             self.metadata_match_reason = status.message
             return
@@ -378,6 +865,7 @@ class GestureTriggerStateMachine:
     def _pause_failed(self, message: str) -> None:
         self.attempt_state = AttemptState.PAUSED_FAILED
         self.last_error = message
+        self._pending_failure_message = ""
 
 
 def validate_reference_lengths(plan: GestureTriggerPlan) -> None:

@@ -105,6 +105,8 @@ class LeRobotV21WriterTest(unittest.TestCase):
 
             info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
             self.assertEqual(info["codebase_version"], "v2.1")
+            self.assertEqual(info["robo_collector_schema_version"], 1)
+            self.assertEqual(info["timeline_semantics"], "fixed_rate_v1")
             self.assertEqual(info["total_episodes"], 1)
             self.assertEqual(info["total_frames"], 2)
             self.assertEqual(info["features"]["action.joint_position"]["shape"], [29])
@@ -198,7 +200,7 @@ class LeRobotV21WriterTest(unittest.TestCase):
                 set(modality["observation"]["images"]), {"head", "ego_view"}
             )
 
-    def test_source_timestamps_preserve_real_frame_gaps_and_camera_offsets(self):
+    def test_fixed_fps_timeline_keeps_source_timestamps_for_audit(self):
         parquet_rows = {}
 
         def write_fake_parquet(path, rows):
@@ -225,13 +227,21 @@ class LeRobotV21WriterTest(unittest.TestCase):
             writer.save_episode()
 
             rows = parquet_rows["train-000000.parquet"]
-            self.assertAlmostEqual(rows[0]["timestamp"], 0.02)
+            self.assertAlmostEqual(rows[0]["timestamp"], 0.0)
             self.assertAlmostEqual(
                 rows[0]["observation.images.ego_view"]["timestamp"], 0.0
             )
-            self.assertAlmostEqual(rows[1]["timestamp"], 0.14)
+            self.assertAlmostEqual(rows[1]["timestamp"], 1 / 50)
             self.assertAlmostEqual(
-                rows[1]["observation.images.ego_view"]["timestamp"], 0.12
+                rows[1]["observation.images.ego_view"]["timestamp"], 1 / 50
+            )
+            self.assertEqual(rows[0]["source_timestamp.state"], 100.0)
+            self.assertEqual(rows[1]["source_timestamp.state"], 100.12)
+            self.assertEqual(
+                rows[0]["source_timestamp.camera.ego_view"], 99.98
+            )
+            self.assertEqual(
+                rows[1]["source_timestamp.camera.ego_view"], 100.10
             )
 
     def test_source_timestamps_must_be_finite_and_monotonic(self):
@@ -621,9 +631,46 @@ class LeRobotV21WriterTest(unittest.TestCase):
             ):
                 _writer(tmp)
 
+    def test_legacy_dataset_requires_explicit_timeline_migration(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("legacy episode")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            writer.save_episode()
+
+            info_path = writer.root / "meta/info.json"
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            for key in list(info["features"]):
+                if key.startswith("source_timestamp."):
+                    del info["features"][key]
+            info_path.write_text(json.dumps(info), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "predates the fixed-rate timeline"
+            ):
+                _writer(tmp)
+
+    def test_existing_dataset_rejects_partial_source_timestamp_schema(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("timestamp schema")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            writer.save_episode()
+
+            info_path = writer.root / "meta/info.json"
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            del info["features"]["source_timestamp.camera.ego_view"]
+            info_path.write_text(json.dumps(info), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "source timestamp features do not match"
+            ):
+                _writer(tmp)
+
     def test_default_writer_spools_rows_and_streams_parquet(self):
         calls = []
         original_stream_writer = lerobot_dataset.write_parquet_pyarrow_stream
+        original_row_count_validator = lerobot_dataset._validate_parquet_row_count
 
         def fake_stream_writer(path, row_spool_path, *, batch_size):
             rows = [
@@ -636,6 +683,7 @@ class LeRobotV21WriterTest(unittest.TestCase):
             path.write_text(json.dumps(rows), encoding="utf-8")
 
         lerobot_dataset.write_parquet_pyarrow_stream = fake_stream_writer
+        lerobot_dataset._validate_parquet_row_count = lambda path, count: None
         try:
             with TemporaryDirectory() as tmp:
                 writer = LeRobotV21Writer(
@@ -663,6 +711,278 @@ class LeRobotV21WriterTest(unittest.TestCase):
                 self.assertFalse((writer.root / ".inprogress").exists())
         finally:
             lerobot_dataset.write_parquet_pyarrow_stream = original_stream_writer
+            lerobot_dataset._validate_parquet_row_count = original_row_count_validator
+
+    def test_default_parquet_schema_matches_declared_feature_dtypes(self):
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is not installed")
+
+        with TemporaryDirectory() as tmp:
+            writer = LeRobotV21Writer(
+                tmp,
+                dataset_name="dataset",
+                fps=50,
+                video_sink_factory=FakeVideoSink,
+            )
+            writer.start_episode("typed")
+            writer.add_frame(
+                replace(_robot_frame(), state_timestamp_sec=10.0),
+                FakeFrame(),
+                camera_timestamps_sec={"ego_view": 9.99},
+            )
+            result = writer.save_episode()
+
+            table = pq.read_table(result.data_path)
+            schema = table.schema
+            self.assertEqual(schema.field("timestamp").type, pa.float32())
+            self.assertEqual(
+                schema.field("source_timestamp.state").type, pa.float64()
+            )
+            self.assertEqual(
+                schema.field("source_timestamp.camera.ego_view").type,
+                pa.float64(),
+            )
+            robot_type = schema.field("action.joint_position").type
+            self.assertTrue(pa.types.is_list(robot_type))
+            self.assertEqual(robot_type.value_type, pa.float32())
+            video_type = schema.field("observation.images.ego_view").type
+            self.assertEqual(video_type.field("timestamp").type, pa.float32())
+
+    def test_episode_metadata_records_artifact_integrity(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("integrity")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            writer.save_episode()
+
+            episode = json.loads(
+                (writer.root / "meta/episodes.jsonl")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            integrity = episode["integrity"]
+            self.assertEqual(integrity["algorithm"], "sha256")
+            self.assertEqual(integrity["data"]["rows"], 1)
+            self.assertEqual(
+                integrity["videos"]["observation.images.ego_view"]["frames"],
+                1,
+            )
+            self.assertEqual(len(integrity["data"]["sha256"]), 64)
+
+    def test_committed_artifacts_are_validated_before_append(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("integrity")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            result = writer.save_episode()
+            result.video_path.unlink()
+
+            restarted = _writer(tmp)
+            with self.assertRaisesRegex(RuntimeError, "committed video.*missing"):
+                restarted.start_episode("must not append")
+
+    def test_same_size_artifact_corruption_is_rejected_before_append(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("integrity")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            result = writer.save_episode()
+            corrupted = bytearray(result.video_path.read_bytes())
+            corrupted[0] ^= 0x01
+            result.video_path.write_bytes(corrupted)
+
+            restarted = _writer(tmp)
+            with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
+                restarted.start_episode("must not append")
+
+    def test_incomplete_metadata_bundle_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("metadata")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            writer.save_episode()
+            (writer.root / "meta/info.json").unlink()
+
+            with self.assertRaisesRegex(RuntimeError, "metadata is incomplete"):
+                _writer(tmp)
+
+    def test_committed_manifest_rolls_forward_missing_final_artifact(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("roll forward")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            original_cleanup = writer._cleanup_active_staging
+
+            def leave_manifest(active, *, remove_committed):
+                raise OSError("simulated cleanup interruption")
+
+            writer._cleanup_active_staging = leave_manifest
+            result = writer.save_episode()
+            self.assertTrue(result.saved)
+            manifest_path = next((writer.root / ".inprogress").glob("*/manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            staged_data = writer._root_path(manifest["staged_data_path"])
+            staged_data.parent.mkdir(parents=True, exist_ok=True)
+            result.data_path.replace(staged_data)
+            writer._cleanup_active_staging = original_cleanup
+
+            restarted = _writer(tmp)
+            self.assertEqual(restarted.start_episode("next"), 1)
+            self.assertTrue(result.data_path.exists())
+            self.assertFalse((writer.root / ".inprogress").exists())
+            restarted.discard_episode()
+
+    def test_post_commit_staging_cleanup_failure_still_reports_saved(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("cleanup")
+            writer.add_frame(_robot_frame(), FakeFrame())
+
+            def fail_cleanup(active, *, remove_committed):
+                raise OSError("simulated staging cleanup failure")
+
+            writer._cleanup_active_staging = fail_cleanup
+            result = writer.save_episode()
+
+            self.assertTrue(result.saved)
+            self.assertTrue(result.data_path.exists())
+            restarted = _writer(tmp)
+            self.assertEqual(restarted.start_episode("next"), 1)
+            self.assertFalse((writer.root / ".inprogress").exists())
+            restarted.discard_episode()
+
+    def test_collision_discard_preserves_preexisting_final_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("collision")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            data_path = writer.root / "data/train-000000.parquet"
+            video_path = (
+                writer.root
+                / "videos/observation.images.ego_view/episode_000000.mp4"
+            )
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            data_path.write_bytes(b"existing-data")
+            video_path.write_bytes(b"existing-video")
+
+            with self.assertRaisesRegex(RuntimeError, "refusing to overwrite"):
+                writer.save_episode()
+            writer.discard_episode()
+
+            self.assertEqual(data_path.read_bytes(), b"existing-data")
+            self.assertEqual(video_path.read_bytes(), b"existing-video")
+
+    def test_post_rename_failure_discard_removes_owned_final_artifact(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("rename interruption")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            original_replace = lerobot_dataset._replace_path_durable
+            calls = 0
+
+            def replace_then_fail(source, target):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    lerobot_dataset._replace_path(source, target)
+                    raise OSError("directory fsync failed after rename")
+                original_replace(source, target)
+
+            lerobot_dataset._replace_path_durable = replace_then_fail
+            try:
+                with self.assertRaisesRegex(OSError, "after rename"):
+                    writer.save_episode()
+            finally:
+                lerobot_dataset._replace_path_durable = original_replace
+
+            final_data = writer.root / "data/train-000000.parquet"
+            self.assertTrue(final_data.exists())
+            writer.discard_episode()
+            self.assertFalse(final_data.exists())
+            self.assertFalse((writer.root / ".inprogress").exists())
+
+            restarted = _writer(tmp)
+            self.assertEqual(restarted.start_episode("retry"), 0)
+            restarted.discard_episode()
+
+    def test_integrity_cache_only_hashes_new_episode_on_next_start(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("first")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            writer.save_episode()
+            writer.start_episode("second")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            writer.save_episode()
+
+            original_integrity = lerobot_dataset._file_integrity
+            hashed_paths = []
+
+            def count_integrity(path):
+                hashed_paths.append(path)
+                return original_integrity(path)
+
+            lerobot_dataset._file_integrity = count_integrity
+            try:
+                self.assertEqual(writer.start_episode("third"), 2)
+            finally:
+                lerobot_dataset._file_integrity = original_integrity
+
+            self.assertEqual(len(hashed_paths), 2)
+            writer.discard_episode()
+
+    def test_orphan_recovery_preserves_unowned_collision_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            abandoned = _writer(tmp)
+            abandoned.start_episode("collision")
+            abandoned.add_frame(_robot_frame(), FakeFrame())
+            data_path = abandoned.root / "data/train-000000.parquet"
+            video_path = (
+                abandoned.root
+                / "videos/observation.images.ego_view/episode_000000.mp4"
+            )
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            data_path.write_bytes(b"existing-data")
+            video_path.write_bytes(b"existing-video")
+
+            with self.assertRaisesRegex(RuntimeError, "refusing to overwrite"):
+                abandoned.save_episode()
+            abandoned._release_dataset_lock()
+
+            restarted = _writer(tmp)
+            self.assertEqual(restarted.start_episode("recovered"), 0)
+            self.assertEqual(data_path.read_bytes(), b"existing-data")
+            self.assertEqual(video_path.read_bytes(), b"existing-video")
+            restarted.discard_episode()
+
+    def test_discard_cleanup_failure_retains_active_episode_for_retry(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("retry discard")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            original_cleanup = writer._cleanup_active_staging
+            calls = 0
+
+            def fail_once(active, *, remove_committed):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError("temporary unlink failure")
+                return original_cleanup(active, remove_committed=remove_committed)
+
+            writer._cleanup_active_staging = fail_once
+            with self.assertRaisesRegex(OSError, "temporary unlink failure"):
+                writer.discard_episode()
+            self.assertIsNotNone(writer.active_episode_index)
+
+            writer.discard_episode()
+            self.assertIsNone(writer.active_episode_index)
+            self.assertFalse((writer.root / ".inprogress").exists())
 
     def test_restart_removes_uncommitted_episode_artifacts(self):
         with TemporaryDirectory() as tmp:
@@ -677,10 +997,38 @@ class LeRobotV21WriterTest(unittest.TestCase):
                 (abandoned_writer.root / ".inprogress").exists()
             )
 
+            abandoned_writer._release_dataset_lock()
             recovered_writer = _writer(tmp)
 
-            self.assertFalse((recovered_writer.root / ".inprogress").exists())
             self.assertEqual(recovered_writer.start_episode("recovered"), 0)
+            self.assertFalse((recovered_writer.root / ".inprogress").exists())
+            recovered_writer.discard_episode()
+
+    def test_active_episode_excludes_concurrent_writer_and_reload_prevents_collision(self):
+        with TemporaryDirectory() as tmp:
+            first = _writer(tmp)
+            second = _writer(tmp)
+            self.assertEqual(first.start_episode("first"), 0)
+            first.add_frame(_robot_frame(), FakeFrame())
+
+            with self.assertRaisesRegex(RuntimeError, "locked by another active writer"):
+                second.start_episode("second")
+
+            first.save_episode()
+            self.assertEqual(second.start_episode("second"), 1)
+            second.add_frame(_robot_frame(), FakeFrame())
+            second.save_episode()
+
+            episodes = [
+                json.loads(line)
+                for line in (second.root / "meta/episodes.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(
+                [episode["episode_index"] for episode in episodes], [0, 1]
+            )
 
     def test_dataset_and_camera_paths_cannot_escape_root(self):
         with TemporaryDirectory() as tmp:
@@ -830,6 +1178,73 @@ class LeRobotV21WriterTest(unittest.TestCase):
                     / "videos/observation.images.ego_view/episode_000000.mp4"
                 ).exists()
             )
+
+    def test_restart_recovers_interrupted_metadata_transaction(self):
+        with TemporaryDirectory() as tmp:
+            abandoned_writer = _writer(tmp)
+            abandoned_writer.start_episode("interrupted metadata")
+            abandoned_writer.add_frame(_robot_frame(), FakeFrame())
+            original_replace_path = lerobot_dataset._replace_path
+
+            def interrupt_on_info_replace(source, target):
+                if target.name == "info.json":
+                    raise KeyboardInterrupt("simulated power loss")
+                original_replace_path(source, target)
+
+            lerobot_dataset._replace_path = interrupt_on_info_replace
+            try:
+                with self.assertRaisesRegex(KeyboardInterrupt, "power loss"):
+                    abandoned_writer.save_episode()
+            finally:
+                lerobot_dataset._replace_path = original_replace_path
+                abandoned_writer._release_dataset_lock()
+
+            meta_dir = abandoned_writer.root / "meta"
+            self.assertTrue(
+                (meta_dir / lerobot_dataset.METADATA_TRANSACTION_FILENAME).exists()
+            )
+
+            recovered_writer = _writer(tmp)
+            self.assertEqual(recovered_writer.start_episode("recovered"), 0)
+            self.assertFalse(
+                (meta_dir / lerobot_dataset.METADATA_TRANSACTION_FILENAME).exists()
+            )
+            self.assertEqual(list(meta_dir.glob(".*.tmp")), [])
+            self.assertEqual(list(meta_dir.glob(".*.bak")), [])
+            recovered_writer.discard_episode()
+
+    def test_post_commit_metadata_cleanup_failure_rolls_forward(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("committed metadata")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            original_cleanup = lerobot_dataset._cleanup_transaction_files
+
+            def fail_cleanup(parent_dir, entries):
+                raise OSError("simulated backup cleanup failure")
+
+            lerobot_dataset._cleanup_transaction_files = fail_cleanup
+            try:
+                result = writer.save_episode()
+            finally:
+                lerobot_dataset._cleanup_transaction_files = original_cleanup
+
+            self.assertTrue(result.saved)
+            journal = (
+                writer.root
+                / "meta"
+                / lerobot_dataset.METADATA_TRANSACTION_FILENAME
+            )
+            self.assertTrue(journal.exists())
+            self.assertEqual(
+                json.loads(journal.read_text(encoding="utf-8"))["phase"],
+                "committed",
+            )
+
+            restarted = _writer(tmp)
+            self.assertEqual(restarted.start_episode("next"), 1)
+            self.assertFalse(journal.exists())
+            restarted.discard_episode()
 
     def test_video_write_failure_marks_episode_failed_until_discard(self):
         def sink_factory(path, fps, frame_size):

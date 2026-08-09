@@ -52,7 +52,9 @@ class ConversionResult:
 @dataclass(frozen=True)
 class _EpisodeConversionPlan:
     episode_index: int
-    converted_rows: list[dict[str, Any]]
+    global_start_index: int
+    source_parquet_path: Path
+    frame_count: int
     dest_data_rel_path: Path
     dest_video_rel_paths: dict[str, Path]
     source_video_paths: dict[str, Path]
@@ -123,7 +125,7 @@ def convert_dataset(
             fps=fps,
         )
         episode_plans.append(episode_plan)
-        total_frames += len(episode_plan.converted_rows)
+        total_frames += episode_plan.frame_count
 
     tasks_rows = [
         {"task_index": task_index, "task": task}
@@ -151,6 +153,9 @@ def convert_dataset(
             tasks_rows=tasks_rows,
             info=info,
             modality=modality,
+            task_lookup=task_lookup,
+            action_source=action_source,
+            camera_keys=camera_keys,
         )
         staging_output.replace(output_dataset)
     except Exception:
@@ -230,47 +235,56 @@ def _preflight_episode(
 ) -> tuple[_EpisodeConversionPlan, int]:
     episode_index = int(source_episode["episode_index"])
     parquet_path = _source_parquet_path(source_dataset, source_episode, episode_index)
-    rows = _read_parquet_rows(parquet_path)
-    if not rows:
+    frame_count = _parquet_row_count(parquet_path)
+    if frame_count <= 0:
         raise ConversionError(f"source parquet has no rows: {parquet_path}")
+    row_iterator = _iter_parquet_rows(parquet_path)
+    first_row = next(row_iterator)
 
     dest_video_rel_paths, source_video_paths = _resolve_video_paths(
         source_dataset=source_dataset,
         source_episode=source_episode,
-        first_row=rows[0],
+        first_row=first_row,
         camera_keys=camera_keys,
         episode_index=episode_index,
     )
 
-    converted_rows: list[dict[str, Any]] = []
-    for frame_index, row in enumerate(rows):
+    task_indices: set[int] = set()
+    for frame_index, row in enumerate(
+        _prepend_row(first_row, row_iterator)
+    ):
         task_index, next_task_index = _task_index_from_row(
             row,
             task_lookup=task_lookup,
             next_task_index=next_task_index,
         )
-        converted_rows.append(
-            _convert_row(
-                row,
-                frame_index=frame_index,
-                global_index=total_frames + frame_index,
-                episode_index=episode_index,
-                action_source=action_source,
-                task_index=task_index,
-                camera_keys=camera_keys,
-                dest_video_rel_paths=dest_video_rel_paths,
-                episode_length=len(rows),
-            )
+        task_indices.add(task_index)
+        _convert_row(
+            row,
+            frame_index=frame_index,
+            global_index=total_frames + frame_index,
+            episode_index=episode_index,
+            action_source=action_source,
+            task_index=task_index,
+            camera_keys=camera_keys,
+            dest_video_rel_paths=dest_video_rel_paths,
+            episode_length=frame_count,
+        )
+    if frame_index + 1 != frame_count:
+        raise ConversionError(
+            f"source parquet row count changed while reading: {parquet_path}"
         )
 
     task_strings = [
         _task_string_from_index(task_lookup, int(task_index))
-        for task_index in sorted({int(row["task_index"]) for row in converted_rows})
+        for task_index in sorted(task_indices)
     ]
     return (
         _EpisodeConversionPlan(
             episode_index=episode_index,
-            converted_rows=converted_rows,
+            global_start_index=total_frames,
+            source_parquet_path=parquet_path,
+            frame_count=frame_count,
             dest_data_rel_path=Path(f"data/chunk-000/episode_{episode_index:06d}.parquet"),
             dest_video_rel_paths=dest_video_rel_paths,
             source_video_paths=source_video_paths,
@@ -288,6 +302,9 @@ def _materialize_dataset(
     tasks_rows: list[dict[str, Any]],
     info: dict[str, Any],
     modality: dict[str, Any],
+    task_lookup: dict[str, int],
+    action_source: str,
+    camera_keys: list[str],
 ) -> None:
     meta_dir = staging_output / "meta"
     meta_dir.mkdir(parents=True, exist_ok=False)
@@ -307,13 +324,21 @@ def _materialize_dataset(
             str(episode_plan.dest_data_rel_path),
             label=f"dest parquet path for episode {episode_plan.episode_index}",
         )
-        write_parquet(dest_data_path, episode_plan.converted_rows)
+        write_parquet_stream(
+            dest_data_path,
+            _converted_rows_for_plan(
+                episode_plan,
+                action_source=action_source,
+                camera_keys=camera_keys,
+                task_lookup=task_lookup,
+            ),
+        )
 
     episodes_rows = [
         {
             "episode_index": episode_plan.episode_index,
             "tasks": episode_plan.task_strings,
-            "length": len(episode_plan.converted_rows),
+            "length": episode_plan.frame_count,
             "fps": episode_plan.fps,
             "data_path": str(episode_plan.dest_data_rel_path),
             "video_paths": {
@@ -543,6 +568,60 @@ def _source_parquet_path(
     return parquet_path
 
 
+def _converted_rows_for_plan(
+    episode_plan: _EpisodeConversionPlan,
+    *,
+    action_source: str,
+    camera_keys: list[str],
+    task_lookup: dict[str, int],
+):
+    row_count = 0
+    for frame_index, row in enumerate(
+        _iter_parquet_rows(episode_plan.source_parquet_path)
+    ):
+        task_index = _known_task_index_from_row(row, task_lookup)
+        yield _convert_row(
+            row,
+            frame_index=frame_index,
+            global_index=episode_plan.global_start_index + frame_index,
+            episode_index=episode_plan.episode_index,
+            action_source=action_source,
+            task_index=task_index,
+            camera_keys=camera_keys,
+            dest_video_rel_paths=episode_plan.dest_video_rel_paths,
+            episode_length=episode_plan.frame_count,
+        )
+        row_count += 1
+    if row_count != episode_plan.frame_count:
+        raise ConversionError(
+            "source parquet row count changed between preflight and conversion: "
+            f"{episode_plan.source_parquet_path}"
+        )
+
+
+def _known_task_index_from_row(
+    row: dict[str, Any], task_lookup: dict[str, int]
+) -> int:
+    task_value = row.get("annotation.human.action.task_description")
+    if isinstance(task_value, int):
+        task_index = int(task_value)
+        if task_index not in task_lookup.values():
+            raise ConversionError(
+                f"task_index changed after preflight: {task_index}"
+            )
+        return task_index
+    if isinstance(task_value, bytes):
+        task_value = task_value.decode("utf-8")
+    if not isinstance(task_value, str) or not task_value.strip():
+        raise ConversionError(
+            "annotation.human.action.task_description must be a non-empty string or int"
+        )
+    task = task_value.strip()
+    if task not in task_lookup:
+        raise ConversionError(f"task changed after preflight: {task!r}")
+    return task_lookup[task]
+
+
 def _camera_keys_from_info(source_info: dict[str, Any]) -> list[str]:
     features = source_info.get("features")
     if not isinstance(features, dict):
@@ -558,7 +637,7 @@ def _camera_keys_from_info(source_info: dict[str, Any]) -> list[str]:
     return camera_keys
 
 
-def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
+def _parquet_row_count(path: Path) -> int:
     try:
         import pyarrow.parquet as pq
     except ImportError as exc:
@@ -566,10 +645,32 @@ def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
             "pyarrow is required to convert datasets; run scripts/setup_data_collection_env.sh first"
         ) from exc
 
-    return pq.read_table(path).to_pylist()
+    return int(pq.ParquetFile(path).metadata.num_rows)
+
+
+def _iter_parquet_rows(path: Path, *, batch_size: int = 256):
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "pyarrow is required to convert datasets; run scripts/setup_data_collection_env.sh first"
+        ) from exc
+
+    parquet_file = pq.ParquetFile(path)
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        yield from batch.to_pylist()
+
+
+def _prepend_row(first_row: dict[str, Any], rows):
+    yield first_row
+    yield from rows
 
 
 def write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
+    write_parquet_stream(path, iter(rows))
+
+
+def write_parquet_stream(path: Path, rows, *, batch_size: int = 256) -> None:
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -578,12 +679,38 @@ def write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
             "pyarrow is required to convert datasets; run scripts/setup_data_collection_env.sh first"
         ) from exc
 
-    if not rows:
-        raise ConversionError("cannot write empty parquet row set")
-
+    row_iterator = iter(rows)
+    try:
+        first_row = next(row_iterator)
+    except StopIteration as exc:
+        raise ConversionError("cannot write empty parquet row set") from exc
+    camera_keys = sorted(
+        key for key in first_row if key.startswith("observation.images.")
+    )
+    schema = _gr00t_arrow_schema(pa, camera_keys)
     path.parent.mkdir(parents=True, exist_ok=True)
-    first_row = rows[0]
-    camera_keys = sorted(key for key in first_row if key.startswith("observation.images."))
+    parquet_writer = pq.ParquetWriter(path, schema, compression="snappy")
+    batch = [first_row]
+    try:
+        for row in row_iterator:
+            batch.append(row)
+            if len(batch) < batch_size:
+                continue
+            parquet_writer.write_table(
+                pa.Table.from_pylist(batch, schema=schema),
+                row_group_size=len(batch),
+            )
+            batch.clear()
+        if batch:
+            parquet_writer.write_table(
+                pa.Table.from_pylist(batch, schema=schema),
+                row_group_size=len(batch),
+            )
+    finally:
+        parquet_writer.close()
+
+
+def _gr00t_arrow_schema(pa: Any, camera_keys: list[str]):
     schema_fields = [
         pa.field("observation.state", pa.list_(pa.float32())),
         pa.field("action", pa.list_(pa.float32())),
@@ -603,35 +730,7 @@ def write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
         ]
     )
     schema_fields.extend(pa.field(camera_key, video_ref_type) for camera_key in camera_keys)
-    schema = pa.schema(schema_fields)
-
-    columns: dict[str, Any] = {
-        "observation.state": pa.array(
-            [row["observation.state"] for row in rows],
-            type=pa.list_(pa.float32()),
-        ),
-        "action": pa.array(
-            [row["action"] for row in rows],
-            type=pa.list_(pa.float32()),
-        ),
-        "timestamp": pa.array([row["timestamp"] for row in rows], type=pa.float32()),
-        "frame_index": pa.array([row["frame_index"] for row in rows], type=pa.int64()),
-        "episode_index": pa.array([row["episode_index"] for row in rows], type=pa.int64()),
-        "index": pa.array([row["index"] for row in rows], type=pa.int64()),
-        "task_index": pa.array([row["task_index"] for row in rows], type=pa.int64()),
-        "annotation.human.action.task_description": pa.array(
-            [row["annotation.human.action.task_description"] for row in rows],
-            type=pa.int64(),
-        ),
-        "next.reward": pa.array([row["next.reward"] for row in rows], type=pa.float32()),
-        "next.done": pa.array([row["next.done"] for row in rows], type=pa.bool_()),
-    }
-    for camera_key in camera_keys:
-        columns[camera_key] = pa.array(
-            [row[camera_key] for row in rows],
-            type=video_ref_type,
-        )
-    pq.write_table(pa.table(columns, schema=schema), path, compression="snappy")
+    return pa.schema(schema_fields)
 
 
 def _load_json(path: Path) -> dict[str, Any]:

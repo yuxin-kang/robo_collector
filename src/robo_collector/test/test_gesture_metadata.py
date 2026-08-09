@@ -1,7 +1,9 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from robo_collector import gesture_metadata
 from robo_collector.gesture_episode_id import build_gesture_episode_id
 from robo_collector.gesture_metadata import (
     ProgressCurrent,
@@ -110,6 +112,34 @@ class GestureMetadataTest(unittest.TestCase):
             snapshot = scan_plan_metadata(root, plan)
             self.assertTrue(snapshot.status_for(plan.planned_trials[0]).ambiguous)
 
+    def test_multiple_successful_attempts_are_ambiguous(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_episodes(
+                root,
+                [
+                    {
+                        "episode_id": _episode_id(plan.plan_id, "shake_hand", 0, 1),
+                        "tasks": ["Shake hand with somebody"],
+                        "length": 5,
+                    },
+                    {
+                        "episode_id": _episode_id(plan.plan_id, "shake_hand", 0, 2),
+                        "tasks": ["Shake hand with somebody"],
+                        "length": 6,
+                    },
+                ],
+            )
+
+            status = scan_plan_metadata(root, plan).status_for(
+                plan.planned_trials[0]
+            )
+
+            self.assertTrue(status.ambiguous)
+            self.assertFalse(status.complete)
+            self.assertIn("multiple successful attempts", status.message)
+
     def test_restart_recovery_uses_metadata_not_progress_log(self):
         plan = gesture_plan_from_payload(_plan_payload(target_trials=3))
         with TemporaryDirectory() as tmp:
@@ -210,6 +240,29 @@ class GestureMetadataTest(unittest.TestCase):
             self.assertFalse(status.complete)
             self.assertEqual(status.latest_state, "INCOMPLETE_MEDIA")
 
+    def test_checksum_mismatch_does_not_mark_trial_success(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            row = {
+                "episode_id": _episode_id(plan.plan_id, "shake_hand", 0, 1),
+                "tasks": ["Shake hand with somebody"],
+                "length": 12,
+            }
+            _write_episodes(root, [row])
+            row["integrity"] = _integrity_for_row(root, row)
+            _write_episodes(root, [row], create_media=False)
+            video_path = root / next(iter(row["video_paths"].values()))
+            video_path.write_bytes(b"FAIL")
+
+            status = scan_plan_metadata(root, plan).status_for(
+                plan.planned_trials[0]
+            )
+
+            self.assertFalse(status.complete)
+            self.assertEqual(status.latest_state, "INCOMPLETE_MEDIA")
+            self.assertIn("checksum", status.message)
+
     def test_parse_error_is_reported(self):
         plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
         with TemporaryDirectory() as tmp:
@@ -221,6 +274,83 @@ class GestureMetadataTest(unittest.TestCase):
             snapshot = scan_plan_metadata(root, plan)
 
             self.assertIn("invalid JSONL", snapshot.parse_error)
+
+    def test_pending_metadata_transaction_is_never_classified_complete(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_episodes(
+                root,
+                [
+                    {
+                        "episode_id": _episode_id(plan.plan_id, "shake_hand", 0, 1),
+                        "tasks": ["Shake hand with somebody"],
+                        "length": 12,
+                    }
+                ],
+            )
+            transaction_path = root / "meta/.metadata-transaction.json"
+            transaction_path.write_text(
+                '{"version": 1, "phase": "prepared", "entries": []}',
+                encoding="utf-8",
+            )
+
+            snapshot = scan_plan_metadata(root, plan)
+
+            self.assertIn("pending recovery", snapshot.parse_error)
+            self.assertFalse(snapshot.status_for(plan.planned_trials[0]).complete)
+
+    def test_checksum_read_error_is_reported_as_incomplete_media(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            row = {
+                "episode_id": _episode_id(plan.plan_id, "shake_hand", 0, 1),
+                "tasks": ["Shake hand with somebody"],
+                "length": 12,
+            }
+            _write_episodes(root, [row])
+            row["integrity"] = _integrity_for_row(root, row)
+            _write_episodes(root, [row], create_media=False)
+
+            with patch.object(
+                gesture_metadata,
+                "_cached_file_sha256",
+                side_effect=PermissionError("denied"),
+            ):
+                status = scan_plan_metadata(root, plan).status_for(
+                    plan.planned_trials[0]
+                )
+
+            self.assertEqual(status.latest_state, "INCOMPLETE_MEDIA")
+            self.assertIn("cannot be read", status.message)
+
+    def test_checksum_cache_keeps_more_than_512_artifacts(self):
+        gesture_metadata._FILE_SHA256_CACHE.clear()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index in range(513):
+                path = root / f"artifact-{index}.bin"
+                path.write_bytes(f"value-{index}".encode())
+                stat = path.stat()
+                gesture_metadata._cached_file_sha256(
+                    str(path.resolve()),
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ino,
+                )
+                paths.append(path)
+
+            first = paths[0]
+            stat = first.stat()
+            with patch.object(Path, "open", side_effect=AssertionError("cache miss")):
+                gesture_metadata._cached_file_sha256(
+                    str(first.resolve()),
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ino,
+                )
 
 
 def _write_episodes(
@@ -256,6 +386,29 @@ def _write_episodes(
 def _write_nonempty(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"test")
+
+
+def _integrity_for_row(root: Path, row: dict) -> dict:
+    import hashlib
+
+    def record(relative_path: str, frames_or_rows: tuple[str, int]) -> dict:
+        path = root / relative_path
+        content = path.read_bytes()
+        count_key, count = frames_or_rows
+        return {
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            count_key: count,
+        }
+
+    return {
+        "algorithm": "sha256",
+        "data": record(row["data_path"], ("rows", row["length"])),
+        "videos": {
+            camera_key: record(path, ("frames", row["length"]))
+            for camera_key, path in row["video_paths"].items()
+        },
+    }
 
 
 def _json_line(row: dict) -> str:

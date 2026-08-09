@@ -2,6 +2,11 @@
 
 Minimal RealSense camera publisher/client for G1 data collection.
 
+The current transport is `robo_collector_camera.v3`. Upgrade and restart the
+remote camera server together with the collector; v2 packets are deliberately
+rejected because they do not carry the server session identifier required to
+detect sequence resets safely.
+
 This module is intentionally small:
 
 - Robot side: read one or more Intel RealSense RGB streams and publish a composed packet over ZMQ.
@@ -95,7 +100,8 @@ if packet is not None:
 
 ```python
 {
-    "schema": "robo_collector_camera.v2",
+    "schema": "robo_collector_camera.v3",
+    "session_id": "unique-server-process-id",
     "timestamps": {
         "head": 1770000000.0,
         "ego_view": 1770000000.0,

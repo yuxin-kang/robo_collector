@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import math
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +22,12 @@ CAMERA_KEY = "observation.images.ego_view"
 ALIGNED_TARGET_POS_DIM = 45
 PARQUET_ROW_GROUP_SIZE = 256
 IN_PROGRESS_DIR = ".inprogress"
+METADATA_TRANSACTION_FILENAME = ".metadata-transaction.json"
+METADATA_LOCK_FILENAME = ".metadata.lock"
+ROBO_COLLECTOR_SCHEMA_VERSION = 1
+TIMELINE_SEMANTICS = "fixed_rate_v1"
+SOURCE_STATE_TIMESTAMP_KEY = "source_timestamp.state"
+SOURCE_CAMERA_TIMESTAMP_PREFIX = "source_timestamp.camera."
 STATE_FIELD_SHAPES = {
     "joint_position": [DOF],
     "joint_velocity": [DOF],
@@ -100,10 +110,12 @@ class _ActiveEpisode:
     row_spool_handle: TextIO | None = None
     manifest_rel_path: Path | None = None
     storage_token: str = field(default_factory=lambda: uuid4().hex)
-    timestamp_origin_sec: float | None = None
-    last_timestamp_sec: float | None = None
-    last_camera_timestamps_sec: dict[str, float] = field(default_factory=dict)
+    last_state_source_timestamp_sec: float | None = None
+    last_camera_source_timestamps_sec: dict[str, float] = field(default_factory=dict)
     videos_closed: bool = False
+    artifacts_committed: bool = False
+    committed_artifact_rel_paths: set[Path] = field(default_factory=set)
+    artifact_integrity: dict[str, Any] = field(default_factory=dict)
     failed_reason: str | None = None
 
 
@@ -148,6 +160,7 @@ class LeRobotV21Writer:
         self._field_selection = field_selection or default_field_selection()
         self._uses_default_parquet_writer = parquet_writer is None
         self._parquet_writer = parquet_writer or write_parquet_pyarrow
+        self._uses_default_video_sink = video_sink_factory is None
         self._video_sink_factory = video_sink_factory or OpenCvVideoSink
         self._active: _ActiveEpisode | None = None
         self._tasks_by_text: dict[str, int] = {}
@@ -155,8 +168,12 @@ class LeRobotV21Writer:
         self._total_frames = 0
         self._image_shapes: dict[str, tuple[int, int, int]] = {}
         self._joint_names: list[str] = []
-        self._load_existing_metadata()
-        self._recover_orphaned_active_episodes()
+        self._validated_artifact_fingerprints: dict[
+            Path, tuple[int, int, int, str]
+        ] = {}
+        self._dataset_lock_fd: int | None = None
+        if not self._metadata_transaction_path().exists():
+            self._load_existing_metadata()
 
     @property
     def active_frame_count(self) -> int:
@@ -179,18 +196,30 @@ class LeRobotV21Writer:
         if not normalized_prompt:
             raise ValueError("task_prompt is required")
 
-        episode_index = self._next_episode_index()
-        task_is_new = normalized_prompt not in self._tasks_by_text
-        task_index = self._get_or_allocate_task_index(normalized_prompt)
-        self._active = _ActiveEpisode(
-            episode_index=episode_index,
-            episode_id=episode_id.strip(),
-            task_prompt=normalized_prompt,
-            task_index=task_index,
-            task_is_new=task_is_new,
-            global_start_index=self._total_frames,
-        )
-        return episode_index
+        self._acquire_dataset_lock()
+        try:
+            # Metadata may have changed since this writer was constructed. Reload it
+            # while holding the dataset lock before allocating indexes or recovering
+            # abandoned staging files.
+            _recover_files_transaction(self._metadata_transaction_path())
+            self._reload_existing_metadata()
+            self._recover_orphaned_active_episodes()
+            self._validate_committed_artifacts()
+            episode_index = self._next_episode_index()
+            task_is_new = normalized_prompt not in self._tasks_by_text
+            task_index = self._get_or_allocate_task_index(normalized_prompt)
+            self._active = _ActiveEpisode(
+                episode_index=episode_index,
+                episode_id=episode_id.strip(),
+                task_prompt=normalized_prompt,
+                task_index=task_index,
+                task_is_new=task_is_new,
+                global_start_index=self._total_frames,
+            )
+            return episode_index
+        except Exception:
+            self._release_dataset_lock()
+            raise
 
     def add_frame(
         self,
@@ -222,7 +251,12 @@ class LeRobotV21Writer:
         selected_robot_values = self._selected_robot_values(frame)
         self._validate_joint_names(active, frame.joint_names)
         frame_index = active.frame_count
-        timestamp, video_timestamps = self._episode_timestamps(
+        (
+            timestamp,
+            video_timestamps,
+            state_source_timestamp,
+            camera_source_timestamps,
+        ) = self._episode_timestamps(
             active,
             frame_index=frame_index,
             state_timestamp_sec=frame.state_timestamp_sec,
@@ -283,13 +317,17 @@ class LeRobotV21Writer:
                 "episode_index": active.episode_index,
                 "index": active.global_start_index + frame_index,
                 "task_index": active.task_index,
+                SOURCE_STATE_TIMESTAMP_KEY: state_source_timestamp,
             }
         )
-        for camera_key in self.camera_keys:
+        for camera_key, camera_stream in zip(self.camera_keys, self.camera_streams):
             row[camera_key] = {
                 "path": str(active.video_rel_paths[camera_key]),
                 "timestamp": video_timestamps[camera_key],
             }
+            row[_source_camera_timestamp_key(camera_stream)] = (
+                camera_source_timestamps[camera_key]
+            )
         self._append_spooled_row(active, row)
         active.frame_count += 1
 
@@ -378,8 +416,13 @@ class LeRobotV21Writer:
         frame_index: int,
         state_timestamp_sec: float | None,
         camera_timestamps_sec: dict[str, float | None] | None,
-    ) -> tuple[float, dict[str, float]]:
-        expected_timestamp = frame_index / self.fps
+    ) -> tuple[
+        float,
+        dict[str, float],
+        float | None,
+        dict[str, float | None],
+    ]:
+        dataset_timestamp = frame_index / self.fps
         state_source_timestamp = _optional_finite_timestamp(
             state_timestamp_sec, label="state_timestamp_sec"
         )
@@ -387,53 +430,34 @@ class LeRobotV21Writer:
             camera_timestamps_sec
         )
 
-        if active.timestamp_origin_sec is None:
-            source_timestamps = [
-                timestamp
-                for timestamp in [
-                    state_source_timestamp,
-                    *camera_source_timestamps.values(),
-                ]
-                if timestamp is not None
-            ]
-            if source_timestamps:
-                active.timestamp_origin_sec = (
-                    min(source_timestamps) - expected_timestamp
-                )
+        if state_source_timestamp is not None:
+            _validate_monotonic_timestamp(
+                state_source_timestamp,
+                active.last_state_source_timestamp_sec,
+                label="state timestamp",
+            )
 
-        if (
-            state_source_timestamp is not None
-            and active.timestamp_origin_sec is not None
-        ):
-            timestamp = state_source_timestamp - active.timestamp_origin_sec
-        else:
-            timestamp = expected_timestamp
-        _validate_monotonic_timestamp(
-            timestamp,
-            active.last_timestamp_sec,
-            label="state timestamp",
-        )
-
-        video_timestamps: dict[str, float] = {}
+        video_timestamps = {
+            camera_key: dataset_timestamp for camera_key in self.camera_keys
+        }
         for camera_key in self.camera_keys:
             source_timestamp = camera_source_timestamps[camera_key]
-            if (
-                source_timestamp is not None
-                and active.timestamp_origin_sec is not None
-            ):
-                video_timestamp = source_timestamp - active.timestamp_origin_sec
-            else:
-                video_timestamp = timestamp
-            _validate_monotonic_timestamp(
-                video_timestamp,
-                active.last_camera_timestamps_sec.get(camera_key),
-                label=f"{camera_key} timestamp",
-            )
-            video_timestamps[camera_key] = video_timestamp
+            if source_timestamp is not None:
+                _validate_monotonic_timestamp(
+                    source_timestamp,
+                    active.last_camera_source_timestamps_sec.get(camera_key),
+                    label=f"{camera_key} timestamp",
+                )
+                active.last_camera_source_timestamps_sec[camera_key] = source_timestamp
 
-        active.last_timestamp_sec = timestamp
-        active.last_camera_timestamps_sec.update(video_timestamps)
-        return timestamp, video_timestamps
+        if state_source_timestamp is not None:
+            active.last_state_source_timestamp_sec = state_source_timestamp
+        return (
+            dataset_timestamp,
+            video_timestamps,
+            state_source_timestamp,
+            camera_source_timestamps,
+        )
 
     def _normalize_camera_timestamps(
         self, camera_timestamps_sec: dict[str, float | None] | None
@@ -467,10 +491,12 @@ class LeRobotV21Writer:
     def _prepare_active_storage(self, active: _ActiveEpisode) -> None:
         work_rel_path = Path(IN_PROGRESS_DIR, active.storage_token)
         work_path = self._root_path(work_rel_path)
-        work_path.mkdir(parents=True, exist_ok=False)
+        _ensure_directory_durable(work_path, exist_ok=False)
         active.row_spool_rel_path = work_rel_path / "rows.jsonl"
         active.manifest_rel_path = work_rel_path / "manifest.json"
         manifest = {
+            "version": 1,
+            "phase": "recording",
             "episode_index": active.episode_index,
             "data_path": str(active.data_rel_path),
             "staged_data_path": str(active.staged_data_rel_path),
@@ -484,7 +510,7 @@ class LeRobotV21Writer:
             "row_spool_path": str(active.row_spool_rel_path),
         }
         manifest_path = self._root_path(active.manifest_rel_path)
-        manifest_path.write_text(_json_content(manifest), encoding="utf-8")
+        _write_text_atomic_durable(manifest_path, _json_content(manifest))
         active.row_spool_handle = self._root_path(
             active.row_spool_rel_path
         ).open("a", encoding="utf-8", buffering=1)
@@ -509,12 +535,35 @@ class LeRobotV21Writer:
         active.row_spool_handle = None
 
     def _commit_active_artifacts(self, active: _ActiveEpisode) -> None:
+        if active.artifacts_committed:
+            return
         assert active.staged_data_rel_path is not None
         assert active.data_rel_path is not None
         staged_data_path = self._root_path(active.staged_data_rel_path)
         data_path = self._root_path(active.data_rel_path)
-        data_path.parent.mkdir(parents=True, exist_ok=True)
-        _replace_path(staged_data_path, data_path)
+        targets = [
+            data_path,
+            *[
+                self._root_path(active.video_rel_paths[camera_key])
+                for camera_key in self.camera_keys
+            ],
+        ]
+        collisions = [str(path) for path in targets if path.exists()]
+        if collisions:
+            active.failed_reason = (
+                "refusing to overwrite existing episode artifact(s): "
+                + ", ".join(collisions)
+            )
+            raise RuntimeError(active.failed_reason)
+
+        self._update_active_manifest_phase(active, "committing")
+
+        _ensure_directory_durable(data_path.parent)
+        # From the durable "committing" phase onward these collision-checked
+        # final paths belong to this attempt, even if rename succeeds and the
+        # following directory fsync raises before control returns.
+        active.committed_artifact_rel_paths.add(active.data_rel_path)
+        _replace_path_durable(staged_data_path, data_path)
 
         for camera_key in self.camera_keys:
             staged_video_path = self._root_path(
@@ -522,12 +571,34 @@ class LeRobotV21Writer:
             )
             video_path = self._root_path(active.video_rel_paths[camera_key])
             if staged_video_path.exists():
-                video_path.parent.mkdir(parents=True, exist_ok=True)
-                _replace_path(staged_video_path, video_path)
-            elif not video_path.exists():
+                _ensure_directory_durable(video_path.parent)
+                active.committed_artifact_rel_paths.add(
+                    active.video_rel_paths[camera_key]
+                )
+                _replace_path_durable(staged_video_path, video_path)
+            else:
                 raise RuntimeError(
                     f"missing staged video for {camera_key}: {staged_video_path}"
                 )
+        self._update_active_manifest_phase(active, "artifacts_committed")
+        active.artifacts_committed = True
+
+    def _update_active_manifest_phase(
+        self, active: _ActiveEpisode, phase: str
+    ) -> None:
+        if active.manifest_rel_path is None:
+            raise RuntimeError("active episode has no recovery manifest")
+        manifest_path = self._root_path(active.manifest_rel_path)
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"cannot update episode recovery manifest: {manifest_path}"
+            ) from exc
+        if manifest.get("version") != 1:
+            raise RuntimeError(f"unsupported episode recovery manifest: {manifest_path}")
+        manifest["phase"] = phase
+        _write_text_atomic_durable(manifest_path, _json_content(manifest))
 
     def _cleanup_active_staging(
         self, active: _ActiveEpisode, *, remove_committed: bool
@@ -536,16 +607,17 @@ class LeRobotV21Writer:
         relative_paths = [
             active.row_spool_rel_path,
             active.staged_data_rel_path,
-            active.manifest_rel_path,
             *active.staged_video_rel_paths.values(),
         ]
         if remove_committed:
-            relative_paths.extend(
-                [active.data_rel_path, *active.video_rel_paths.values()]
-            )
+            relative_paths.extend(active.committed_artifact_rel_paths)
         for relative_path in relative_paths:
             if relative_path is not None:
-                self._root_path(relative_path).unlink(missing_ok=True)
+                _unlink_path_durable(self._root_path(relative_path))
+        # The manifest is the recovery authority. Remove it only after every
+        # staged/owned final artifact deletion is durable in its own directory.
+        if active.manifest_rel_path is not None:
+            _unlink_path_durable(self._root_path(active.manifest_rel_path))
         self._remove_empty_work_dir(active.storage_token)
 
     def _remove_empty_work_dir(self, storage_token: str) -> None:
@@ -567,6 +639,9 @@ class LeRobotV21Writer:
 
     def _root_path(self, relative_path: str | Path) -> Path:
         return _safe_path_below(self.root, relative_path)
+
+    def _metadata_transaction_path(self) -> Path:
+        return self.root / "meta" / METADATA_TRANSACTION_FILENAME
 
     def _normalize_frame_bundle(self, rgb_frame: Any) -> dict[str, Any]:
         if len(self.camera_keys) == 1 and not isinstance(rgb_frame, dict):
@@ -617,21 +692,50 @@ class LeRobotV21Writer:
         assert active.staged_data_rel_path is not None
         assert active.row_spool_rel_path is not None
         assert active.video_rel_paths
-        staged_data_path = self._root_path(active.staged_data_rel_path)
-        staged_data_path.parent.mkdir(parents=True, exist_ok=True)
-        row_spool_path = self._root_path(active.row_spool_rel_path)
-        if self._uses_default_parquet_writer:
-            write_parquet_pyarrow_stream(
-                staged_data_path,
-                row_spool_path,
-                batch_size=PARQUET_ROW_GROUP_SIZE,
-            )
-        else:
-            self._parquet_writer(
-                staged_data_path, _read_spooled_rows(row_spool_path)
-            )
-        self._commit_active_artifacts(active)
+        if not active.artifacts_committed:
+            staged_data_path = self._root_path(active.staged_data_rel_path)
+            staged_data_path.parent.mkdir(parents=True, exist_ok=True)
+            row_spool_path = self._root_path(active.row_spool_rel_path)
+            try:
+                if self._uses_default_parquet_writer:
+                    write_parquet_pyarrow_stream(
+                        staged_data_path,
+                        row_spool_path,
+                        batch_size=PARQUET_ROW_GROUP_SIZE,
+                    )
+                    _validate_parquet_row_count(
+                        staged_data_path, active.frame_count
+                    )
+                else:
+                    self._parquet_writer(
+                        staged_data_path, _read_spooled_rows(row_spool_path)
+                    )
+                _require_nonempty_file(staged_data_path, label="episode parquet")
+                for camera_key in self.camera_keys:
+                    staged_video_path = self._root_path(
+                        active.staged_video_rel_paths[camera_key]
+                    )
+                    _require_nonempty_file(
+                        staged_video_path,
+                        label=f"video for {camera_key}",
+                    )
+                    if self._uses_default_video_sink:
+                        _validate_video_frame_count(
+                            staged_video_path, active.frame_count
+                        )
+                _fsync_file(staged_data_path)
+                for camera_key in self.camera_keys:
+                    _fsync_file(
+                        self._root_path(active.staged_video_rel_paths[camera_key])
+                    )
+                self._commit_active_artifacts(active)
+            except Exception as exc:
+                if active.failed_reason is None:
+                    active.failed_reason = f"episode artifact validation failed: {exc}"
+                raise
         data_path = self._root_path(active.data_rel_path)
+        if not active.artifact_integrity:
+            active.artifact_integrity = self._artifact_integrity(active)
 
         episode_record = self._episode_record(active)
         pending_episodes = [*self._episodes, episode_record]
@@ -660,8 +764,16 @@ class LeRobotV21Writer:
                 for camera_key, video_rel_path in active.video_rel_paths.items()
             },
         )
-        self._cleanup_active_staging(active, remove_committed=False)
-        self._active = None
+        try:
+            self._cleanup_active_staging(active, remove_committed=False)
+        except OSError:
+            # Metadata and artifacts have crossed the durable commit point. Keep
+            # reporting success and leave any manifest/staging residue for the
+            # next locked startup to clean up safely.
+            pass
+        finally:
+            self._active = None
+            self._release_dataset_lock()
         return result
 
     def _episode_record(self, active: _ActiveEpisode) -> dict[str, Any]:
@@ -680,6 +792,7 @@ class LeRobotV21Writer:
             },
             "dataset_from_index": active.global_start_index,
             "dataset_to_index": active.global_start_index + active.frame_count,
+            "integrity": active.artifact_integrity,
         }
 
     def discard_episode(self) -> None:
@@ -689,20 +802,86 @@ class LeRobotV21Writer:
     def _discard_active(self) -> None:
         active = self._active
         if active is None:
+            self._release_dataset_lock()
             return
-        self._close_row_spool(active)
-        for video_sink in active.video_sinks.values():
-            try:
-                video_sink.discard()
-            except Exception:
-                pass
-        self._cleanup_active_staging(active, remove_committed=True)
-        if (
-            active.task_is_new
-            and self._tasks_by_text.get(active.task_prompt) == active.task_index
-        ):
-            del self._tasks_by_text[active.task_prompt]
-        self._active = None
+        discarded = False
+        try:
+            self._close_row_spool(active)
+            for video_sink in active.video_sinks.values():
+                try:
+                    video_sink.discard()
+                except Exception:
+                    pass
+            self._cleanup_active_staging(active, remove_committed=True)
+            if (
+                active.task_is_new
+                and self._tasks_by_text.get(active.task_prompt) == active.task_index
+            ):
+                del self._tasks_by_text[active.task_prompt]
+            self._active = None
+            discarded = True
+        finally:
+            if discarded:
+                self._release_dataset_lock()
+
+    def _artifact_integrity(self, active: _ActiveEpisode) -> dict[str, Any]:
+        assert active.data_rel_path is not None
+        return {
+            "algorithm": "sha256",
+            "data": {
+                **_file_integrity(self._root_path(active.data_rel_path)),
+                "rows": active.frame_count,
+            },
+            "videos": {
+                camera_key: {
+                    **_file_integrity(
+                        self._root_path(active.video_rel_paths[camera_key])
+                    ),
+                    "frames": active.frame_count,
+                }
+                for camera_key in self.camera_keys
+            },
+        }
+
+    def _acquire_dataset_lock(self) -> None:
+        if self._dataset_lock_fd is not None:
+            raise RuntimeError("dataset writer lock is already held")
+        digest = hashlib.sha256(str(self.root).encode("utf-8")).hexdigest()[:20]
+        lock_dir = self.root_output_dir / ".robo_collector_locks" / digest
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(lock_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(lock_fd)
+            raise RuntimeError(
+                f"dataset is locked by another active writer: {self.root}"
+            ) from exc
+        self._dataset_lock_fd = lock_fd
+
+    def _release_dataset_lock(self) -> None:
+        lock_fd = self._dataset_lock_fd
+        if lock_fd is None:
+            return
+        self._dataset_lock_fd = None
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    def __del__(self) -> None:
+        try:
+            self._release_dataset_lock()
+        except Exception:
+            pass
+
+    def _reload_existing_metadata(self) -> None:
+        self._tasks_by_text = {}
+        self._episodes = []
+        self._total_frames = 0
+        self._image_shapes = {}
+        self._joint_names = []
+        self._load_existing_metadata()
 
     def _require_active(self) -> _ActiveEpisode:
         if self._active is None:
@@ -722,15 +901,42 @@ class LeRobotV21Writer:
         return task_index
 
     def _load_existing_metadata(self) -> None:
-        tasks_path = self.root / "meta/tasks.jsonl"
+        meta_dir = self.root / "meta"
+        required_paths = {
+            "tasks": meta_dir / "tasks.jsonl",
+            "episodes": meta_dir / "episodes.jsonl",
+            "info": meta_dir / "info.json",
+            "modality": meta_dir / "modality.json",
+        }
+        existing_names = {
+            name for name, path in required_paths.items() if path.exists()
+        }
+        if existing_names and existing_names != set(required_paths):
+            missing_names = sorted(set(required_paths) - existing_names)
+            raise RuntimeError(
+                "existing dataset metadata is incomplete; missing "
+                + ", ".join(missing_names)
+            )
+        if not existing_names:
+            return
+
+        tasks_path = required_paths["tasks"]
+        task_indexes: set[int] = set()
         if tasks_path.exists():
             for line in tasks_path.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
                 row = json.loads(line)
-                self._tasks_by_text[str(row["task"])] = int(row["task_index"])
+                task = str(row["task"])
+                task_index = int(row["task_index"])
+                if task in self._tasks_by_text or task_index in task_indexes:
+                    raise ValueError("existing tasks metadata contains duplicates")
+                self._tasks_by_text[task] = task_index
+                task_indexes.add(task_index)
+        if task_indexes != set(range(len(task_indexes))):
+            raise ValueError("existing task indexes must be contiguous from zero")
 
-        episodes_path = self.root / "meta/episodes.jsonl"
+        episodes_path = required_paths["episodes"]
         if episodes_path.exists():
             for line in episodes_path.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
@@ -741,7 +947,7 @@ class LeRobotV21Writer:
                     self._total_frames, int(episode.get("dataset_to_index", 0))
                 )
 
-        info_path = self.root / "meta/info.json"
+        info_path = required_paths["info"]
         if info_path.exists():
             info = json.loads(info_path.read_text(encoding="utf-8"))
             if info.get("robot_type") != self.robot_type:
@@ -753,6 +959,19 @@ class LeRobotV21Writer:
                 raise ValueError(
                     "fps does not match existing dataset: "
                     f"expected {info.get('fps')!r}, got {self.fps!r}"
+                )
+            if (
+                info.get("robo_collector_schema_version")
+                != ROBO_COLLECTOR_SCHEMA_VERSION
+            ):
+                raise ValueError(
+                    "existing dataset has no compatible robo_collector schema "
+                    "marker; use a new dataset_name or migrate it explicitly"
+                )
+            if info.get("timeline_semantics") != TIMELINE_SEMANTICS:
+                raise ValueError(
+                    "existing dataset timeline semantics are incompatible; use a "
+                    "new dataset_name or migrate it explicitly"
                 )
             features = info.get("features", {})
             if not isinstance(features, dict):
@@ -772,6 +991,7 @@ class LeRobotV21Writer:
                     f"expected {sorted(existing_camera_keys)}, "
                     f"got {sorted(configured_camera_keys)}"
                 )
+            self._validate_existing_source_timestamp_features(features)
             for camera_key in self.camera_keys:
                 image_feature = features.get(camera_key, {})
                 shape = image_feature.get("shape")
@@ -795,6 +1015,67 @@ class LeRobotV21Writer:
                     int(shape[1]),
                     int(shape[2]),
                 )
+            self._validate_existing_metadata_consistency(info)
+
+        try:
+            modality = json.loads(
+                required_paths["modality"].read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("existing modality metadata is invalid") from exc
+        if not isinstance(modality, dict):
+            raise ValueError("existing modality metadata must be a mapping")
+
+    def _validate_existing_metadata_consistency(
+        self, info: dict[str, Any]
+    ) -> None:
+        sorted_episodes = sorted(
+            self._episodes, key=lambda item: int(item["episode_index"])
+        )
+        expected_indexes = list(range(len(sorted_episodes)))
+        actual_indexes = [int(item["episode_index"]) for item in sorted_episodes]
+        if actual_indexes != expected_indexes:
+            raise ValueError("existing episode indexes must be contiguous from zero")
+
+        expected_from_index = 0
+        task_indexes = set(self._tasks_by_text.values())
+        for episode in sorted_episodes:
+            episode_index = int(episode["episode_index"])
+            length = int(episode.get("length", 0))
+            from_index = int(episode.get("dataset_from_index", -1))
+            to_index = int(episode.get("dataset_to_index", -1))
+            if length <= 0:
+                raise ValueError(
+                    f"existing episode {episode_index} length must be positive"
+                )
+            if from_index != expected_from_index or to_index != from_index + length:
+                raise ValueError(
+                    f"existing episode {episode_index} has inconsistent frame range"
+                )
+            if int(episode.get("fps", -1)) != self.fps:
+                raise ValueError(
+                    f"existing episode {episode_index} fps does not match dataset"
+                )
+            if int(episode.get("task_index", -1)) not in task_indexes:
+                raise ValueError(
+                    f"existing episode {episode_index} references an unknown task"
+                )
+            expected_from_index = to_index
+
+        expected_counts = {
+            "total_episodes": len(sorted_episodes),
+            "total_frames": expected_from_index,
+            "total_tasks": len(self._tasks_by_text),
+            "total_videos": len(sorted_episodes) * len(self.camera_keys),
+        }
+        for key, expected in expected_counts.items():
+            if info.get(key) != expected:
+                raise ValueError(
+                    f"existing info.json {key} mismatch: expected {expected}, "
+                    f"got {info.get(key)!r}"
+                )
+        self._episodes = sorted_episodes
+        self._total_frames = expected_from_index
 
     def _validate_existing_robot_features(self, features: dict[str, Any]) -> None:
         existing_robot_keys = _robot_feature_keys(features)
@@ -844,6 +1125,40 @@ class LeRobotV21Writer:
         if canonical_names is not None:
             self._joint_names = canonical_names
 
+    def _validate_existing_source_timestamp_features(
+        self, features: dict[str, Any]
+    ) -> None:
+        expected_keys = {
+            SOURCE_STATE_TIMESTAMP_KEY,
+            *(
+                _source_camera_timestamp_key(camera_stream)
+                for camera_stream in self.camera_streams
+            ),
+        }
+        existing_keys = {
+            key for key in features if key.startswith("source_timestamp.")
+        }
+        if not existing_keys:
+            raise ValueError(
+                "existing dataset predates the fixed-rate timeline/source "
+                "timestamp schema; use a new dataset_name or migrate it explicitly"
+            )
+        if existing_keys != expected_keys:
+            raise ValueError(
+                "source timestamp features do not match existing dataset: "
+                f"expected {sorted(expected_keys)}, got {sorted(existing_keys)}"
+            )
+        for key in sorted(expected_keys):
+            feature = features.get(key)
+            if not isinstance(feature, dict) or feature.get("dtype") != "float64":
+                raise ValueError(
+                    f"existing source timestamp feature {key} dtype must be float64"
+                )
+            if feature.get("shape") != [1]:
+                raise ValueError(
+                    f"existing source timestamp feature {key} shape must be [1]"
+                )
+
     def _recover_orphaned_active_episodes(self) -> None:
         in_progress_path = self._root_path(Path(IN_PROGRESS_DIR))
         if not in_progress_path.exists():
@@ -855,36 +1170,169 @@ class LeRobotV21Writer:
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 episode_index = int(manifest["episode_index"])
-            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-                continue
-
-            relative_paths: list[str] = [
-                str(manifest.get("row_spool_path", "")),
-                str(manifest.get("staged_data_path", "")),
-                *[
-                    str(path)
-                    for path in manifest.get("staged_video_paths", {}).values()
-                ],
-            ]
-            if episode_index not in committed_episode_indexes:
-                relative_paths.extend(
-                    [
-                        str(manifest.get("data_path", "")),
-                        *[
-                            str(path)
-                            for path in manifest.get("video_paths", {}).values()
-                        ],
-                    ]
+                phase = manifest.get("phase", "recording")
+                if manifest.get("version", 1) != 1 or phase not in {
+                    "recording",
+                    "committing",
+                    "artifacts_committed",
+                }:
+                    raise ValueError("unsupported episode manifest phase")
+                artifact_pairs = _manifest_artifact_pairs(manifest)
+                row_spool_path = _required_manifest_path(
+                    manifest, "row_spool_path"
                 )
-            for relative_path in relative_paths:
-                if not relative_path:
-                    continue
-                try:
-                    self._root_path(relative_path).unlink(missing_ok=True)
-                except ValueError:
-                    continue
-            manifest_path.unlink(missing_ok=True)
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"cannot safely recover invalid episode manifest: {manifest_path}"
+                ) from exc
+
+            committed = episode_index in committed_episode_indexes
+            if committed:
+                if phase == "recording":
+                    raise RuntimeError(
+                        "committed episode has a pre-commit recovery manifest: "
+                        f"{manifest_path}"
+                    )
+                for staged_relative, final_relative in artifact_pairs:
+                    staged_path = self._root_path(staged_relative)
+                    final_path = self._root_path(final_relative)
+                    if final_path.exists():
+                        _unlink_path_durable(staged_path)
+                        continue
+                    if not staged_path.exists():
+                        raise RuntimeError(
+                            "committed episode artifact is missing from both final "
+                            f"and staging paths: {final_path}"
+                        )
+                    _ensure_directory_durable(final_path.parent)
+                    _replace_path_durable(staged_path, final_path)
+            else:
+                for staged_relative, final_relative in artifact_pairs:
+                    _unlink_path_durable(self._root_path(staged_relative))
+                    if phase in {"committing", "artifacts_committed"}:
+                        _unlink_path_durable(self._root_path(final_relative))
+
+            _unlink_path_durable(self._root_path(row_spool_path))
+            _unlink_path_durable(manifest_path)
             self._remove_empty_work_dir(manifest_path.parent.name)
+
+    def _validate_committed_artifacts(self) -> None:
+        for episode in self._episodes:
+            episode_index = int(episode["episode_index"])
+            episode_length = int(episode["length"])
+            integrity = episode.get("integrity")
+            if not isinstance(integrity, dict) or integrity.get("algorithm") != "sha256":
+                raise RuntimeError(
+                    f"episode {episode_index} is missing a supported integrity manifest"
+                )
+            data_integrity = integrity.get("data")
+            if not isinstance(data_integrity, dict):
+                raise RuntimeError(
+                    f"episode {episode_index} has invalid data integrity metadata"
+                )
+            if data_integrity.get("rows") != episode_length:
+                raise RuntimeError(
+                    f"episode {episode_index} parquet integrity row count mismatch"
+                )
+            self._validate_committed_artifact(
+                episode_index=episode_index,
+                relative_path=episode.get("data_path"),
+                integrity=data_integrity,
+                label="parquet",
+            )
+
+            video_paths = episode.get("video_paths")
+            video_integrity = integrity.get("videos")
+            if not isinstance(video_paths, dict) or not isinstance(video_integrity, dict):
+                raise RuntimeError(
+                    f"episode {episode_index} has invalid video artifact metadata"
+                )
+            if set(video_integrity) != set(self.camera_keys):
+                raise RuntimeError(
+                    f"episode {episode_index} video integrity does not match configured cameras"
+                )
+            if set(video_paths) != set(self.camera_keys):
+                raise RuntimeError(
+                    f"episode {episode_index} video paths do not match configured cameras"
+                )
+            for camera_key in self.camera_keys:
+                item_integrity = video_integrity.get(camera_key)
+                if not isinstance(item_integrity, dict):
+                    raise RuntimeError(
+                        f"episode {episode_index} is missing integrity for {camera_key}"
+                    )
+                if item_integrity.get("frames") != episode_length:
+                    raise RuntimeError(
+                        f"episode {episode_index} video integrity frame count mismatch "
+                        f"for {camera_key}"
+                    )
+                self._validate_committed_artifact(
+                    episode_index=episode_index,
+                    relative_path=video_paths[camera_key],
+                    integrity=item_integrity,
+                    label=f"video {camera_key}",
+                )
+
+    def _validate_committed_artifact(
+        self,
+        *,
+        episode_index: int,
+        relative_path: Any,
+        integrity: dict[str, Any],
+        label: str,
+    ) -> None:
+        if not isinstance(relative_path, str) or not relative_path:
+            raise RuntimeError(
+                f"episode {episode_index} has no path for committed {label}"
+            )
+        path = self._root_path(relative_path)
+        expected_sha256 = integrity.get("sha256")
+        if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+            raise RuntimeError(
+                f"episode {episode_index} has invalid SHA-256 metadata for {label}"
+            )
+        try:
+            int(expected_sha256, 16)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"episode {episode_index} has invalid SHA-256 metadata for {label}"
+            ) from exc
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"episode {episode_index} committed {label} is missing: {path}"
+            ) from exc
+        expected_size = integrity.get("size_bytes")
+        if (
+            not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size <= 0
+        ):
+            raise RuntimeError(
+                f"episode {episode_index} has invalid size metadata for {label}"
+            )
+        actual_size = stat.st_size
+        if actual_size != expected_size:
+            raise RuntimeError(
+                f"episode {episode_index} committed {label} size mismatch: "
+                f"expected {expected_size}, got {actual_size}"
+            )
+        fingerprint = (
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ino,
+            expected_sha256.lower(),
+        )
+        if self._validated_artifact_fingerprints.get(path) == fingerprint:
+            return
+        actual_integrity = _file_integrity(path)
+        actual_sha256 = actual_integrity["sha256"]
+        if actual_sha256 != expected_sha256.lower():
+            raise RuntimeError(
+                f"episode {episode_index} committed {label} SHA-256 mismatch"
+            )
+        self._validated_artifact_fingerprints[path] = fingerprint
 
     def _write_metadata(
         self,
@@ -895,7 +1343,7 @@ class LeRobotV21Writer:
         tasks_by_text: dict[str, int],
     ) -> None:
         meta_dir = self.root / "meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_directory_durable(meta_dir)
         metadata_files = {
             meta_dir / "tasks.jsonl": _jsonl_content(
                 [
@@ -929,6 +1377,8 @@ class LeRobotV21Writer:
         episode_count = len(episodes)
         return {
             "codebase_version": "v2.1",
+            "robo_collector_schema_version": ROBO_COLLECTOR_SCHEMA_VERSION,
+            "timeline_semantics": TIMELINE_SEMANTICS,
             "robot_type": self.robot_type,
             "total_episodes": episode_count,
             "total_frames": total_frames,
@@ -1012,10 +1462,26 @@ class LeRobotV21Writer:
             key: robot_feature_by_key[key]
             for key in self._field_selection.robot_parquet_keys
         }
+        source_timestamp_features = {
+            SOURCE_STATE_TIMESTAMP_KEY: {
+                "dtype": "float64",
+                "shape": [1],
+                "names": None,
+            },
+            **{
+                _source_camera_timestamp_key(camera_stream): {
+                    "dtype": "float64",
+                    "shape": [1],
+                    "names": None,
+                }
+                for camera_stream in self.camera_streams
+            },
+        }
 
         return {
             **video_features,
             **selected_robot_features,
+            **source_timestamp_features,
             "annotation.human.action.task_description": {
                 "dtype": "string",
                 "shape": [1],
@@ -1102,7 +1568,10 @@ def write_parquet_pyarrow(path: Path, rows: list[dict[str, Any]]) -> None:
             "scripts/setup_data_collection_env.sh first"
         ) from exc
 
-    table = pa.Table.from_pylist(rows)
+    if not rows:
+        raise ValueError("cannot write parquet from an empty row list")
+    schema = _arrow_schema_for_row(pa, rows[0])
+    table = pa.Table.from_pylist(rows, schema=schema)
     pq.write_table(table, path, compression="snappy")
 
 
@@ -1129,18 +1598,20 @@ def write_parquet_pyarrow_stream(
                 batch.append(json.loads(line))
                 if len(batch) < batch_size:
                     continue
+                if schema is None:
+                    schema = _arrow_schema_for_row(pa, batch[0])
                 table = pa.Table.from_pylist(batch, schema=schema)
                 if parquet_writer is None:
-                    schema = table.schema
                     parquet_writer = pq.ParquetWriter(
                         path, schema, compression="snappy"
                     )
                 parquet_writer.write_table(table, row_group_size=len(batch))
                 batch.clear()
             if batch:
+                if schema is None:
+                    schema = _arrow_schema_for_row(pa, batch[0])
                 table = pa.Table.from_pylist(batch, schema=schema)
                 if parquet_writer is None:
-                    schema = table.schema
                     parquet_writer = pq.ParquetWriter(
                         path, schema, compression="snappy"
                     )
@@ -1155,6 +1626,33 @@ def write_parquet_pyarrow_stream(
 def _read_spooled_rows(row_spool_path: Path) -> list[dict[str, Any]]:
     with row_spool_path.open("r", encoding="utf-8") as spool:
         return [json.loads(line) for line in spool if line.strip()]
+
+
+def _arrow_schema_for_row(pa: Any, row: dict[str, Any]) -> Any:
+    video_reference_type = pa.struct(
+        [
+            pa.field("path", pa.string()),
+            pa.field("timestamp", pa.float32()),
+        ]
+    )
+    fields = []
+    for key, value in row.items():
+        if key.startswith("action.") or key.startswith("observation.state."):
+            value_type = pa.list_(pa.float32())
+        elif key == "annotation.human.action.task_description":
+            value_type = pa.string()
+        elif key == "timestamp":
+            value_type = pa.float32()
+        elif key.startswith("source_timestamp."):
+            value_type = pa.float64()
+        elif key in {"frame_index", "episode_index", "index", "task_index"}:
+            value_type = pa.int64()
+        elif isinstance(value, dict) and set(value) == {"path", "timestamp"}:
+            value_type = video_reference_type
+        else:
+            raise ValueError(f"unsupported parquet field {key!r}")
+        fields.append(pa.field(key, value_type))
+    return pa.schema(fields)
 
 
 def _validate_robot_frame(frame: RobotFrame) -> None:
@@ -1264,6 +1762,10 @@ def _camera_stream_from_key(camera_key: str) -> str:
     return camera_key.rsplit(".", 1)[-1]
 
 
+def _source_camera_timestamp_key(camera_stream: str) -> str:
+    return SOURCE_CAMERA_TIMESTAMP_PREFIX + camera_stream
+
+
 def _normalize_camera_keys(camera_keys: list[str] | tuple[str, ...]) -> list[str]:
     normalized = [str(camera_key).strip() for camera_key in camera_keys]
     normalized = [camera_key for camera_key in normalized if camera_key]
@@ -1365,41 +1867,349 @@ def _robot_feature_keys(features: dict[str, Any]) -> set[str]:
     }
 
 
+def _require_nonempty_file(path: Path, *, label: str) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"{label} is missing: {path}") from exc
+    if size <= 0:
+        raise RuntimeError(f"{label} is empty: {path}")
+
+
+def _validate_parquet_row_count(path: Path, expected_rows: int) -> None:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required to validate episode parquet") from exc
+    actual_rows = int(pq.ParquetFile(path).metadata.num_rows)
+    if actual_rows != expected_rows:
+        raise RuntimeError(
+            "parquet row count mismatch: "
+            f"expected {expected_rows}, got {actual_rows}"
+        )
+
+
+def _validate_video_frame_count(path: Path, expected_frames: int) -> None:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("opencv-python is required to validate episode video") from exc
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            raise RuntimeError(f"cannot open encoded episode video: {path}")
+        actual_frames = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    finally:
+        capture.release()
+    if actual_frames != expected_frames:
+        raise RuntimeError(
+            "video frame count mismatch for "
+            f"{path}: expected {expected_frames}, got {actual_frames}"
+        )
+
+
+def _file_integrity(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with path.open("rb") as artifact:
+        while True:
+            chunk = artifact.read(1024 * 1024)
+            if not chunk:
+                break
+            size_bytes += len(chunk)
+            digest.update(chunk)
+    if size_bytes <= 0:
+        raise RuntimeError(f"cannot record integrity for empty artifact: {path}")
+    return {"size_bytes": size_bytes, "sha256": digest.hexdigest()}
+
+
+def _required_manifest_path(manifest: dict[str, Any], key: str) -> str:
+    value = manifest.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"episode manifest {key} must be a non-empty path")
+    return value
+
+
+def _manifest_artifact_pairs(
+    manifest: dict[str, Any],
+) -> list[tuple[str, str]]:
+    data_pair = (
+        _required_manifest_path(manifest, "staged_data_path"),
+        _required_manifest_path(manifest, "data_path"),
+    )
+    staged_video_paths = manifest.get("staged_video_paths")
+    video_paths = manifest.get("video_paths")
+    if not isinstance(staged_video_paths, dict) or not isinstance(video_paths, dict):
+        raise ValueError("episode manifest video paths must be mappings")
+    if not staged_video_paths or set(staged_video_paths) != set(video_paths):
+        raise ValueError("episode manifest staged/final video keys do not match")
+    video_pairs = []
+    for camera_key in sorted(video_paths):
+        staged_path = staged_video_paths[camera_key]
+        final_path = video_paths[camera_key]
+        if not isinstance(staged_path, str) or not staged_path:
+            raise ValueError(
+                f"episode manifest staged path for {camera_key} is invalid"
+            )
+        if not isinstance(final_path, str) or not final_path:
+            raise ValueError(
+                f"episode manifest final path for {camera_key} is invalid"
+            )
+        video_pairs.append((staged_path, final_path))
+    return [data_pair, *video_pairs]
+
+
 def _write_files_transactional(files: dict[Path, str]) -> None:
+    if not files:
+        return
+    parent_dirs = {path.parent.resolve() for path in files}
+    if len(parent_dirs) != 1:
+        raise ValueError("transactional files must share one parent directory")
+    parent_dir = next(iter(parent_dirs))
+    with _metadata_files_lock(parent_dir, exclusive=True):
+        _write_files_transactional_locked(files)
+
+
+def _write_files_transactional_locked(files: dict[Path, str]) -> None:
+    if not files:
+        return
+    parent_dirs = {path.parent.resolve() for path in files}
+    if len(parent_dirs) != 1:
+        raise ValueError("transactional files must share one parent directory")
+    parent_dir = next(iter(parent_dirs))
+    _ensure_directory_durable(parent_dir)
     token = uuid4().hex
-    staging_paths: dict[Path, Path] = {}
-    backup_paths: dict[Path, Path | None] = {}
+    journal_path = parent_dir / METADATA_TRANSACTION_FILENAME
+    if journal_path.exists():
+        raise RuntimeError(
+            f"unfinished metadata transaction must be recovered first: {journal_path}"
+        )
+    entries: list[dict[str, Any]] = []
+    committed = False
 
     try:
         for path, content in files.items():
             staging_path = path.with_name(f".{path.name}.{token}.tmp")
-            staging_path.write_text(content, encoding="utf-8")
-            staging_paths[path] = staging_path
-
-        for path, staging_path in staging_paths.items():
             backup_path = path.with_name(f".{path.name}.{token}.bak")
-            if path.exists():
-                _replace_path(path, backup_path)
-                backup_paths[path] = backup_path
-            else:
-                backup_paths[path] = None
-            _replace_path(staging_path, path)
+            _write_text_durable(staging_path, content)
+            entries.append(
+                {
+                    "target": path.name,
+                    "staging": staging_path.name,
+                    "backup": backup_path.name,
+                    "had_original": path.exists(),
+                }
+            )
 
-        for backup_path in backup_paths.values():
-            if backup_path is not None:
-                backup_path.unlink(missing_ok=True)
+        journal = {"version": 1, "phase": "prepared", "entries": entries}
+        _write_text_atomic_durable(journal_path, _json_content(journal))
+
+        for entry in entries:
+            path = parent_dir / entry["target"]
+            staging_path = parent_dir / entry["staging"]
+            backup_path = parent_dir / entry["backup"]
+            if entry["had_original"]:
+                _replace_path(path, backup_path)
+            _replace_path(staging_path, path)
+            _fsync_directory(parent_dir)
+
+        journal["phase"] = "committed"
+        _write_text_atomic_durable(journal_path, _json_content(journal))
+        committed = True
+
+        _cleanup_transaction_files(parent_dir, entries)
+        journal_path.unlink(missing_ok=True)
+        _fsync_directory(parent_dir)
     except Exception:
-        for path, backup_path in reversed(list(backup_paths.items())):
-            path.unlink(missing_ok=True)
-            if backup_path is not None and backup_path.exists():
-                _replace_path(backup_path, path)
-        for staging_path in staging_paths.values():
-            staging_path.unlink(missing_ok=True)
-        for backup_path in backup_paths.values():
-            if backup_path is not None:
-                backup_path.unlink(missing_ok=True)
+        if committed:
+            # All targets and the committed journal are already durable. Leave the
+            # journal in place when cleanup fails so startup can finish roll-forward
+            # without ever restoring a partially deleted backup generation.
+            return
+        _rollback_transaction(parent_dir, entries)
+        journal_path.unlink(missing_ok=True)
+        _fsync_directory(parent_dir)
         raise
+
+
+def _recover_files_transaction(journal_path: Path) -> None:
+    if not journal_path.parent.exists():
+        return
+    with _metadata_files_lock(journal_path.parent, exclusive=True):
+        _recover_files_transaction_locked(journal_path)
+
+
+def _recover_files_transaction_locked(journal_path: Path) -> None:
+    if not journal_path.exists():
+        _cleanup_atomic_text_staging(journal_path)
+        return
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"cannot recover invalid metadata transaction journal: {journal_path}"
+        ) from exc
+    if journal.get("version") != 1 or journal.get("phase") not in {
+        "prepared",
+        "committed",
+    }:
+        raise RuntimeError(f"unsupported metadata transaction journal: {journal_path}")
+    entries = journal.get("entries")
+    if not isinstance(entries, list) or not all(
+        _valid_transaction_entry(entry) for entry in entries
+    ):
+        raise RuntimeError(f"invalid metadata transaction entries: {journal_path}")
+
+    parent_dir = journal_path.parent
+    if journal["phase"] == "prepared":
+        _rollback_transaction(parent_dir, entries)
+    else:
+        for entry in entries:
+            target = parent_dir / entry["target"]
+            staging = parent_dir / entry["staging"]
+            if not target.exists() and staging.exists():
+                _replace_path_durable(staging, target)
+            if not target.exists():
+                raise RuntimeError(
+                    f"committed metadata transaction is missing {target}"
+                )
+        _cleanup_transaction_files(parent_dir, entries)
+    journal_path.unlink(missing_ok=True)
+    _cleanup_atomic_text_staging(journal_path)
+    _fsync_directory(parent_dir)
+
+
+@contextmanager
+def _metadata_files_lock(parent_dir: Path, *, exclusive: bool):
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = parent_dir / METADATA_LOCK_FILENAME
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def _valid_transaction_entry(entry: Any) -> bool:
+    if not isinstance(entry, dict) or not isinstance(entry.get("had_original"), bool):
+        return False
+    for key in ("target", "staging", "backup"):
+        value = entry.get(key)
+        if (
+            not isinstance(value, str)
+            or not value
+            or Path(value).name != value
+            or value in {".", ".."}
+        ):
+            return False
+    return True
+
+
+def _rollback_transaction(parent_dir: Path, entries: list[dict[str, Any]]) -> None:
+    for entry in reversed(entries):
+        target = parent_dir / entry["target"]
+        staging = parent_dir / entry["staging"]
+        backup = parent_dir / entry["backup"]
+        if entry["had_original"]:
+            if backup.exists():
+                target.unlink(missing_ok=True)
+                backup.replace(target)
+        else:
+            target.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
+        backup.unlink(missing_ok=True)
+
+
+def _cleanup_transaction_files(
+    parent_dir: Path, entries: list[dict[str, Any]]
+) -> None:
+    for entry in entries:
+        (parent_dir / entry["staging"]).unlink(missing_ok=True)
+        (parent_dir / entry["backup"]).unlink(missing_ok=True)
+
+
+def _write_text_durable(path: Path, content: str) -> None:
+    with path.open("w", encoding="utf-8") as output:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def _write_text_atomic_durable(path: Path, content: str) -> None:
+    staging_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        _write_text_durable(staging_path, content)
+        _replace_path(staging_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        staging_path.unlink(missing_ok=True)
+
+
+def _cleanup_atomic_text_staging(path: Path) -> None:
+    removed = False
+    for staging_path in path.parent.glob(f".{path.name}.*.tmp"):
+        staging_path.unlink(missing_ok=True)
+        removed = True
+    if removed:
+        _fsync_directory(path.parent)
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as source:
+        os.fsync(source.fileno())
+
+
+def _unlink_path_durable(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        if path.parent.exists():
+            # The file may have been removed by a sink-specific discard method;
+            # persist that directory state before the recovery manifest is removed.
+            _fsync_directory(path.parent)
+        return
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _ensure_directory_durable(path: Path, *, exist_ok: bool = True) -> None:
+    if path.exists():
+        if not path.is_dir():
+            raise NotADirectoryError(path)
+        if not exist_ok:
+            raise FileExistsError(path)
+        return
+
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    path.mkdir(parents=True, exist_ok=False)
+    for directory in reversed(missing):
+        _fsync_directory(directory)
+        _fsync_directory(directory.parent)
 
 
 def _replace_path(source: Path, target: Path) -> None:
     source.replace(target)
+
+
+def _replace_path_durable(source: Path, target: Path) -> None:
+    source_parent = source.parent.resolve()
+    target_parent = target.parent.resolve()
+    _replace_path(source, target)
+    _fsync_directory(target_parent)
+    if source_parent != target_parent:
+        _fsync_directory(source_parent)

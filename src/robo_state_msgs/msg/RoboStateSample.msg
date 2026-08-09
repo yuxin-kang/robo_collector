@@ -11,3 +11,5 @@ float32[1545] stepit_observation
 float32 observation_l2_error
 
 string[] missing_optional_fields
+string[] source_timestamp_names
+float64[] source_timestamps_sec

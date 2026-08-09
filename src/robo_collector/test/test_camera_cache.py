@@ -21,6 +21,7 @@ class CameraFrameCacheTest(unittest.TestCase):
         cache = CameraFrameCache("127.0.0.1", 5555, ["head", "ego_view"], logger)
         cache.update_from_packet(
             {
+                "session_id": "session-a",
                 "timestamps": {"head": 0.9, "ego_view": 1.0},
                 "sequences": {"head": 1, "ego_view": 1},
                 "images": {"head": "head-image", "ego_view": "ego-image"},
@@ -30,6 +31,7 @@ class CameraFrameCacheTest(unittest.TestCase):
 
         updated = cache.update_from_packet(
             {
+                "session_id": "session-a",
                 "timestamps": {"ego_view": 1.0},
                 "sequences": {"ego_view": 2},
                 "images": {"ego_view": "ego-image"},
@@ -51,6 +53,7 @@ class CameraFrameCacheTest(unittest.TestCase):
 
         updated = cache.update_from_packet(
             {
+                "session_id": "session-a",
                 "timestamps": {"head": 2.0, "ego_view": 2.1},
                 "sequences": {"head": 20, "ego_view": 21},
                 "images": {"head": "head-image", "ego_view": "ego-image"},
@@ -76,6 +79,7 @@ class CameraFrameCacheTest(unittest.TestCase):
             max_inter_camera_skew_sec=0.05,
         )
         packet = {
+            "session_id": "session-a",
             "timestamps": {"head": 2.0, "ego_view": 2.01},
             "sequences": {"head": 20, "ego_view": 21},
             "images": {"head": "head-image", "ego_view": "ego-image"},
@@ -85,6 +89,7 @@ class CameraFrameCacheTest(unittest.TestCase):
         self.assertIn("did not advance", cache.last_error)
 
         skewed = {
+            "session_id": "session-a",
             "timestamps": {"head": 3.0, "ego_view": 3.2},
             "sequences": {"head": 21, "ego_view": 22},
             "images": {"head": "head-image", "ego_view": "ego-image"},
@@ -100,6 +105,7 @@ class CameraFrameCacheTest(unittest.TestCase):
         self.assertFalse(
             cache.update_from_packet(
                 {
+                    "session_id": "session-a",
                     "timestamps": {"head": float("inf")},
                     "images": {"head": "image"},
                 }
@@ -116,6 +122,7 @@ class CameraFrameCacheTest(unittest.TestCase):
             expected_fps=30,
         )
         packet = {
+            "session_id": "session-a",
             "timestamps": {"head": 2.0},
             "sequences": {"head": 20},
             "images": {"head": "head-image"},
@@ -132,6 +139,7 @@ class CameraFrameCacheTest(unittest.TestCase):
         self.assertFalse(
             cache.update_from_packet(
                 {
+                    "session_id": "session-a",
                     "timestamps": {"head": 1.0},
                     "sequences": {"head": 1.0},
                     "images": {"head": "image"},
@@ -139,6 +147,54 @@ class CameraFrameCacheTest(unittest.TestCase):
             )
         )
         self.assertIn("invalid sequence", cache.last_error)
+
+    def test_accepts_sequence_reset_after_camera_server_restart(self):
+        cache = CameraFrameCache("127.0.0.1", 5555, ["head"], FakeLogger())
+        first = {
+            "session_id": "session-a",
+            "timestamps": {"head": 2.0},
+            "sequences": {"head": 100},
+            "images": {"head": "first"},
+        }
+        restarted = {
+            "session_id": "session-b",
+            "timestamps": {"head": 3.0},
+            "sequences": {"head": 0},
+            "images": {"head": "restarted"},
+        }
+
+        self.assertTrue(cache.update_from_packet(first))
+        self.assertTrue(cache.update_from_packet(restarted))
+        self.assertEqual(cache.latest().session_id, "session-b")
+        self.assertEqual(cache.latest().images["head"], "restarted")
+
+    def test_rejects_late_packet_from_retired_camera_session(self):
+        cache = CameraFrameCache("127.0.0.1", 5555, ["head"], FakeLogger())
+        first = {
+            "session_id": "session-a",
+            "timestamps": {"head": 2.0},
+            "sequences": {"head": 100},
+            "images": {"head": "first"},
+        }
+        restarted = {
+            "session_id": "session-b",
+            "timestamps": {"head": 3.0},
+            "sequences": {"head": 0},
+            "images": {"head": "restarted"},
+        }
+        late_old = {
+            "session_id": "session-a",
+            "timestamps": {"head": 3.1},
+            "sequences": {"head": 101},
+            "images": {"head": "late-old"},
+        }
+
+        self.assertTrue(cache.update_from_packet(first))
+        self.assertTrue(cache.update_from_packet(restarted))
+        self.assertFalse(cache.update_from_packet(late_old))
+        self.assertEqual(cache.latest().session_id, "session-b")
+        self.assertEqual(cache.latest().images["head"], "restarted")
+        self.assertIn("retired session", cache.last_error)
 
     def test_parse_camera_streams_accepts_comma_string(self):
         self.assertEqual(parse_camera_streams("head, ego_view"), ["head", "ego_view"])
