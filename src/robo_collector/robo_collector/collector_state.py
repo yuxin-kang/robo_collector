@@ -11,6 +11,7 @@ class CollectorMode(str, Enum):
     IDLE = "IDLE"
     RECORDING = "RECORDING"
     NEED_TO_SAVE = "NEED_TO_SAVE"
+    SAVING = "SAVING"
     FAILED = "FAILED"
     DISCARD = "DISCARD"
 
@@ -133,8 +134,13 @@ class RecordStateMachine:
             return self._stop(episode_id, force=force)
         return self._discard(episode_id, force=force)
 
-    def mark_saved(self) -> None:
+    def mark_saving(self) -> None:
         if self.mode != CollectorMode.NEED_TO_SAVE:
+            raise RuntimeError(f"cannot mark saving while mode is {self.mode.value}")
+        self.mode = CollectorMode.SAVING
+
+    def mark_saved(self) -> None:
+        if self.mode != CollectorMode.SAVING:
             raise RuntimeError(f"cannot mark saved while mode is {self.mode.value}")
         self.mode = CollectorMode.IDLE
         self.session = None
@@ -156,12 +162,18 @@ class RecordStateMachine:
         self.failure_reason = reason.strip() or "discard failed"
 
     def mark_save_failed(self) -> None:
-        if self.mode != CollectorMode.NEED_TO_SAVE:
-            raise RuntimeError(f"cannot mark save failed while mode is {self.mode.value}")
+        if self.mode != CollectorMode.SAVING:
+            raise RuntimeError(
+                f"cannot mark save failed while mode is {self.mode.value}"
+            )
         self.mark_failed("save failed; discard required")
 
     def mark_failed(self, reason: str) -> None:
-        if self.mode not in (CollectorMode.RECORDING, CollectorMode.NEED_TO_SAVE):
+        if self.mode not in (
+            CollectorMode.RECORDING,
+            CollectorMode.NEED_TO_SAVE,
+            CollectorMode.SAVING,
+        ):
             raise RuntimeError(f"cannot mark failed while mode is {self.mode.value}")
         self.mode = CollectorMode.FAILED
         self.failure_reason = reason.strip() or "discard required"

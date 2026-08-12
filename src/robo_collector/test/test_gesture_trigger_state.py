@@ -430,6 +430,219 @@ class GestureTriggerStateTest(unittest.TestCase):
         self.assertEqual(machine.attempt_state, AttemptState.PAUSED_FAILED)
         self.assertIn("save confirmation timed out", machine.last_error)
 
+    def test_stop_ack_can_arrive_after_collector_enters_saving(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        machine = GestureTriggerStateMachine(plan)
+        waiting = _missing_snapshot(plan)
+        machine.bootstrap(waiting)
+        machine.step(0.0, ready_triggered=True)
+        start_action = machine.step(0.1, start_triggered=True)[0]
+        _ack_start(machine, start_action, now_sec=0.2)
+        stop_action = machine.step(0.3, end_triggered=True)[0]
+
+        _ack_stop(
+            machine,
+            stop_action,
+            now_sec=0.4,
+            collector_mode="SAVING",
+            metadata_snapshot=waiting,
+        )
+
+        self.assertEqual(machine.attempt_state, AttemptState.WAITING_SAVE_METADATA)
+
+    def test_saving_state_recovers_when_stop_receipt_is_lost(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        machine = GestureTriggerStateMachine(plan)
+        waiting = _missing_snapshot(plan)
+        machine.bootstrap(waiting)
+        machine.step(0.0, ready_triggered=True)
+        start_action = machine.step(0.1, start_triggered=True)[0]
+        _ack_start(machine, start_action, now_sec=0.2)
+        machine.step(0.3, end_triggered=True)
+
+        emitted = machine.step(
+            0.4,
+            collector_mode="SAVING",
+            collector_episode_id=machine.current_attempt.episode_id,
+            metadata_snapshot=waiting,
+        )
+
+        self.assertEqual(emitted, [])
+        self.assertEqual(machine.attempt_state, AttemptState.WAITING_SAVE_METADATA)
+
+    def test_new_save_progress_renews_save_confirmation_deadline(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        machine = GestureTriggerStateMachine(plan)
+        waiting = _missing_snapshot(plan)
+        machine.bootstrap(waiting)
+        machine.step(0.0, ready_triggered=True)
+        start_action = machine.step(0.1, start_triggered=True)[0]
+        _ack_start(machine, start_action, now_sec=0.2)
+        stop_action = machine.step(0.3, end_triggered=True)[0]
+        _ack_stop(
+            machine,
+            stop_action,
+            now_sec=1.0,
+            collector_mode="NEED_TO_SAVE",
+            metadata_snapshot=waiting,
+            collector_save_progress_token="0",
+        )
+
+        first = machine.step(
+            1.8,
+            metadata_snapshot=waiting,
+            collector_mode="SAVING",
+            collector_episode_id=machine.current_attempt.episode_id,
+            collector_save_progress_token="1",
+        )
+        second = machine.step(
+            2.5,
+            metadata_snapshot=waiting,
+            collector_mode="SAVING",
+            collector_episode_id=machine.current_attempt.episode_id,
+            collector_save_progress_token="2",
+        )
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertEqual(machine.attempt_state, AttemptState.WAITING_SAVE_METADATA)
+
+        machine.step(
+            3.6,
+            metadata_snapshot=waiting,
+            collector_mode="",
+        )
+        self.assertEqual(machine.attempt_state, AttemptState.PAUSED_FAILED)
+        self.assertIn("save confirmation timed out", machine.last_error)
+
+    def test_unchanged_save_progress_does_not_renew_deadline(self):
+        plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
+        machine = GestureTriggerStateMachine(plan)
+        waiting = _missing_snapshot(plan)
+        machine.bootstrap(waiting)
+        machine.step(0.0, ready_triggered=True)
+        start_action = machine.step(0.1, start_triggered=True)[0]
+        _ack_start(machine, start_action, now_sec=0.2)
+        stop_action = machine.step(0.3, end_triggered=True)[0]
+        _ack_stop(
+            machine,
+            stop_action,
+            now_sec=1.0,
+            collector_mode="SAVING",
+            metadata_snapshot=waiting,
+            collector_save_progress_token="1",
+        )
+
+        machine.step(
+            1.8,
+            metadata_snapshot=waiting,
+            collector_mode="SAVING",
+            collector_episode_id=machine.current_attempt.episode_id,
+            collector_save_progress_token="1",
+        )
+        actions = machine.step(
+            2.1,
+            metadata_snapshot=waiting,
+            collector_mode="SAVING",
+            collector_episode_id=machine.current_attempt.episode_id,
+            collector_save_progress_token="1",
+        )
+
+        self.assertEqual(actions, [])
+        self.assertEqual(machine.attempt_state, AttemptState.PAUSED_FAILED)
+        self.assertIn("save confirmation timed out", machine.last_error)
+
+    def test_save_progress_cannot_extend_maximum_wait(self):
+        payload = _plan_payload(target_trials=1)
+        payload["collector"]["max_save_wait_sec"] = 2.0
+        plan = gesture_plan_from_payload(payload)
+        machine = GestureTriggerStateMachine(plan)
+        waiting = _missing_snapshot(plan)
+        machine.bootstrap(waiting)
+        machine.step(0.0, ready_triggered=True)
+        start_action = machine.step(0.1, start_triggered=True)[0]
+        _ack_start(machine, start_action, now_sec=0.2)
+        stop_action = machine.step(0.3, end_triggered=True)[0]
+        _ack_stop(
+            machine,
+            stop_action,
+            now_sec=1.0,
+            collector_mode="SAVING",
+            metadata_snapshot=waiting,
+            collector_save_progress_token="0",
+        )
+
+        machine.step(
+            1.8,
+            metadata_snapshot=waiting,
+            collector_mode="SAVING",
+            collector_episode_id=machine.current_attempt.episode_id,
+            collector_save_progress_token="1",
+        )
+        machine.step(
+            2.7,
+            metadata_snapshot=waiting,
+            collector_mode="SAVING",
+            collector_episode_id=machine.current_attempt.episode_id,
+            collector_save_progress_token="2",
+        )
+        actions = machine.step(
+            3.0,
+            metadata_snapshot=waiting,
+            collector_mode="SAVING",
+            collector_episode_id=machine.current_attempt.episode_id,
+            collector_save_progress_token="3",
+        )
+
+        self.assertEqual(actions, [])
+        self.assertEqual(machine.attempt_state, AttemptState.PAUSED_FAILED)
+        self.assertIn("maximum save reconciliation wait", machine.last_error)
+
+    def test_late_saved_metadata_does_not_bypass_maximum_wait(self):
+        payload = _plan_payload(target_trials=1)
+        payload["collector"]["max_save_wait_sec"] = 2.0
+        plan = gesture_plan_from_payload(payload)
+        machine = GestureTriggerStateMachine(plan)
+        waiting = _missing_snapshot(plan)
+        machine.bootstrap(waiting)
+        machine.step(0.0, ready_triggered=True)
+        start_action = machine.step(0.1, start_triggered=True)[0]
+        _ack_start(machine, start_action, now_sec=0.2)
+        stop_action = machine.step(0.3, end_triggered=True)[0]
+        _ack_stop(
+            machine,
+            stop_action,
+            now_sec=1.0,
+            collector_mode="SAVING",
+            metadata_snapshot=waiting,
+            collector_save_progress_token="0",
+        )
+        saved = _snapshot(
+            plan,
+            [
+                TrialMetadataStatus(
+                    task_slug="shake_hand",
+                    trial_index=0,
+                    complete=True,
+                    latest_state="SUCCESS",
+                    latest_attempt_index=1,
+                    next_attempt_index=2,
+                    message="metadata row saved successfully",
+                    episode_id=start_action.episode_id,
+                )
+            ],
+        )
+
+        actions = machine.step(
+            3.1,
+            collector_mode="IDLE",
+            metadata_snapshot=saved,
+        )
+
+        self.assertEqual(actions, [])
+        self.assertEqual(machine.attempt_state, AttemptState.PAUSED_FAILED)
+        self.assertIn("maximum save reconciliation wait", machine.last_error)
+
     def test_saved_metadata_recovers_when_stop_receipt_is_lost(self):
         plan = gesture_plan_from_payload(_plan_payload(target_trials=1))
         machine = GestureTriggerStateMachine(plan)
@@ -683,6 +896,7 @@ def _ack_stop(
     now_sec,
     collector_mode="NEED_TO_SAVE",
     metadata_snapshot=None,
+    collector_save_progress_token="",
 ):
     machine.step(
         now_sec,
@@ -692,6 +906,7 @@ def _ack_stop(
         collector_last_command="STOP",
         collector_last_command_outcome="SUCCEEDED",
         collector_last_command_episode_id=action.episode_id,
+        collector_save_progress_token=collector_save_progress_token,
         metadata_snapshot=metadata_snapshot,
     )
 

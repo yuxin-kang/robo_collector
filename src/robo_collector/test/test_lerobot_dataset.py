@@ -3,6 +3,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Thread
 
 from robo_collector import lerobot_dataset
 from robo_collector.field_config import FieldSelection
@@ -124,6 +125,155 @@ class LeRobotV21WriterTest(unittest.TestCase):
                 (root / "meta/tasks.jsonl").read_text(encoding="utf-8").strip()
             )
             self.assertEqual(task, {"task_index": 0, "task": "pick the red cup"})
+
+    def test_save_episode_reports_durable_commit_phases(self):
+        phases = []
+
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("pick the red cup", "manual-1")
+            writer.add_frame(_robot_frame(), FakeFrame())
+
+            result = writer.save_episode(progress_callback=phases.append)
+
+        self.assertTrue(result.saved)
+        self.assertEqual(
+            phases,
+            [
+                "closing_video",
+                "writing_parquet",
+                "validating_artifacts",
+                "syncing_artifacts",
+                "committing_artifacts",
+                "hashing_artifacts",
+                "committing_metadata",
+                "cleaning_up",
+                "complete",
+            ],
+        )
+
+    def test_save_progress_callback_failure_does_not_fail_commit(self):
+        def fail_progress(_phase):
+            raise RuntimeError("status transport failed")
+
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("pick the red cup", "manual-1")
+            writer.add_frame(_robot_frame(), FakeFrame())
+
+            result = writer.save_episode(progress_callback=fail_progress)
+
+            self.assertTrue(result.saved)
+            self.assertTrue((Path(tmp) / "dataset/meta/episodes.jsonl").exists())
+
+    def test_save_progress_callback_cannot_reenter_writer_mutations(self):
+        rejected = []
+
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("pick the red cup", "manual-1")
+            writer.add_frame(_robot_frame(), FakeFrame())
+
+            def try_discard(_phase):
+                try:
+                    writer.discard_episode()
+                except RuntimeError as exc:
+                    rejected.append(str(exc))
+
+            result = writer.save_episode(progress_callback=try_discard)
+
+            self.assertTrue(result.saved)
+            self.assertTrue(rejected)
+            self.assertTrue(
+                all("writer operation is running" in message for message in rejected)
+            )
+            self.assertTrue((Path(tmp) / "dataset/meta/episodes.jsonl").exists())
+
+    def test_discard_cannot_overlap_save_after_save_has_started(self):
+        parquet_started = Event()
+        release_parquet = Event()
+        save_results = []
+        save_errors = []
+
+        def write_blocking_parquet(path, rows):
+            parquet_started.set()
+            if not release_parquet.wait(timeout=2.0):
+                raise TimeoutError("test did not release parquet writer")
+            _write_fake_parquet(path, rows)
+
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp, parquet_writer=write_blocking_parquet)
+            writer.start_episode("pick the red cup", "manual-1")
+            writer.add_frame(_robot_frame(), FakeFrame())
+
+            def save_in_thread():
+                try:
+                    save_results.append(writer.save_episode())
+                except Exception as exc:
+                    save_errors.append(exc)
+
+            save_thread = Thread(target=save_in_thread)
+            save_thread.start()
+            self.assertTrue(parquet_started.wait(timeout=2.0))
+
+            with self.assertRaisesRegex(RuntimeError, "writer operation is running"):
+                writer.discard_episode()
+
+            release_parquet.set()
+            save_thread.join(timeout=2.0)
+
+            self.assertFalse(save_thread.is_alive())
+            self.assertEqual(save_errors, [])
+            self.assertEqual(len(save_results), 1)
+            self.assertTrue(save_results[0].saved)
+            root = Path(tmp) / "dataset"
+            self.assertTrue((root / "data/train-000000.parquet").exists())
+            self.assertTrue((root / "meta/episodes.jsonl").exists())
+
+    def test_save_cannot_overlap_discard_after_discard_has_started(self):
+        discard_started = Event()
+        release_discard = Event()
+        discard_errors = []
+
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("pick the red cup", "manual-1")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            original_discard_active = writer._discard_active
+
+            def discard_after_release():
+                discard_started.set()
+                if not release_discard.wait(timeout=2.0):
+                    raise TimeoutError("test did not release discard")
+                original_discard_active()
+
+            writer._discard_active = discard_after_release
+
+            def discard_in_thread():
+                try:
+                    writer.discard_episode()
+                except Exception as exc:
+                    discard_errors.append(exc)
+
+            discard_thread = Thread(target=discard_in_thread)
+            discard_thread.start()
+            self.assertTrue(discard_started.wait(timeout=2.0))
+
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError, "writer operation is running"
+                ):
+                    writer.save_episode()
+            finally:
+                release_discard.set()
+                discard_thread.join(timeout=2.0)
+
+            self.assertFalse(discard_thread.is_alive())
+            self.assertEqual(discard_errors, [])
+            self.assertIsNone(writer.active_episode_index)
+            root = Path(tmp) / "dataset"
+            self.assertFalse((root / "data/train-000000.parquet").exists())
+            self.assertFalse((root / "meta/episodes.jsonl").exists())
 
     def test_save_episode_writes_two_camera_video_features(self):
         parquet_rows = {}
@@ -672,7 +822,13 @@ class LeRobotV21WriterTest(unittest.TestCase):
         original_stream_writer = lerobot_dataset.write_parquet_pyarrow_stream
         original_row_count_validator = lerobot_dataset._validate_parquet_row_count
 
-        def fake_stream_writer(path, row_spool_path, *, batch_size):
+        def fake_stream_writer(
+            path,
+            row_spool_path,
+            *,
+            batch_size,
+            progress_callback=None,
+        ):
             rows = [
                 json.loads(line)
                 for line in row_spool_path.read_text(encoding="utf-8").splitlines()
@@ -721,6 +877,7 @@ class LeRobotV21WriterTest(unittest.TestCase):
             self.skipTest("pyarrow is not installed")
 
         with TemporaryDirectory() as tmp:
+            phases = []
             writer = LeRobotV21Writer(
                 tmp,
                 dataset_name="dataset",
@@ -733,7 +890,7 @@ class LeRobotV21WriterTest(unittest.TestCase):
                 FakeFrame(),
                 camera_timestamps_sec={"ego_view": 9.99},
             )
-            result = writer.save_episode()
+            result = writer.save_episode(progress_callback=phases.append)
 
             table = pq.read_table(result.data_path)
             schema = table.schema
@@ -750,6 +907,26 @@ class LeRobotV21WriterTest(unittest.TestCase):
             self.assertEqual(robot_type.value_type, pa.float32())
             video_type = schema.field("observation.images.ego_view").type
             self.assertEqual(video_type.field("timestamp").type, pa.float32())
+            self.assertGreaterEqual(phases.count("writing_parquet"), 2)
+
+    def test_integrity_hashing_reports_incremental_progress(self):
+        original_interval = lerobot_dataset.SAVE_PROGRESS_BYTES_INTERVAL
+        lerobot_dataset.SAVE_PROGRESS_BYTES_INTERVAL = 4
+        try:
+            with TemporaryDirectory() as tmp:
+                artifact = Path(tmp) / "artifact.bin"
+                artifact.write_bytes(b"123456789")
+                phases = []
+
+                integrity = lerobot_dataset._file_integrity(
+                    artifact,
+                    progress_callback=phases.append,
+                )
+
+            self.assertEqual(integrity["size_bytes"], 9)
+            self.assertEqual(phases, ["hashing_artifacts"])
+        finally:
+            lerobot_dataset.SAVE_PROGRESS_BYTES_INTERVAL = original_interval
 
     def test_episode_metadata_records_artifact_integrity(self):
         with TemporaryDirectory() as tmp:

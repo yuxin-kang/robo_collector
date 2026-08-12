@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Protocol, TextIO
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ DOF = 29
 CAMERA_KEY = "observation.images.ego_view"
 ALIGNED_TARGET_POS_DIM = 45
 PARQUET_ROW_GROUP_SIZE = 256
+SAVE_PROGRESS_BYTES_INTERVAL = 8 * 1024 * 1024
 IN_PROGRESS_DIR = ".inprogress"
 METADATA_TRANSACTION_FILENAME = ".metadata-transaction.json"
 METADATA_LOCK_FILENAME = ".metadata.lock"
@@ -88,6 +90,19 @@ class SaveResult:
     video_path: Path | None
     message: str
     video_paths: dict[str, Path] = field(default_factory=dict)
+
+
+def _report_save_progress(
+    callback: Callable[[str], None] | None,
+    phase: str,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(phase)
+    except Exception:
+        # Progress reporting is advisory and must never invalidate a durable save.
+        pass
 
 
 @dataclass
@@ -172,6 +187,7 @@ class LeRobotV21Writer:
             Path, tuple[int, int, int, str]
         ] = {}
         self._dataset_lock_fd: int | None = None
+        self._operation_lock = Lock()
         if not self._metadata_transaction_path().exists():
             self._load_existing_metadata()
 
@@ -190,6 +206,10 @@ class LeRobotV21Writer:
         return self._active.failed_reason
 
     def start_episode(self, task_prompt: str, episode_id: str = "") -> int:
+        with self._writer_operation("start an episode"):
+            return self._start_episode(task_prompt, episode_id)
+
+    def _start_episode(self, task_prompt: str, episode_id: str = "") -> int:
         if self._active is not None:
             raise RuntimeError("cannot start a new episode while another is active")
         normalized_prompt = task_prompt.strip()
@@ -222,6 +242,20 @@ class LeRobotV21Writer:
             raise
 
     def add_frame(
+        self,
+        frame: RobotFrame,
+        rgb_frame: Any,
+        *,
+        camera_timestamps_sec: dict[str, float | None] | None = None,
+    ) -> None:
+        with self._writer_operation("add a frame"):
+            self._add_frame(
+                frame,
+                rgb_frame,
+                camera_timestamps_sec=camera_timestamps_sec,
+            )
+
+    def _add_frame(
         self,
         frame: RobotFrame,
         rgb_frame: Any,
@@ -664,7 +698,19 @@ class LeRobotV21Writer:
             raise ValueError("missing RGB frame(s): " + ",".join(missing))
         return frames
 
-    def save_episode(self) -> SaveResult:
+    def save_episode(
+        self,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> SaveResult:
+        with self._writer_operation("save an episode"):
+            return self._save_episode(progress_callback=progress_callback)
+
+    def _save_episode(
+        self,
+        *,
+        progress_callback: Callable[[str], None] | None,
+    ) -> SaveResult:
         active = self._require_active()
         if active.failed_reason is not None:
             raise RuntimeError(
@@ -672,7 +718,9 @@ class LeRobotV21Writer:
                 f"{active.failed_reason}"
             )
         if active.frame_count == 0:
+            _report_save_progress(progress_callback, "discarding_empty")
             self._discard_active()
+            _report_save_progress(progress_callback, "complete")
             return SaveResult(
                 saved=False,
                 episode_index=active.episode_index,
@@ -682,6 +730,7 @@ class LeRobotV21Writer:
                 message="discarded empty episode",
             )
 
+        _report_save_progress(progress_callback, "closing_video")
         if not active.videos_closed:
             for video_sink in active.video_sinks.values():
                 video_sink.close()
@@ -697,11 +746,13 @@ class LeRobotV21Writer:
             staged_data_path.parent.mkdir(parents=True, exist_ok=True)
             row_spool_path = self._root_path(active.row_spool_rel_path)
             try:
+                _report_save_progress(progress_callback, "writing_parquet")
                 if self._uses_default_parquet_writer:
                     write_parquet_pyarrow_stream(
                         staged_data_path,
                         row_spool_path,
                         batch_size=PARQUET_ROW_GROUP_SIZE,
+                        progress_callback=progress_callback,
                     )
                     _validate_parquet_row_count(
                         staged_data_path, active.frame_count
@@ -710,6 +761,7 @@ class LeRobotV21Writer:
                     self._parquet_writer(
                         staged_data_path, _read_spooled_rows(row_spool_path)
                     )
+                _report_save_progress(progress_callback, "validating_artifacts")
                 _require_nonempty_file(staged_data_path, label="episode parquet")
                 for camera_key in self.camera_keys:
                     staged_video_path = self._root_path(
@@ -723,11 +775,13 @@ class LeRobotV21Writer:
                         _validate_video_frame_count(
                             staged_video_path, active.frame_count
                         )
+                _report_save_progress(progress_callback, "syncing_artifacts")
                 _fsync_file(staged_data_path)
                 for camera_key in self.camera_keys:
                     _fsync_file(
                         self._root_path(active.staged_video_rel_paths[camera_key])
                     )
+                _report_save_progress(progress_callback, "committing_artifacts")
                 self._commit_active_artifacts(active)
             except Exception as exc:
                 if active.failed_reason is None:
@@ -735,11 +789,16 @@ class LeRobotV21Writer:
                 raise
         data_path = self._root_path(active.data_rel_path)
         if not active.artifact_integrity:
-            active.artifact_integrity = self._artifact_integrity(active)
+            _report_save_progress(progress_callback, "hashing_artifacts")
+            active.artifact_integrity = self._artifact_integrity(
+                active,
+                progress_callback=progress_callback,
+            )
 
         episode_record = self._episode_record(active)
         pending_episodes = [*self._episodes, episode_record]
         pending_total_frames = self._total_frames + active.frame_count
+        _report_save_progress(progress_callback, "committing_metadata")
         self._write_metadata(
             active,
             episodes=pending_episodes,
@@ -765,6 +824,7 @@ class LeRobotV21Writer:
             },
         )
         try:
+            _report_save_progress(progress_callback, "cleaning_up")
             self._cleanup_active_staging(active, remove_committed=False)
         except OSError:
             # Metadata and artifacts have crossed the durable commit point. Keep
@@ -774,6 +834,7 @@ class LeRobotV21Writer:
         finally:
             self._active = None
             self._release_dataset_lock()
+        _report_save_progress(progress_callback, "complete")
         return result
 
     def _episode_record(self, active: _ActiveEpisode) -> dict[str, Any]:
@@ -796,8 +857,20 @@ class LeRobotV21Writer:
         }
 
     def discard_episode(self) -> None:
-        self._require_active()
-        self._discard_active()
+        with self._writer_operation("discard an episode"):
+            self._require_active()
+            self._discard_active()
+
+    @contextmanager
+    def _writer_operation(self, operation: str):
+        if not self._operation_lock.acquire(blocking=False):
+            raise RuntimeError(
+                f"cannot {operation} while another writer operation is running"
+            )
+        try:
+            yield
+        finally:
+            self._operation_lock.release()
 
     def _discard_active(self) -> None:
         active = self._active
@@ -824,18 +897,27 @@ class LeRobotV21Writer:
             if discarded:
                 self._release_dataset_lock()
 
-    def _artifact_integrity(self, active: _ActiveEpisode) -> dict[str, Any]:
+    def _artifact_integrity(
+        self,
+        active: _ActiveEpisode,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
         assert active.data_rel_path is not None
         return {
             "algorithm": "sha256",
             "data": {
-                **_file_integrity(self._root_path(active.data_rel_path)),
+                **_file_integrity(
+                    self._root_path(active.data_rel_path),
+                    progress_callback=progress_callback,
+                ),
                 "rows": active.frame_count,
             },
             "videos": {
                 camera_key: {
                     **_file_integrity(
-                        self._root_path(active.video_rel_paths[camera_key])
+                        self._root_path(active.video_rel_paths[camera_key]),
+                        progress_callback=progress_callback,
                     ),
                     "frames": active.frame_count,
                 }
@@ -1576,7 +1658,11 @@ def write_parquet_pyarrow(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def write_parquet_pyarrow_stream(
-    path: Path, row_spool_path: Path, *, batch_size: int
+    path: Path,
+    row_spool_path: Path,
+    *,
+    batch_size: int,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> None:
     try:
         import pyarrow as pa
@@ -1607,6 +1693,7 @@ def write_parquet_pyarrow_stream(
                     )
                 parquet_writer.write_table(table, row_group_size=len(batch))
                 batch.clear()
+                _report_save_progress(progress_callback, "writing_parquet")
             if batch:
                 if schema is None:
                     schema = _arrow_schema_for_row(pa, batch[0])
@@ -1616,6 +1703,7 @@ def write_parquet_pyarrow_stream(
                         path, schema, compression="snappy"
                     )
                 parquet_writer.write_table(table, row_group_size=len(batch))
+                _report_save_progress(progress_callback, "writing_parquet")
         if parquet_writer is None:
             raise ValueError("cannot write parquet from an empty row spool")
     finally:
@@ -1908,16 +1996,25 @@ def _validate_video_frame_count(path: Path, expected_frames: int) -> None:
         )
 
 
-def _file_integrity(path: Path) -> dict[str, Any]:
+def _file_integrity(
+    path: Path,
+    *,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     digest = hashlib.sha256()
     size_bytes = 0
+    bytes_since_progress = 0
     with path.open("rb") as artifact:
         while True:
             chunk = artifact.read(1024 * 1024)
             if not chunk:
                 break
             size_bytes += len(chunk)
+            bytes_since_progress += len(chunk)
             digest.update(chunk)
+            if bytes_since_progress >= SAVE_PROGRESS_BYTES_INTERVAL:
+                _report_save_progress(progress_callback, "hashing_artifacts")
+                bytes_since_progress = 0
     if size_bytes <= 0:
         raise RuntimeError(f"cannot record integrity for empty artifact: {path}")
     return {"size_bytes": size_bytes, "sha256": digest.hexdigest()}

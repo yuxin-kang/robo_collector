@@ -30,7 +30,8 @@ class CollectorPlanConfig:
     discard_confirm_timeout_sec: float = 5.0
     command_retry_interval_sec: float = 0.5
     command_max_retries: int = 5
-    save_confirm_timeout_sec: float = 20.0
+    save_confirm_timeout_sec: float = 120.0
+    max_save_wait_sec: float = 600.0
     status_timeout_sec: float = 5.0
     max_recording_duration_sec: float = 300.0
     auto_discard: bool = False
@@ -192,6 +193,19 @@ def _parse_collector(value: Any, *, source: str) -> CollectorPlanConfig:
         raise GesturePlanError(
             f"{source}: collector.auto_discard=true is not implemented in v1"
         )
+    save_confirm_timeout_sec = _positive_float(
+        value.get("save_confirm_timeout_sec", 120.0),
+        source=f"{source}: collector.save_confirm_timeout_sec",
+    )
+    max_save_wait_sec = _positive_float(
+        value.get("max_save_wait_sec", 600.0),
+        source=f"{source}: collector.max_save_wait_sec",
+    )
+    if max_save_wait_sec < save_confirm_timeout_sec:
+        raise GesturePlanError(
+            f"{source}: collector.max_save_wait_sec must be greater than or "
+            "equal to collector.save_confirm_timeout_sec"
+        )
     return CollectorPlanConfig(
         command_topic=str(value.get("command_topic", "/robo_collector/record_command")).strip(),
         status_topic=str(value.get("status_topic", "/robo_collector/status")).strip(),
@@ -219,10 +233,8 @@ def _parse_collector(value: Any, *, source: str) -> CollectorPlanConfig:
             value.get("command_max_retries", 5),
             source=f"{source}: collector.command_max_retries",
         ),
-        save_confirm_timeout_sec=_positive_float(
-            value.get("save_confirm_timeout_sec", 20.0),
-            source=f"{source}: collector.save_confirm_timeout_sec",
-        ),
+        save_confirm_timeout_sec=save_confirm_timeout_sec,
+        max_save_wait_sec=max_save_wait_sec,
         status_timeout_sec=_positive_float(
             value.get("status_timeout_sec", 5.0),
             source=f"{source}: collector.status_timeout_sec",

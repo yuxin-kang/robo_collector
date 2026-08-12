@@ -537,6 +537,9 @@ if rclpy is not None:  # pragma: no branch
                 return {}
             values = self._latest_collector_status.values
             return {
+                "collector_save_progress_token": values.get(
+                    "save_progress_seq", ""
+                ),
                 "collector_last_command_id": values.get("last_command_id", ""),
                 "collector_last_command": values.get("last_command", ""),
                 "collector_last_command_outcome": values.get(

@@ -256,6 +256,15 @@ Plan fields:
   `max_tail_frames` bound.
 - `collector.stop_confirm_timeout_sec`: STOP acknowledgement deadline; STOP is
   retried idempotently for the current episode.
+- `collector.save_confirm_timeout_sec`: rolling save watchdog. Only a newer
+  collector `save_progress_seq` renews this deadline, so repeated status messages
+  from a stuck save cannot keep the attempt alive indefinitely. Configure it
+  above the longest expected video-close, validation, fsync, rename, or metadata
+  transaction phase because those system calls cannot report intermediate
+  progress.
+- `collector.max_save_wait_sec`: maximum time the gesture controller waits for
+  metadata reconciliation, even while progress continues. It does not cancel an
+  in-flight durable writer transaction.
 - `collector.discard_confirm_timeout_sec`: fail-closed DISCARD acknowledgement
   deadline; DISCARD is retried for the owned episode before the trigger pauses.
 - `collector.max_recording_duration_sec`: gesture-side fail-closed watchdog; an
@@ -272,6 +281,14 @@ progress from `meta/episodes.jsonl` instead of trusting the progress log.
 New episode rows include SHA-256/size integrity records. Recovery verifies those
 records before marking a gesture trial complete; dataset metadata updates use a
 durable transaction journal, and only one writer may own a dataset at a time.
+Episode finalization runs on one background worker. Collector status remains
+responsive in `SAVING` mode and exposes `save_phase`, `save_elapsed_sec`, and
+`save_progress_seq`/`save_progress_age_sec`. `DISCARD` is rejected while that
+durable commit is in flight; a failed save transitions to `FAILED`, where
+episode-scoped `DISCARD` remains available. On node shutdown, the collector waits
+for `save_shutdown_grace_sec` (default `10.0`) before warning, then continues to
+wait for an in-flight save so the writer cannot outlive the node. If the process
+is externally terminated, staging data remains available for startup recovery.
 
 ## Convert to Isaac-GR00T
 

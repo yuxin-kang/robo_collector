@@ -145,6 +145,8 @@ class GestureTriggerStateMachine:
         self._discard_attempts = 0
         self._pending_failure_message = ""
         self._save_deadline_sec = 0.0
+        self._save_wait_deadline_sec = 0.0
+        self._last_save_progress_seq: int | None = None
         self._command_ids: dict[str, str] = {}
 
     def bootstrap(self, snapshot: MetadataSnapshot) -> None:
@@ -163,6 +165,7 @@ class GestureTriggerStateMachine:
         metadata_snapshot: MetadataSnapshot | None = None,
         collector_mode: str = "",
         collector_episode_id: str = "",
+        collector_save_progress_token: str = "",
         collector_last_command_id: str = "",
         collector_last_command: str = "",
         collector_last_command_outcome: str = "",
@@ -200,6 +203,7 @@ class GestureTriggerStateMachine:
                 collector_mode,
                 collector_episode_id,
                 now_sec,
+                collector_save_progress_token,
             )
 
         if self.attempt_state == AttemptState.WAITING_START_ACK:
@@ -238,6 +242,7 @@ class GestureTriggerStateMachine:
                             collector_episode_id,
                             metadata_snapshot,
                             "recovered saved metadata after STOP receipt loss",
+                            collector_save_progress_token,
                         )
                 if (
                     collector_last_episode_id == expected_episode_id
@@ -249,6 +254,7 @@ class GestureTriggerStateMachine:
                         collector_episode_id,
                         metadata_snapshot,
                         "collector reports the episode saved after STOP receipt loss",
+                        collector_save_progress_token,
                     )
                 if (
                     collector_last_episode_id == expected_episode_id
@@ -267,6 +273,7 @@ class GestureTriggerStateMachine:
                 collector_last_command_episode_id=(
                     collector_last_command_episode_id
                 ),
+                collector_save_progress_token=collector_save_progress_token,
                 now_sec=now_sec,
             )
             if (
@@ -279,6 +286,7 @@ class GestureTriggerStateMachine:
                         collector_mode,
                         collector_episode_id,
                         now_sec,
+                        collector_save_progress_token,
                     )
                 )
             return actions
@@ -333,6 +341,7 @@ class GestureTriggerStateMachine:
                         collector_episode_id,
                         metadata_snapshot,
                         "collector saved the episode outside the gesture STOP path",
+                        collector_save_progress_token,
                     )
                 if (
                     collector_last_episode_id == expected_episode_id
@@ -346,7 +355,7 @@ class GestureTriggerStateMachine:
                     "collector returned to IDLE before the gesture STOP command"
                 )
                 return []
-            if collector_mode == "NEED_TO_SAVE":
+            if collector_mode in ("NEED_TO_SAVE", "SAVING"):
                 if collector_episode_id not in ("", expected_episode_id):
                     self._pause_failed(
                         "collector is saving a different episode while gesture recording"
@@ -358,6 +367,7 @@ class GestureTriggerStateMachine:
                     collector_episode_id,
                     metadata_snapshot,
                     "collector is saving after an external STOP command",
+                    collector_save_progress_token,
                 )
             if (
                 now_sec - self._recording_started_sec
@@ -383,11 +393,9 @@ class GestureTriggerStateMachine:
         collector_episode_id: str,
         metadata_snapshot: MetadataSnapshot | None,
         reason: str,
+        collector_save_progress_token: str,
     ) -> list[TriggerAction]:
-        self.attempt_state = AttemptState.WAITING_SAVE_METADATA
-        self._save_deadline_sec = (
-            now_sec + self._plan.collector.save_confirm_timeout_sec
-        )
+        self._begin_save_wait(now_sec, collector_save_progress_token)
         self.metadata_match_reason = reason
         if metadata_snapshot is None:
             return []
@@ -396,6 +404,7 @@ class GestureTriggerStateMachine:
             collector_mode,
             collector_episode_id,
             now_sec,
+            collector_save_progress_token,
         )
 
     def abort_active_attempt(
@@ -514,6 +523,7 @@ class GestureTriggerStateMachine:
         collector_last_command: str,
         collector_last_command_outcome: str,
         collector_last_command_episode_id: str,
+        collector_save_progress_token: str,
         now_sec: float,
     ) -> list[TriggerAction]:
         if self.current_attempt is None:
@@ -536,9 +546,9 @@ class GestureTriggerStateMachine:
                 f"expected {expected_episode_id!r}, got {collector_episode_id!r}"
             )
             return []
-        if collector_mode in ("NEED_TO_SAVE", "IDLE"):
+        if collector_mode in ("NEED_TO_SAVE", "SAVING", "IDLE"):
             if (
-                collector_mode == "NEED_TO_SAVE"
+                collector_mode in ("NEED_TO_SAVE", "SAVING")
                 and collector_episode_id
                 and collector_episode_id != expected_episode_id
             ):
@@ -551,11 +561,14 @@ class GestureTriggerStateMachine:
                 matching_receipt
                 and collector_last_command_outcome == "SUCCEEDED"
             ):
-                self.attempt_state = AttemptState.WAITING_SAVE_METADATA
-                self._save_deadline_sec = (
-                    now_sec + self._plan.collector.save_confirm_timeout_sec
-                )
+                self._begin_save_wait(now_sec, collector_save_progress_token)
                 self.metadata_match_reason = "waiting for metadata save confirmation"
+                return []
+            if collector_mode in ("NEED_TO_SAVE", "SAVING"):
+                self._begin_save_wait(now_sec, collector_save_progress_token)
+                self.metadata_match_reason = (
+                    "collector state confirms save after STOP receipt loss"
+                )
                 return []
         if collector_mode == "FAILED":
             return self._begin_discard(
@@ -624,7 +637,8 @@ class GestureTriggerStateMachine:
         expected_episode_id = self.current_attempt.episode_id
         expected_command_id = self._current_action("DISCARD").command_id
         if (
-            collector_mode in ("RECORDING", "NEED_TO_SAVE", "FAILED", "DISCARD")
+            collector_mode
+            in ("RECORDING", "NEED_TO_SAVE", "SAVING", "FAILED", "DISCARD")
             and collector_episode_id
             and collector_episode_id != expected_episode_id
         ):
@@ -701,25 +715,96 @@ class GestureTriggerStateMachine:
             command_id=self._command_ids[command],
         )
 
+    def _begin_save_wait(
+        self,
+        now_sec: float,
+        collector_save_progress_token: str,
+    ) -> None:
+        self.attempt_state = AttemptState.WAITING_SAVE_METADATA
+        self._save_wait_deadline_sec = (
+            now_sec + self._plan.collector.max_save_wait_sec
+        )
+        self._save_deadline_sec = min(
+            self._save_wait_deadline_sec,
+            now_sec + self._plan.collector.save_confirm_timeout_sec,
+        )
+        self._last_save_progress_seq = self._parse_save_progress_seq(
+            collector_save_progress_token
+        )
+
+    def _observe_save_progress(
+        self,
+        now_sec: float,
+        collector_save_progress_token: str,
+    ) -> None:
+        if now_sec >= self._save_wait_deadline_sec:
+            return
+        progress_seq = self._parse_save_progress_seq(
+            collector_save_progress_token
+        )
+        if progress_seq is None:
+            return
+        if (
+            self._last_save_progress_seq is not None
+            and progress_seq <= self._last_save_progress_seq
+        ):
+            return
+        self._last_save_progress_seq = progress_seq
+        self._save_deadline_sec = min(
+            self._save_wait_deadline_sec,
+            now_sec + self._plan.collector.save_confirm_timeout_sec,
+        )
+
+    def _save_wait_timed_out(self, now_sec: float) -> bool:
+        return now_sec >= min(
+            self._save_deadline_sec,
+            self._save_wait_deadline_sec,
+        )
+
+    @staticmethod
+    def _parse_save_progress_seq(value: str) -> int | None:
+        try:
+            progress_seq = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        return progress_seq if progress_seq >= 0 else None
+
     def _handle_waiting_save(
         self,
         snapshot: MetadataSnapshot,
         collector_mode: str,
         collector_episode_id: str,
         now_sec: float,
+        collector_save_progress_token: str,
     ) -> list[TriggerAction]:
+        if self.current_attempt is None:
+            self._pause_failed("waiting for save confirmation without a current attempt")
+            return []
+        if collector_mode == "SAVING":
+            expected_episode_id = self.current_attempt.episode_id
+            if collector_episode_id not in ("", expected_episode_id):
+                self._pause_failed(
+                    "collector is saving a different episode: "
+                    f"expected {expected_episode_id!r}, got {collector_episode_id!r}"
+                )
+                return []
+            self._observe_save_progress(now_sec, collector_save_progress_token)
+        if now_sec >= self._save_wait_deadline_sec:
+            return self._discard_owned_save_timeout(
+                "maximum save reconciliation wait exceeded",
+                collector_mode,
+                collector_episode_id,
+                now_sec,
+            )
         if snapshot.parse_error:
             self.metadata_match_reason = snapshot.parse_error
-            if now_sec >= self._save_deadline_sec:
+            if self._save_wait_timed_out(now_sec):
                 return self._discard_owned_save_timeout(
                     snapshot.parse_error,
                     collector_mode,
                     collector_episode_id,
                     now_sec,
                 )
-            return []
-        if self.current_attempt is None:
-            self._pause_failed("waiting for save confirmation without a current attempt")
             return []
         status = snapshot.status_for(
             PlannedTrial(
@@ -746,7 +831,7 @@ class GestureTriggerStateMachine:
                 if status.latest_attempt_index > self.current_attempt.attempt_index:
                     self.attempt_state = AttemptState.PAUSED_AMBIGUOUS_METADATA
                     self.last_error = self.metadata_match_reason
-                elif now_sec >= self._save_deadline_sec:
+                elif self._save_wait_timed_out(now_sec):
                     self._pause_failed(self.metadata_match_reason)
                 return []
             if collector_mode == "FAILED":
@@ -756,7 +841,7 @@ class GestureTriggerStateMachine:
                 self.attempt_state = AttemptState.SAVED
                 self.last_error = ""
                 return []
-            if now_sec >= self._save_deadline_sec:
+            if self._save_wait_timed_out(now_sec):
                 self._pause_failed(
                     "metadata saved but collector did not return to IDLE before timeout"
                 )
@@ -786,7 +871,7 @@ class GestureTriggerStateMachine:
             )
             return []
 
-        if now_sec >= self._save_deadline_sec:
+        if self._save_wait_timed_out(now_sec):
             return self._discard_owned_save_timeout(
                 "save confirmation timed out without matching metadata",
                 collector_mode,
@@ -805,6 +890,9 @@ class GestureTriggerStateMachine:
         if self.current_attempt is None:
             self._pause_failed(message)
             return []
+        # SAVING is deliberately excluded: a durable commit cannot be cancelled
+        # safely. Only a newer save_progress_seq renews the rolling deadline;
+        # timeout pauses instead of issuing a concurrent DISCARD.
         if collector_mode in {"RECORDING", "NEED_TO_SAVE", "FAILED", "DISCARD"}:
             if collector_episode_id in ("", self.current_attempt.episode_id):
                 return self._begin_discard(message, now_sec)

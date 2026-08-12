@@ -18,6 +18,9 @@ if(BUILD_TESTING)
     ament_add_pytest_test(test_collector_state test/test_collector_state.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
+    ament_add_pytest_test(test_save_worker test/test_save_worker.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
     ament_add_pytest_test(test_camera_cache test/test_camera_cache.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )

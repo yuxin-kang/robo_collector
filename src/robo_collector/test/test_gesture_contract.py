@@ -143,6 +143,17 @@ class GestureContractTest(unittest.TestCase):
             gesture_plan_from_payload(payload)
 
         payload = _plan_payload()
+        payload["collector"]["max_save_wait_sec"] = 0
+        with self.assertRaisesRegex(GesturePlanError, "max_save_wait_sec"):
+            gesture_plan_from_payload(payload)
+
+        payload = _plan_payload()
+        payload["collector"]["save_confirm_timeout_sec"] = 10
+        payload["collector"]["max_save_wait_sec"] = 9
+        with self.assertRaisesRegex(GesturePlanError, "max_save_wait_sec"):
+            gesture_plan_from_payload(payload)
+
+        payload = _plan_payload()
         payload["collector"]["auto_discard"] = True
         with self.assertRaisesRegex(GesturePlanError, "auto_discard=true is not implemented"):
             gesture_plan_from_payload(payload)

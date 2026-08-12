@@ -80,9 +80,51 @@ class RecordStateMachineTest(unittest.TestCase):
         self.assertTrue(stop.should_save)
         self.assertEqual(machine.mode, CollectorMode.NEED_TO_SAVE)
 
+        machine.mark_saving()
+        self.assertEqual(machine.mode, CollectorMode.SAVING)
+
         machine.mark_saved()
         self.assertEqual(machine.mode, CollectorMode.IDLE)
         self.assertIsNone(machine.session)
+
+    def test_discard_is_rejected_while_save_is_running(self):
+        machine = RecordStateMachine()
+        machine.handle_command(
+            RecordCommandType.START,
+            task_prompt="pick up the cup",
+            episode_id="ep-a",
+        )
+        machine.handle_command(RecordCommandType.STOP, episode_id="ep-a")
+        machine.mark_saving()
+
+        discard = machine.handle_command(
+            RecordCommandType.DISCARD,
+            episode_id="ep-a",
+        )
+
+        self.assertFalse(discard.accepted)
+        self.assertFalse(discard.should_discard)
+        self.assertEqual(machine.mode, CollectorMode.SAVING)
+
+    def test_failed_background_save_can_be_discarded(self):
+        machine = RecordStateMachine()
+        machine.handle_command(
+            RecordCommandType.START,
+            task_prompt="pick up the cup",
+            episode_id="ep-a",
+        )
+        machine.handle_command(RecordCommandType.STOP, episode_id="ep-a")
+        machine.mark_saving()
+
+        machine.mark_failed("metadata commit failed")
+        discard = machine.handle_command(
+            RecordCommandType.DISCARD,
+            episode_id="ep-a",
+        )
+
+        self.assertTrue(discard.accepted)
+        self.assertTrue(discard.should_discard)
+        self.assertEqual(machine.mode, CollectorMode.DISCARD)
 
     def test_start_requires_task_prompt(self):
         machine = RecordStateMachine()

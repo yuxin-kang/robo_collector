@@ -28,7 +28,8 @@ from .field_config import (
     default_field_selection,
     load_optional_field_selection,
 )
-from .lerobot_dataset import LeRobotV21Writer, RobotFrame
+from .lerobot_dataset import LeRobotV21Writer, RobotFrame, SaveResult
+from .save_worker import EpisodeSaveWorker
 from .sample_alignment import (
     message_stamp_sec,
     selected_missing_inputs,
@@ -67,6 +68,7 @@ class LeRobotCollectorNode(Node):
         self.declare_parameter("max_episode_duration_sec", 600.0)
         self.declare_parameter("max_episode_frames", 18000)
         self.declare_parameter("min_free_disk_bytes", 2147483648)
+        self.declare_parameter("save_shutdown_grace_sec", 10.0)
 
         self._fps = int(self.get_parameter("fps").value)
         self._robo_state_topic = str(self.get_parameter("robo_state_topic").value)
@@ -91,6 +93,9 @@ class LeRobotCollectorNode(Node):
         self._min_free_disk_bytes = int(
             self.get_parameter("min_free_disk_bytes").value
         )
+        self._save_shutdown_grace_sec = float(
+            self.get_parameter("save_shutdown_grace_sec").value
+        )
         for name, value in (
             ("fps", self._fps),
             ("max_state_age_sec", self._max_state_age_sec),
@@ -98,6 +103,7 @@ class LeRobotCollectorNode(Node):
             ("max_inter_camera_skew_sec", self._max_inter_camera_skew_sec),
             ("max_state_camera_skew_sec", self._max_state_camera_skew_sec),
             ("max_episode_duration_sec", self._max_episode_duration_sec),
+            ("save_shutdown_grace_sec", self._save_shutdown_grace_sec),
         ):
             if not math.isfinite(value) or value <= 0:
                 raise RuntimeError(f"{name} must be finite and positive")
@@ -132,6 +138,14 @@ class LeRobotCollectorNode(Node):
             ],
             field_selection=self._field_selection,
         )
+        self._save_worker = EpisodeSaveWorker[SaveResult]()
+        self._save_started_monotonic_sec: float | None = None
+        self._save_finished_monotonic_sec: float | None = None
+        self._save_progress_monotonic_sec: float | None = None
+        self._save_progress_seq = 0
+        self._save_phase = ""
+        self._saving_episode_index: int | None = None
+        self._saving_frame_count = 0
         self._latest_state: CachedStateSample | None = None
         self._last_warn_message = ""
         self._last_warn_monotonic_sec = 0.0
@@ -190,6 +204,18 @@ class LeRobotCollectorNode(Node):
 
     def destroy_node(self) -> bool:
         self._camera_cache.stop()
+        save_finished = self._save_worker.shutdown(
+            timeout=self._save_shutdown_grace_sec
+        )
+        if not save_finished:
+            self.get_logger().warn(
+                "episode save is still running after the "
+                f"{self._save_shutdown_grace_sec:.3f}s shutdown grace period; "
+                "waiting for the durable transaction to finish"
+            )
+            self._save_worker.shutdown()
+        if self._state_machine.mode == CollectorMode.SAVING:
+            self._poll_save_episode()
         if self._writer.active_episode_index is not None:
             try:
                 self._writer.discard_episode()
@@ -276,6 +302,7 @@ class LeRobotCollectorNode(Node):
                     DiagnosticStatus.ERROR, f"failed to start episode: {exc}"
                 )
                 return
+            self._clear_save_tracking()
             self._last_recorded_camera_identity = None
             self._last_command_outcome = "SUCCEEDED"
             self._command_receipts.remember(
@@ -318,7 +345,10 @@ class LeRobotCollectorNode(Node):
 
     def _record_tick(self) -> None:
         if self._state_machine.mode == CollectorMode.NEED_TO_SAVE:
-            self._save_episode()
+            self._begin_save_episode()
+            return
+        if self._state_machine.mode == CollectorMode.SAVING:
+            self._poll_save_episode()
             return
         if self._state_machine.mode == CollectorMode.FAILED:
             self._publish_failed_status_throttled()
@@ -488,13 +518,59 @@ class LeRobotCollectorNode(Node):
         self._publish_status(DiagnosticStatus.WARN, f"SAFETY DISCARD: {reason}; IDLE")
         return True
 
-    def _save_episode(self) -> None:
+    def _begin_save_episode(self) -> None:
+        if self._save_worker.has_active:
+            reason = "cannot start save because another save task is active"
+            self._state_machine.mark_failed(reason)
+            self._publish_status(DiagnosticStatus.ERROR, reason)
+            return
+
+        self._saving_episode_index = self._writer.active_episode_index
+        self._saving_frame_count = self._writer.active_frame_count
+        self._save_started_monotonic_sec = time.monotonic()
+        self._save_finished_monotonic_sec = None
+        self._save_progress_monotonic_sec = self._save_started_monotonic_sec
+        self._save_progress_seq = 0
+        self._save_phase = "queued"
+        self._state_machine.mark_saving()
+        try:
+            self._save_worker.start(
+                lambda report_progress: self._writer.save_episode(
+                    progress_callback=report_progress
+                )
+            )
+        except Exception as exc:
+            reason = f"failed to start save worker: {exc}"
+            self._state_machine.mark_failed(reason)
+            self._save_phase = "failed"
+            self._save_finished_monotonic_sec = time.monotonic()
+            self._save_progress_monotonic_sec = self._save_finished_monotonic_sec
+            self._publish_status(
+                DiagnosticStatus.ERROR,
+                f"save failed; DISCARD required: {reason}",
+            )
+            return
+
+        self._publish_status(
+            DiagnosticStatus.OK,
+            self._saving_status_message(),
+        )
+
+    def _poll_save_episode(self) -> None:
+        self._drain_save_progress()
+        if not self._save_worker.done:
+            return
+
         session = self._state_machine.session
         try:
-            result = self._writer.save_episode()
+            result = self._save_worker.take_result()
+            self._drain_save_progress()
         except Exception as exc:
             reason = self._writer.active_failed_reason or str(exc)
             self._state_machine.mark_failed(reason)
+            self._save_phase = "failed"
+            self._save_finished_monotonic_sec = time.monotonic()
+            self._save_progress_monotonic_sec = self._save_finished_monotonic_sec
             self._publish_status(
                 DiagnosticStatus.ERROR,
                 f"save failed; DISCARD required: {reason}",
@@ -502,6 +578,9 @@ class LeRobotCollectorNode(Node):
             return
 
         self._state_machine.mark_saved()
+        self._save_phase = "complete"
+        self._save_finished_monotonic_sec = time.monotonic()
+        self._save_progress_monotonic_sec = self._save_finished_monotonic_sec
         self._last_episode_id = session.episode_id if session is not None else ""
         self._last_episode_outcome = "SAVED" if result.saved else "DISCARDED"
         level = DiagnosticStatus.OK if result.saved else DiagnosticStatus.WARN
@@ -514,6 +593,7 @@ class LeRobotCollectorNode(Node):
         )
 
     def _publish_periodic_status(self) -> None:
+        self._drain_save_progress()
         message = self._state_machine.mode.value
         level = DiagnosticStatus.OK
         if self._state_machine.mode == CollectorMode.RECORDING:
@@ -521,6 +601,8 @@ class LeRobotCollectorNode(Node):
                 f"RECORDING episode={self._writer.active_episode_index} "
                 f"frames={self._writer.active_frame_count}"
             )
+        elif self._state_machine.mode == CollectorMode.SAVING:
+            message = self._saving_status_message()
         elif self._state_machine.mode == CollectorMode.FAILED:
             message = (
                 "FAILED: DISCARD required: "
@@ -537,6 +619,41 @@ class LeRobotCollectorNode(Node):
                 level = DiagnosticStatus.WARN
             message = f"{message}; {'; '.join(warnings)}"
         self._publish_status(level, message)
+
+    def _drain_save_progress(self) -> None:
+        for progress in self._save_worker.drain_progress():
+            self._save_phase = progress.phase
+            self._save_progress_monotonic_sec = progress.monotonic_sec
+            self._save_progress_seq += 1
+
+    def _clear_save_tracking(self) -> None:
+        self._save_started_monotonic_sec = None
+        self._save_finished_monotonic_sec = None
+        self._save_progress_monotonic_sec = None
+        self._save_progress_seq = 0
+        self._save_phase = ""
+        self._saving_episode_index = None
+        self._saving_frame_count = 0
+
+    def _saving_status_message(self) -> str:
+        episode = (
+            ""
+            if self._saving_episode_index is None
+            else str(self._saving_episode_index)
+        )
+        return (
+            f"SAVING episode={episode} frames={self._saving_frame_count} "
+            f"phase={self._save_phase or 'queued'} "
+            f"elapsed={self._save_elapsed_sec():.3f}s"
+        )
+
+    def _save_elapsed_sec(self) -> float:
+        started = self._save_started_monotonic_sec
+        if started is None:
+            return 0.0
+        finished = self._save_finished_monotonic_sec
+        end = finished if finished is not None else time.monotonic()
+        return max(0.0, end - started)
 
     def _publish_failed_status_throttled(self) -> None:
         self._publish_status_throttled(
@@ -574,6 +691,17 @@ class LeRobotCollectorNode(Node):
         if self._latest_state is not None:
             state_age = (
                 f"{time.monotonic() - self._latest_state.received_monotonic_sec:.3f}"
+            )
+        if self._state_machine.mode == CollectorMode.SAVING:
+            active_episode = self._saving_episode_index
+            active_frames = self._saving_frame_count
+        else:
+            active_episode = self._writer.active_episode_index
+            active_frames = self._writer.active_frame_count
+        save_progress_age = ""
+        if self._save_progress_monotonic_sec is not None:
+            save_progress_age = (
+                f"{max(0.0, time.monotonic() - self._save_progress_monotonic_sec):.3f}"
             )
         status = DiagnosticStatus()
         status.level = _diagnostic_level_value(level)
@@ -613,8 +741,12 @@ class LeRobotCollectorNode(Node):
                 key="last_episode_outcome", value=self._last_episode_outcome
             ),
             KeyValue(key="fps", value=str(self._fps)),
-            KeyValue(key="active_episode", value=str(self._writer.active_episode_index)),
-            KeyValue(key="active_frames", value=str(self._writer.active_frame_count)),
+            KeyValue(key="active_episode", value=str(active_episode)),
+            KeyValue(key="active_frames", value=str(active_frames)),
+            KeyValue(key="save_phase", value=self._save_phase),
+            KeyValue(key="save_progress_seq", value=str(self._save_progress_seq)),
+            KeyValue(key="save_elapsed_sec", value=f"{self._save_elapsed_sec():.3f}"),
+            KeyValue(key="save_progress_age_sec", value=save_progress_age),
             KeyValue(key="max_state_age_sec", value=str(self._max_state_age_sec)),
             KeyValue(key="max_camera_age_sec", value=str(self._max_camera_age_sec)),
             KeyValue(
