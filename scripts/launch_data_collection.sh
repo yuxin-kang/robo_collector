@@ -13,6 +13,12 @@ FPS="30"
 MAX_EPISODE_DURATION_SEC="600.0"
 MAX_EPISODE_FRAMES="18000"
 MIN_FREE_DISK_BYTES="2147483648"
+MAX_CAMERA_CLOCK_MAPPING_UNCERTAINTY_SEC="0.05"
+RECORDING_MODE="raw_first"
+RAW_EPISODE_ROOT=""
+RAW_SOURCE_SCOPE="transport_observed"
+CAMERA_RAW_SPOOL_ROOT=""
+CAMERA_CALLBACK_QUEUE_SIZE="128"
 PRINT_ROS_SETUP=0
 
 while [[ $# -gt 0 ]]; do
@@ -66,6 +72,30 @@ while [[ $# -gt 0 ]]; do
       MIN_FREE_DISK_BYTES="$2"
       shift 2
       ;;
+    --max-camera-clock-mapping-uncertainty-sec)
+      MAX_CAMERA_CLOCK_MAPPING_UNCERTAINTY_SEC="$2"
+      shift 2
+      ;;
+    --recording-mode)
+      RECORDING_MODE="$2"
+      shift 2
+      ;;
+    --raw-episode-root)
+      RAW_EPISODE_ROOT="$2"
+      shift 2
+      ;;
+    --raw-source-scope)
+      RAW_SOURCE_SCOPE="$2"
+      shift 2
+      ;;
+    --camera-raw-spool-root)
+      CAMERA_RAW_SPOOL_ROOT="$2"
+      shift 2
+      ;;
+    --camera-callback-queue-size)
+      CAMERA_CALLBACK_QUEUE_SIZE="$2"
+      shift 2
+      ;;
     --print-ros-setup)
       PRINT_ROS_SETUP=1
       shift
@@ -111,7 +141,16 @@ COLLECTOR_ARGS=(
   "-p" "max_episode_duration_sec:=${MAX_EPISODE_DURATION_SEC}"
   "-p" "max_episode_frames:=${MAX_EPISODE_FRAMES}"
   "-p" "min_free_disk_bytes:=${MIN_FREE_DISK_BYTES}"
+  "-p" "max_camera_clock_mapping_uncertainty_sec:=${MAX_CAMERA_CLOCK_MAPPING_UNCERTAINTY_SEC}"
+  "-p" "recording_mode:=${RECORDING_MODE}"
+  "-p" "raw_source_scope:=${RAW_SOURCE_SCOPE}"
+  "-p" "camera_raw_spool_root:=${CAMERA_RAW_SPOOL_ROOT}"
+  "-p" "camera_callback_queue_size:=${CAMERA_CALLBACK_QUEUE_SIZE}"
 )
+
+if [[ -n "$RAW_EPISODE_ROOT" ]]; then
+  COLLECTOR_ARGS+=("-p" "raw_episode_root:=${RAW_EPISODE_ROOT}")
+fi
 
 if [[ -n "$CAMERA_STREAMS" ]]; then
   COLLECTOR_ARGS+=("-p" "camera_streams:=${CAMERA_STREAMS}")

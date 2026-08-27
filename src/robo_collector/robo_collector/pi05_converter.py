@@ -5,12 +5,21 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from uuid import uuid4
 
+from .conversion_provenance import (
+    is_raw_episode,
+    materialize_raw_source,
+    reusable_conversion,
+    validate_raw_source_ready,
+    write_conversion_provenance,
+    episode_provenance_from_row,
+)
 from .lerobot_dataset import DOF
 
 
@@ -63,6 +72,7 @@ class _EpisodePlan:
     source_video_paths: dict[str, Path]
     image_shapes: dict[str, tuple[int, int, int]]
     dest_data_rel_path: Path
+    source_provenance: dict[str, Any] = field(default_factory=dict)
 
 
 def convert_dataset(
@@ -76,6 +86,7 @@ def convert_dataset(
     history_window_index: int = -1,
     frame_reader_factory: FrameReaderFactory | None = None,
     image_encoder: ImageEncoder | None = None,
+    _provenance_source_dataset: Path | None = None,
 ) -> ConversionResult:
     source_root_path = Path(source_root).resolve()
     dest_root_path = Path(dest_root).resolve()
@@ -95,11 +106,58 @@ def convert_dataset(
     if not source_dataset.is_dir():
         raise ConversionError(f"source dataset is not a directory: {source_dataset}")
 
+    if is_raw_episode(source_dataset):
+        # Validate the current source before checking an existing output.  A
+        # READY conversion must not be reused after raw QC moves to REVIEW or
+        # REJECT.
+        try:
+            validate_raw_source_ready(source_dataset)
+        except ValueError as exc:
+            raise ConversionError(str(exc)) from exc
+
     output_dataset = dest_root_path / output_dataset_name
+    conversion_config = {
+        "action_key": action_key,
+        "history_window_index": history_window_index,
+        "output_name": output_dataset_name,
+        "state_key": state_key,
+    }
     if output_dataset.exists():
-        raise ConversionError(
-            f"output dataset already exists: {output_dataset}; choose a new --output-name"
+        if not reusable_conversion(output_dataset, source_dataset,
+                                   converter_version="robo_collector.pi05_converter.v1",
+                                   output_schema_version="openpi.pi05.v1",
+                                   conversion_config=conversion_config):
+            raise ConversionError(f"output dataset already exists and is not a complete matching conversion: {output_dataset}")
+        info = _load_json(output_dataset / "meta/info.json")
+        return ConversionResult(source_dataset, output_dataset, int(info["total_episodes"]), int(info["total_frames"]), state_key, action_key)
+
+    if is_raw_episode(source_dataset):
+        temporary_root, materialized_dataset = materialize_raw_source(
+            source_dataset, dest_root_path
         )
+        try:
+            converted = convert_dataset(
+                materialized_dataset.parent,
+                materialized_dataset.name,
+                dest_root_path,
+                output_name=output_dataset_name,
+                state_key=state_key,
+                action_key=action_key,
+                history_window_index=history_window_index,
+                frame_reader_factory=frame_reader_factory,
+                image_encoder=image_encoder,
+                _provenance_source_dataset=source_dataset,
+            )
+            return ConversionResult(
+                source_dataset=source_dataset,
+                output_dataset=converted.output_dataset,
+                episode_count=converted.episode_count,
+                frame_count=converted.frame_count,
+                state_key=converted.state_key,
+                action_key=converted.action_key,
+            )
+        finally:
+            shutil.rmtree(temporary_root, ignore_errors=True)
 
     source_info = _load_json(source_dataset / "meta/info.json")
     source_episodes = _load_jsonl(source_dataset / "meta/episodes.jsonl")
@@ -176,7 +234,19 @@ def convert_dataset(
             image_encoder=image_encoder,
             task_lookup=task_lookup,
         )
+        write_conversion_provenance(
+            staging_output,
+            _provenance_source_dataset or source_dataset,
+            converter_version="robo_collector.pi05_converter.v1",
+            output_schema_version="openpi.pi05.v1",
+            conversion_config=conversion_config,
+            action_source=action_key,
+            state_source=state_key,
+            selection_policy="source_frame_index_order",
+        )
+        _fsync_tree(staging_output)
         staging_output.replace(output_dataset)
+        _fsync_dir(dest_root_path)
     except Exception:
         shutil.rmtree(staging_output, ignore_errors=True)
         raise
@@ -189,6 +259,27 @@ def convert_dataset(
         state_key=state_key,
         action_key=action_key,
     )
+
+
+def _fsync_tree(root: Path) -> None:
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+    for path in sorted((p for p in root.rglob("*") if p.is_dir()), reverse=True):
+        _fsync_dir(path)
+    _fsync_dir(root)
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -381,6 +472,7 @@ def _preflight_episode(
         _task_string_from_index(task_lookup, int(task_index))
         for task_index in sorted(task_indices)
     ]
+    source_provenance = episode_provenance_from_row(source_episode)
     return (
         _EpisodePlan(
             episode_index=episode_index,
@@ -391,6 +483,7 @@ def _preflight_episode(
             source_video_paths=source_video_paths,
             image_shapes=image_shapes,
             dest_data_rel_path=_dest_data_rel_path(episode_index),
+            source_provenance=source_provenance,
         ),
         next_task_index,
     )
@@ -438,6 +531,12 @@ def _materialize_dataset(
             "episode_index": episode_plan.episode_index,
             "tasks": episode_plan.task_strings,
             "length": episode_plan.frame_count,
+            **episode_plan.source_provenance,
+            **(
+                {"source_provenance": dict(episode_plan.source_provenance)}
+                if episode_plan.source_provenance
+                else {}
+            ),
         }
         for episode_plan in episode_plans
     ]

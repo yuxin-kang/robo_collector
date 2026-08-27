@@ -7,12 +7,14 @@ import hashlib
 import json
 import math
 import os
+import shutil
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, Protocol, TextIO
+from typing import Any, Callable, Protocol, Sequence, TextIO
 from uuid import uuid4
 
 from .field_config import FieldSelection, default_field_selection
@@ -30,6 +32,15 @@ ROBO_COLLECTOR_SCHEMA_VERSION = 1
 TIMELINE_SEMANTICS = "fixed_rate_v1"
 SOURCE_STATE_TIMESTAMP_KEY = "source_timestamp.state"
 SOURCE_CAMERA_TIMESTAMP_PREFIX = "source_timestamp.camera."
+ALIGNMENT_SELECTION_POLICY_KEY = "alignment.selection_policy"
+ALIGNMENT_RESIDUAL_KEY = "alignment.residual_sec"
+ALIGNMENT_SOURCE_PREFIX = "alignment.source."
+ALIGNMENT_SELECTED_TIMESTAMP_KEY = "selected_dataset_timestamp"
+ALIGNMENT_TARGET_SOURCE_TIMESTAMP_KEY = "alignment.target_source_timestamp_sec"
+ALIGNMENT_ACTION_POLICY_KEY = "alignment.action_policy"
+ALIGNMENT_STATE_RESIDUAL_KEY = "alignment.state_residual_sec"
+ALIGNMENT_ACTION_SEQUENCE_KEY = "alignment.action.sequence"
+ALIGNMENT_CAMERA_RESIDUAL_PREFIX = "alignment.camera_residual."
 STATE_FIELD_SHAPES = {
     "joint_position": [DOF],
     "joint_velocity": [DOF],
@@ -63,6 +74,46 @@ class VideoSink(Protocol):
 
 ParquetWriter = Callable[[Path, list[dict[str, Any]]], None]
 VideoSinkFactory = Callable[[Path, int, tuple[int, int]], VideoSink]
+
+
+def video_encoder_identity() -> dict[str, str]:
+    """Return JSON-safe identity for the video backend used by this writer."""
+    try:
+        import cv2
+
+        version = str(getattr(cv2, "__version__", "unknown"))
+    except ImportError:  # pragma: no cover - optional writer dependency
+        version = "unavailable"
+    return {
+        "library": "opencv",
+        "library_version": version,
+        "backend": "cv2.VideoWriter",
+        "codec": "mp4v",
+    }
+
+
+def recover_dataset_metadata(
+    root_output_dir: str | Path,
+    dataset_name: str,
+) -> dict[str, Any]:
+    """Recover and read the committed dataset metadata under its lock.
+
+    Materialization recovery must not infer publication from one metadata file.
+    This helper first resolves any interrupted all-files transaction while
+    holding the same metadata lock used by the writer, then parses the complete
+    ``tasks``/``episodes``/``info``/``modality`` set.  A missing set is returned
+    as ``present=False``; a partial or malformed set raises so callers fail
+    closed instead of guessing which publication phase won.
+    """
+    root = _validated_dataset_root(Path(root_output_dir).resolve(), dataset_name)
+    meta_dir = root / "meta"
+    with _metadata_files_lock(meta_dir, exclusive=True):
+        recovered_phase = _recover_files_transaction_locked(
+            meta_dir / METADATA_TRANSACTION_FILENAME
+        )
+        metadata = _read_metadata_documents_locked(meta_dir)
+    metadata["recovered_transaction_phase"] = recovered_phase
+    return metadata
 
 
 @dataclass(frozen=True)
@@ -131,7 +182,16 @@ class _ActiveEpisode:
     artifacts_committed: bool = False
     committed_artifact_rel_paths: set[Path] = field(default_factory=set)
     artifact_integrity: dict[str, Any] = field(default_factory=dict)
+    source_provenance: dict[str, Any] = field(default_factory=dict)
     failed_reason: str | None = None
+    alignment_feature_keys: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class _PendingPublication:
+    episodes: list[dict[str, Any]]
+    total_frames: int
+    tasks_by_text: dict[str, int]
 
 
 class LeRobotV21Writer:
@@ -183,11 +243,13 @@ class LeRobotV21Writer:
         self._total_frames = 0
         self._image_shapes: dict[str, tuple[int, int, int]] = {}
         self._joint_names: list[str] = []
+        self._alignment_feature_keys: set[str] = set()
         self._validated_artifact_fingerprints: dict[
             Path, tuple[int, int, int, str]
         ] = {}
         self._dataset_lock_fd: int | None = None
         self._operation_lock = Lock()
+        self._pending_publication: _PendingPublication | None = None
         if not self._metadata_transaction_path().exists():
             self._load_existing_metadata()
 
@@ -205,9 +267,54 @@ class LeRobotV21Writer:
             return ""
         return self._active.failed_reason
 
+    def get_encoder_identity(self) -> dict[str, Any]:
+        """Return the encoder/backend identity for the active video sinks.
+
+        The generic writer API also supports injected sinks for tests and
+        deployments.  Those sinks may not expose encoder metadata, so retain
+        the stable OpenCV fallback while reporting per-camera identities when
+        the concrete sink provides them.
+        """
+        active = self._active
+        if active is None or not active.video_sinks:
+            return video_encoder_identity()
+        identities: dict[str, dict[str, Any]] = {}
+        for camera_key, sink in active.video_sinks.items():
+            identity = getattr(sink, "encoder_identity", None)
+            if isinstance(identity, Mapping) and identity:
+                identities[str(camera_key)] = dict(identity)
+        if not identities:
+            return video_encoder_identity()
+        serialized = {
+            json.dumps(value, sort_keys=True, separators=(",", ":"))
+            for value in identities.values()
+        }
+        if len(serialized) == 1:
+            return dict(next(iter(identities.values())))
+        return {"per_camera": identities}
+
     def start_episode(self, task_prompt: str, episode_id: str = "") -> int:
         with self._writer_operation("start an episode"):
             return self._start_episode(task_prompt, episode_id)
+
+    def set_episode_provenance(self, provenance: Mapping[str, Any]) -> None:
+        """Attach immutable source/conversion provenance to the active episode."""
+        if not isinstance(provenance, Mapping):
+            raise TypeError("episode provenance must be a mapping")
+        try:
+            normalized = json.loads(
+                json.dumps(
+                    dict(provenance),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"episode provenance is not JSON serializable: {exc}") from exc
+        with self._writer_operation("set episode provenance"):
+            active = self._require_active()
+            active.source_provenance = normalized
 
     def _start_episode(self, task_prompt: str, episode_id: str = "") -> int:
         if self._active is not None:
@@ -247,12 +354,14 @@ class LeRobotV21Writer:
         rgb_frame: Any,
         *,
         camera_timestamps_sec: dict[str, float | None] | None = None,
+        alignment_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         with self._writer_operation("add a frame"):
             self._add_frame(
                 frame,
                 rgb_frame,
                 camera_timestamps_sec=camera_timestamps_sec,
+                alignment_metadata=alignment_metadata,
             )
 
     def _add_frame(
@@ -261,6 +370,7 @@ class LeRobotV21Writer:
         rgb_frame: Any,
         *,
         camera_timestamps_sec: dict[str, float | None] | None = None,
+        alignment_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         if self._active is None:
             raise RuntimeError("cannot add a frame before start_episode")
@@ -271,6 +381,21 @@ class LeRobotV21Writer:
                 f"{active.failed_reason}"
             )
         _validate_robot_frame(frame)
+        alignment_fields = _alignment_row_fields(
+            alignment_metadata, self.camera_streams
+        )
+        expected_alignment_fields = set(self._alignment_feature_keys)
+        if self._episodes and set(alignment_fields) != expected_alignment_fields:
+            raise ValueError(
+                "alignment metadata fields do not match the existing dataset; "
+                "use a new dataset or provide the same per-row provenance"
+            )
+        if active.frame_count == 0:
+            active.alignment_feature_keys = tuple(sorted(alignment_fields))
+        elif set(alignment_fields) != set(active.alignment_feature_keys):
+            raise ValueError(
+                "alignment metadata fields must be present on every row in an episode"
+            )
 
         rgb_frames = self._normalize_frame_bundle(rgb_frame)
         shapes = {
@@ -362,6 +487,7 @@ class LeRobotV21Writer:
             row[_source_camera_timestamp_key(camera_stream)] = (
                 camera_source_timestamps[camera_key]
             )
+        row.update(alignment_fields)
         self._append_spooled_row(active, row)
         active.frame_count += 1
 
@@ -704,12 +830,109 @@ class LeRobotV21Writer:
         progress_callback: Callable[[str], None] | None = None,
     ) -> SaveResult:
         with self._writer_operation("save an episode"):
-            return self._save_episode(progress_callback=progress_callback)
+            return self._save_episode(
+                progress_callback=progress_callback, publish_metadata=True
+            )
+
+    def save_episode_unpublished(
+        self,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> SaveResult:
+        """Write and validate artifacts while deferring the dataset index commit.
+
+        Raw materialization uses this boundary to run QC before the episode is
+        visible in the shared LeRobot metadata.  The dataset lock remains held
+        until either :meth:`publish_unpublished_episode` or
+        :meth:`retain_unpublished_episode` is called.
+        """
+        with self._writer_operation("stage an episode"):
+            return self._save_episode(
+                progress_callback=progress_callback, publish_metadata=False
+            )
+
+    def publish_unpublished_episode(self) -> SaveResult:
+        """Commit a previously staged episode into the shared dataset index."""
+        with self._writer_operation("publish an episode"):
+            active = self._require_active()
+            pending = self._pending_publication
+            if pending is None:
+                raise RuntimeError("no unpublished episode is waiting for publication")
+            self._write_metadata(
+                active,
+                episodes=pending.episodes,
+                total_frames=pending.total_frames,
+                tasks_by_text=pending.tasks_by_text,
+            )
+            self._episodes = pending.episodes
+            self._total_frames = pending.total_frames
+            self._apply_active_metadata(active)
+            result = self._result_for_active(active, message="episode published")
+            self._finish_active(active)
+            self._pending_publication = None
+            return result
+
+    def retain_unpublished_episode(
+        self,
+        destination: str | Path,
+        *,
+        extra_paths: Sequence[Path] = (),
+    ) -> SaveResult:
+        """Move a non-ready staged episode to an auditable review directory."""
+        with self._writer_operation("retain an unpublished episode"):
+            active = self._require_active()
+            if self._pending_publication is None:
+                raise RuntimeError("no unpublished episode is waiting for retention")
+            destination_path = Path(destination).resolve()
+            destination_path.mkdir(parents=True, exist_ok=False)
+            moves: list[tuple[Path, Path]] = []
+            try:
+                relative_paths = [
+                    active.data_rel_path,
+                    *active.video_rel_paths.values(),
+                ]
+                for relative in relative_paths:
+                    if relative is None:
+                        continue
+                    source = self._root_path(relative)
+                    target = destination_path / relative
+                    _move_durable(source, target)
+                    moves.append((source, target))
+                for extra in extra_paths:
+                    source = Path(extra).resolve()
+                    relative = source.relative_to(self.root)
+                    target = destination_path / relative
+                    _move_durable(source, target)
+                    moves.append((source, target))
+                _fsync_directory(destination_path)
+            except Exception:
+                for source, target in reversed(moves):
+                    if target.exists() and not source.exists():
+                        _move_durable(target, source)
+                shutil.rmtree(destination_path, ignore_errors=True)
+                raise
+            result = self._result_for_active(active, message="episode retained for review")
+            result = SaveResult(
+                saved=result.saved,
+                episode_index=result.episode_index,
+                frame_count=result.frame_count,
+                data_path=destination_path / active.data_rel_path,
+                video_path=destination_path / active.video_rel_paths[self.camera_key],
+                message=result.message,
+                video_paths={
+                    key: destination_path / relative
+                    for key, relative in active.video_rel_paths.items()
+                },
+            )
+            self._finish_active(active)
+            self._pending_publication = None
+            return result
 
     def _save_episode(
         self,
         *,
         progress_callback: Callable[[str], None] | None,
+        publish_metadata: bool,
     ) -> SaveResult:
         active = self._require_active()
         if active.failed_reason is not None:
@@ -798,6 +1021,16 @@ class LeRobotV21Writer:
         episode_record = self._episode_record(active)
         pending_episodes = [*self._episodes, episode_record]
         pending_total_frames = self._total_frames + active.frame_count
+        result = self._result_for_active(active, message="episode staged")
+        if not publish_metadata:
+            self._pending_publication = _PendingPublication(
+                episodes=pending_episodes,
+                total_frames=pending_total_frames,
+                tasks_by_text=dict(self._tasks_by_text),
+            )
+            _report_save_progress(progress_callback, "staged")
+            return result
+
         _report_save_progress(progress_callback, "committing_metadata")
         self._write_metadata(
             active,
@@ -808,21 +1041,7 @@ class LeRobotV21Writer:
 
         self._episodes = pending_episodes
         self._total_frames = pending_total_frames
-        if active.joint_names and not self._joint_names:
-            self._joint_names = list(active.joint_names)
-        self._image_shapes.update(active.image_shapes)
-        result = SaveResult(
-            saved=True,
-            episode_index=active.episode_index,
-            frame_count=active.frame_count,
-            data_path=data_path,
-            video_path=self._root_path(active.video_rel_paths[self.camera_key]),
-            message="episode saved",
-            video_paths={
-                camera_key: self._root_path(video_rel_path)
-                for camera_key, video_rel_path in active.video_rel_paths.items()
-            },
-        )
+        self._apply_active_metadata(active)
         try:
             _report_save_progress(progress_callback, "cleaning_up")
             self._cleanup_active_staging(active, remove_committed=False)
@@ -834,11 +1053,42 @@ class LeRobotV21Writer:
         finally:
             self._active = None
             self._release_dataset_lock()
+            self._pending_publication = None
         _report_save_progress(progress_callback, "complete")
         return result
 
+    def _result_for_active(self, active: _ActiveEpisode, *, message: str) -> SaveResult:
+        assert active.data_rel_path is not None
+        return SaveResult(
+            saved=True,
+            episode_index=active.episode_index,
+            frame_count=active.frame_count,
+            data_path=self._root_path(active.data_rel_path),
+            video_path=self._root_path(active.video_rel_paths[self.camera_key]),
+            message=message,
+            video_paths={
+                camera_key: self._root_path(video_rel_path)
+                for camera_key, video_rel_path in active.video_rel_paths.items()
+            },
+        )
+
+    def _apply_active_metadata(self, active: _ActiveEpisode) -> None:
+        if active.joint_names and not self._joint_names:
+            self._joint_names = list(active.joint_names)
+        self._alignment_feature_keys = set(active.alignment_feature_keys)
+        self._image_shapes.update(active.image_shapes)
+
+    def _finish_active(self, active: _ActiveEpisode) -> None:
+        try:
+            self._cleanup_active_staging(active, remove_committed=False)
+        except OSError:
+            pass
+        finally:
+            self._active = None
+            self._release_dataset_lock()
+
     def _episode_record(self, active: _ActiveEpisode) -> dict[str, Any]:
-        return {
+        record = {
             "episode_index": active.episode_index,
             "episode_id": active.episode_id,
             "task_index": active.task_index,
@@ -855,6 +1105,18 @@ class LeRobotV21Writer:
             "dataset_to_index": active.global_start_index + active.frame_count,
             "integrity": active.artifact_integrity,
         }
+        if active.source_provenance:
+            record["source_provenance"] = dict(active.source_provenance)
+            for field_name in (
+                "source_episode_id",
+                "source_manifest_hash",
+                "conversion_config_hash",
+                "output_schema_version",
+                "selection_policy",
+            ):
+                if field_name in active.source_provenance:
+                    record[field_name] = active.source_provenance[field_name]
+        return record
 
     def discard_episode(self) -> None:
         with self._writer_operation("discard an episode"):
@@ -892,6 +1154,7 @@ class LeRobotV21Writer:
             ):
                 del self._tasks_by_text[active.task_prompt]
             self._active = None
+            self._pending_publication = None
             discarded = True
         finally:
             if discarded:
@@ -963,6 +1226,7 @@ class LeRobotV21Writer:
         self._total_frames = 0
         self._image_shapes = {}
         self._joint_names = []
+        self._alignment_feature_keys = set()
         self._load_existing_metadata()
 
     def _require_active(self) -> _ActiveEpisode:
@@ -1074,6 +1338,9 @@ class LeRobotV21Writer:
                     f"got {sorted(configured_camera_keys)}"
                 )
             self._validate_existing_source_timestamp_features(features)
+            self._alignment_feature_keys = _validate_existing_alignment_features(
+                features
+            )
             for camera_key in self.camera_keys:
                 image_feature = features.get(camera_key, {})
                 shape = image_feature.get("shape")
@@ -1472,13 +1739,18 @@ class LeRobotV21Writer:
             "splits": {"train": f"0:{episode_count}"},
             "data_path": "data/train-{episode_index:06d}.parquet",
             "video_path": "videos/{video_key}/episode_{episode_index:06d}.mp4",
-            "features": self._features(active.image_shapes, active.joint_names),
+            "features": self._features(
+                active.image_shapes,
+                active.joint_names,
+                active.alignment_feature_keys,
+            ),
         }
 
     def _features(
         self,
         active_image_shapes: dict[str, tuple[int, int, int]],
         joint_names: list[str],
+        alignment_feature_keys: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         joint_feature = {
             "dtype": "float32",
@@ -1500,6 +1772,11 @@ class LeRobotV21Writer:
                     "video.height": height,
                     "video.width": width,
                     "video.codec": "mp4v",
+                    "video.encoder": "opencv",
+                    "video.encoder_version": video_encoder_identity()[
+                        "library_version"
+                    ],
+                    "video.encoder_backend": "cv2.VideoWriter",
                     "video.pix_fmt": "yuv420p",
                     "video.is_depth_map": False,
                     "video.fps": self.fps,
@@ -1559,11 +1836,16 @@ class LeRobotV21Writer:
                 for camera_stream in self.camera_streams
             },
         }
+        alignment_features = {
+            key: _alignment_feature_definition(key)
+            for key in alignment_feature_keys
+        }
 
         return {
             **video_features,
             **selected_robot_features,
             **source_timestamp_features,
+            **alignment_features,
             "annotation.human.action.task_description": {
                 "dtype": "string",
                 "shape": [1],
@@ -1621,10 +1903,19 @@ class OpenCvVideoSink:
 
         self.path = path
         self._cv2 = cv2
+        self.encoder_identity = video_encoder_identity()
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self._writer = cv2.VideoWriter(str(path), fourcc, float(fps), frame_size)
         if not self._writer.isOpened():
             raise RuntimeError(f"failed to open video writer for {path}")
+        get_backend_name = getattr(self._writer, "getBackendName", None)
+        if callable(get_backend_name):
+            try:
+                backend = str(get_backend_name()).strip()
+            except Exception:  # pragma: no cover - backend-specific behavior
+                backend = ""
+            if backend:
+                self.encoder_identity["backend"] = backend
 
     def write(self, rgb_frame: Any) -> None:
         import numpy as np
@@ -1729,6 +2020,19 @@ def _arrow_schema_for_row(pa: Any, row: dict[str, Any]) -> Any:
             value_type = pa.list_(pa.float32())
         elif key == "annotation.human.action.task_description":
             value_type = pa.string()
+        elif key == ALIGNMENT_SELECTION_POLICY_KEY:
+            value_type = pa.string()
+        elif key in {
+            ALIGNMENT_RESIDUAL_KEY,
+            ALIGNMENT_SELECTED_TIMESTAMP_KEY,
+            ALIGNMENT_TARGET_SOURCE_TIMESTAMP_KEY,
+            ALIGNMENT_STATE_RESIDUAL_KEY,
+        } or key.startswith(ALIGNMENT_CAMERA_RESIDUAL_PREFIX):
+            value_type = pa.float64()
+        elif key == ALIGNMENT_ACTION_POLICY_KEY:
+            value_type = pa.string()
+        elif key.startswith(ALIGNMENT_SOURCE_PREFIX) or key == ALIGNMENT_ACTION_SEQUENCE_KEY:
+            value_type = pa.int64()
         elif key == "timestamp":
             value_type = pa.float32()
         elif key.startswith("source_timestamp."):
@@ -1741,6 +2045,176 @@ def _arrow_schema_for_row(pa: Any, row: dict[str, Any]) -> Any:
             raise ValueError(f"unsupported parquet field {key!r}")
         fields.append(pa.field(key, value_type))
     return pa.schema(fields)
+
+
+def _alignment_row_fields(
+    metadata: Mapping[str, Any] | None,
+    camera_streams: list[str],
+) -> dict[str, str | float | int]:
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, Mapping):
+        raise ValueError("alignment_metadata must be a mapping")
+    if not metadata:
+        return {}
+    allowed = {
+        "selection_policy",
+        "alignment_selection_policy",
+        "alignment_residual_sec",
+        "state_sequence",
+        "camera_sequences",
+        "target_timestamp_sec",
+        "alignment_target_source_timestamp",
+        "selected_dataset_timestamp",
+        "state_residual_sec",
+        "camera_residuals_sec",
+        "action_policy",
+        "action_sequence",
+    }
+    unknown = set(metadata) - allowed
+    if unknown:
+        raise ValueError(
+            "unsupported alignment metadata field(s): "
+            + ",".join(sorted(str(key) for key in unknown))
+        )
+
+    policy = metadata.get("selection_policy", metadata.get("alignment_selection_policy"))
+    if not isinstance(policy, str) or not policy.strip():
+        raise ValueError("alignment selection_policy must be a non-empty string")
+    residual = metadata.get("alignment_residual_sec")
+    if isinstance(residual, bool):
+        raise ValueError("alignment_residual_sec must be finite and non-negative")
+    try:
+        residual_value = float(residual)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "alignment_residual_sec must be finite and non-negative"
+        ) from exc
+    if not math.isfinite(residual_value) or residual_value < 0:
+        raise ValueError("alignment_residual_sec must be finite and non-negative")
+
+    state_sequence = _alignment_sequence(metadata.get("state_sequence"), "state_sequence")
+    camera_sequences = metadata.get("camera_sequences")
+    if not isinstance(camera_sequences, Mapping):
+        raise ValueError("alignment camera_sequences must be a mapping")
+
+    fields: dict[str, str | float | int] = {
+        ALIGNMENT_SELECTION_POLICY_KEY: policy.strip(),
+        ALIGNMENT_RESIDUAL_KEY: residual_value,
+        f"{ALIGNMENT_SOURCE_PREFIX}state.sequence": state_sequence,
+    }
+    for stream in camera_streams:
+        sequence = _alignment_sequence(
+            camera_sequences.get(stream), f"camera_sequences[{stream!r}]"
+        )
+        fields[f"{ALIGNMENT_SOURCE_PREFIX}camera.{stream}.sequence"] = sequence
+    target_timestamp = metadata.get(
+        "selected_dataset_timestamp", metadata.get("target_timestamp_sec")
+    )
+    if target_timestamp is not None:
+        fields[ALIGNMENT_SELECTED_TIMESTAMP_KEY] = _alignment_float(
+            target_timestamp, "selected_dataset_timestamp"
+        )
+    target_source_timestamp = metadata.get(
+        "alignment_target_source_timestamp", metadata.get("target_timestamp_sec")
+    )
+    if target_source_timestamp is not None:
+        fields[ALIGNMENT_TARGET_SOURCE_TIMESTAMP_KEY] = _alignment_float(
+            target_source_timestamp, "alignment_target_source_timestamp"
+        )
+    state_residual = metadata.get("state_residual_sec")
+    if state_residual is not None:
+        fields[ALIGNMENT_STATE_RESIDUAL_KEY] = _alignment_float(
+            state_residual, "state_residual_sec"
+        )
+    action_policy = metadata.get("action_policy")
+    if action_policy is not None:
+        if not isinstance(action_policy, str) or not action_policy.strip():
+            raise ValueError("alignment action_policy must be a non-empty string")
+        fields[ALIGNMENT_ACTION_POLICY_KEY] = action_policy.strip()
+    if "action_sequence" in metadata:
+        action_sequence = metadata.get("action_sequence")
+        fields[ALIGNMENT_ACTION_SEQUENCE_KEY] = (
+            -1
+            if action_sequence is None
+            else _alignment_sequence(action_sequence, "action_sequence")
+        )
+    camera_residuals = metadata.get("camera_residuals_sec")
+    if camera_residuals is not None:
+        if not isinstance(camera_residuals, Mapping):
+            raise ValueError("alignment camera_residuals_sec must be a mapping")
+        for stream in camera_streams:
+            if stream not in camera_residuals:
+                raise ValueError(
+                    f"alignment camera_residuals_sec missing {stream!r}"
+                )
+            fields[
+                f"{ALIGNMENT_CAMERA_RESIDUAL_PREFIX}{stream}.sec"
+            ] = _alignment_float(
+                camera_residuals[stream],
+                f"camera_residuals_sec[{stream!r}]",
+            )
+    return fields
+
+
+def _alignment_sequence(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"alignment {label} must be a non-negative integer")
+    return value
+
+
+def _alignment_float(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"alignment {label} must be finite and non-negative")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"alignment {label} must be finite and non-negative"
+        ) from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"alignment {label} must be finite and non-negative")
+    return parsed
+
+
+def _alignment_feature_definition(key: str) -> dict[str, Any]:
+    if key == ALIGNMENT_SELECTION_POLICY_KEY:
+        return {"dtype": "string", "shape": [1], "names": None}
+    if key in {
+        ALIGNMENT_RESIDUAL_KEY,
+        ALIGNMENT_SELECTED_TIMESTAMP_KEY,
+        ALIGNMENT_TARGET_SOURCE_TIMESTAMP_KEY,
+        ALIGNMENT_STATE_RESIDUAL_KEY,
+    } or key.startswith(ALIGNMENT_CAMERA_RESIDUAL_PREFIX):
+        return {"dtype": "float64", "shape": [1], "names": None}
+    if key == ALIGNMENT_ACTION_POLICY_KEY:
+        return {"dtype": "string", "shape": [1], "names": None}
+    if key.startswith(ALIGNMENT_SOURCE_PREFIX) or key == ALIGNMENT_ACTION_SEQUENCE_KEY:
+        return {"dtype": "int64", "shape": [1], "names": None}
+    raise ValueError(f"unsupported alignment feature {key!r}")
+
+
+def _validate_existing_alignment_features(features: Mapping[str, Any]) -> set[str]:
+    keys = {
+        key
+        for key in features
+        if key.startswith("alignment.") or key == ALIGNMENT_SELECTED_TIMESTAMP_KEY
+    }
+    for key in keys:
+        feature = features[key]
+        expected = _alignment_feature_definition(key)
+        if not isinstance(feature, Mapping):
+            raise ValueError(f"existing alignment feature {key} must be a mapping")
+        if feature.get("dtype") != expected["dtype"]:
+            raise ValueError(
+                f"existing alignment feature {key} dtype must be "
+                f"{expected['dtype']}"
+            )
+        if feature.get("shape") != expected["shape"]:
+            raise ValueError(
+                f"existing alignment feature {key} shape must be [1]"
+            )
+    return keys
 
 
 def _validate_robot_frame(frame: RobotFrame) -> None:
@@ -2020,6 +2494,18 @@ def _file_integrity(
     return {"size_bytes": size_bytes, "sha256": digest.hexdigest()}
 
 
+def _move_durable(source: Path, target: Path) -> None:
+    """Move one owned artifact and make both directory entries durable."""
+    if not source.is_file():
+        raise RuntimeError(f"artifact to move is missing: {source}")
+    if target.exists():
+        raise RuntimeError(f"review artifact target already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(source, target)
+    _fsync_directory(target.parent)
+    _fsync_directory(source.parent)
+
+
 def _required_manifest_path(manifest: dict[str, Any], key: str) -> str:
     value = manifest.get(key)
     if not isinstance(value, str) or not value:
@@ -2129,17 +2615,85 @@ def _write_files_transactional_locked(files: dict[Path, str]) -> None:
         raise
 
 
-def _recover_files_transaction(journal_path: Path) -> None:
+def _recover_files_transaction(journal_path: Path) -> str | None:
     if not journal_path.parent.exists():
-        return
+        return None
     with _metadata_files_lock(journal_path.parent, exclusive=True):
-        _recover_files_transaction_locked(journal_path)
+        return _recover_files_transaction_locked(journal_path)
 
 
-def _recover_files_transaction_locked(journal_path: Path) -> None:
+def _read_metadata_documents_locked(meta_dir: Path) -> dict[str, Any]:
+    """Read all dataset metadata documents after transaction recovery."""
+    required_paths = {
+        "tasks": meta_dir / "tasks.jsonl",
+        "episodes": meta_dir / "episodes.jsonl",
+        "info": meta_dir / "info.json",
+        "modality": meta_dir / "modality.json",
+    }
+    existing_names = {
+        name for name, path in required_paths.items() if path.is_file()
+    }
+    if not existing_names:
+        return {
+            "present": False,
+            "tasks": [],
+            "episodes": [],
+            "info": None,
+            "modality": None,
+        }
+    if existing_names != set(required_paths):
+        missing_names = sorted(set(required_paths) - existing_names)
+        raise RuntimeError(
+            "committed dataset metadata is incomplete; missing "
+            + ", ".join(missing_names)
+        )
+
+    def read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"cannot read dataset metadata {label}: {path}") from exc
+        rows: list[dict[str, Any]] = []
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"invalid JSON in dataset metadata {label}:{line_number}"
+                ) from exc
+            if not isinstance(value, Mapping):
+                raise RuntimeError(
+                    f"dataset metadata {label}:{line_number} must be an object"
+                )
+            rows.append(dict(value))
+        return rows
+
+    tasks = read_jsonl(required_paths["tasks"], "tasks.jsonl")
+    episodes = read_jsonl(required_paths["episodes"], "episodes.jsonl")
+    try:
+        info = json.loads(required_paths["info"].read_text(encoding="utf-8"))
+        modality = json.loads(
+            required_paths["modality"].read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("cannot read committed dataset metadata documents") from exc
+    if not isinstance(info, Mapping) or not isinstance(modality, Mapping):
+        raise RuntimeError("dataset info.json and modality.json must be objects")
+    return {
+        "present": True,
+        "tasks": tasks,
+        "episodes": episodes,
+        "info": dict(info),
+        "modality": dict(modality),
+    }
+
+
+def _recover_files_transaction_locked(journal_path: Path) -> str | None:
     if not journal_path.exists():
         _cleanup_atomic_text_staging(journal_path)
-        return
+        return None
     try:
         journal = json.loads(journal_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -2158,7 +2712,8 @@ def _recover_files_transaction_locked(journal_path: Path) -> None:
         raise RuntimeError(f"invalid metadata transaction entries: {journal_path}")
 
     parent_dir = journal_path.parent
-    if journal["phase"] == "prepared":
+    phase = str(journal["phase"])
+    if phase == "prepared":
         _rollback_transaction(parent_dir, entries)
     else:
         for entry in entries:
@@ -2174,6 +2729,7 @@ def _recover_files_transaction_locked(journal_path: Path) -> None:
     journal_path.unlink(missing_ok=True)
     _cleanup_atomic_text_staging(journal_path)
     _fsync_directory(parent_dir)
+    return phase
 
 
 @contextmanager

@@ -117,6 +117,29 @@ bash scripts/run_realsense_server.sh \
   --no-depth
 ```
 
+To prepare complete-source capture, enable the camera-side bounded Raw spool.
+It is written before latest-frame aggregation and ZMQ publication, so it can be
+recovered independently after a server restart:
+
+```bash
+bash scripts/run_realsense_server.sh \
+  --camera head:<D405_SERIAL> \
+  --camera ego_view:<D435I_SERIAL> \
+  --raw-spool-dir /data/robo_collector/camera_spools \
+  --packet-schema v3
+```
+
+`v3` remains the default wire protocol; `v4` is an explicit opt-in after the
+normalized-envelope path has been validated. A host Raw Episode made from
+received ZMQ packets is still `transport_observed`; it does not recover frames
+that were lost before reception. To use the spool as the task's complete
+camera source, mount the camera spool directory on the collection host and
+pass `--camera-raw-spool-root` together with
+`--raw-source-scope camera_capture`. The collector snapshots source records in
+the START/STOP server-wall-time window and imports them into the task Raw
+Episode. Without that mount/parameter, `camera_capture` is explicitly
+downgraded to `transport_observed`.
+
 On the collection host, test the client or open the viewer:
 
 ```bash
@@ -142,8 +165,59 @@ bash scripts/launch_data_collection.sh \
   --fps 30 \
   --max-episode-duration-sec 600 \
   --max-episode-frames 18000 \
-  --min-free-disk-bytes 2147483648
+  --min-free-disk-bytes 2147483648 \
+  --max-camera-clock-mapping-uncertainty-sec 0.05 \
+  --recording-mode raw_first \
+  --raw-episode-root outputs/.raw_episodes \
+  --raw-source-scope transport_observed \
+  --camera-callback-queue-size 128
 ```
+
+`raw_first` writes only bounded raw records during `RECORDING`; MP4/Parquet
+are materialized after `STOP`, then checked by the Episode quality gate. The
+host collector intentionally keeps `transport_observed` until the camera-side
+spool is linked to the same task Episode; complete-source capture must not be
+claimed from a receiver-only recording.
+
+For a mounted camera spool, use these raw options instead:
+
+```bash
+  --raw-source-scope camera_capture \
+  --camera-raw-spool-root /data/robo_collector/camera_spools
+```
+
+The raw manifest records source session(s), source manifest hash, capture
+window, imported frame counts, and the measured source/collector clock mapping
+uncertainty. The threshold is configurable with
+`--max-camera-clock-mapping-uncertainty-sec`; missing or exceeded mapping
+evidence stays `REVIEW`. A source with `REVIEW` or `REJECT` QC, or a
+transport-only source when complete capture is required, is not accepted by
+the GR00T/OpenPI raw-input path.
+
+### Recovery and acceptance evidence
+
+`raw_first` is the default recording mode. `legacy` is an explicit migration
+comparison mode; it is not the final raw-first publication path. At startup the
+collector scans `<raw-episode-root>` and retries pending or partially committed
+materialization jobs. Until that scan completes, `START` is rejected. If the
+scan or recovery coordinator fails, the node stays fail-closed and publishes an
+`ERROR` status; repair the raw root and restart the node rather than deleting
+the raw Episode.
+
+Every sealed Episode must have `manifest.json`, `checksums.json`,
+`quality.json`, and a durable materialization job record. The expected commit
+order is `RAW_CLOSED -> MATERIALIZING -> MATERIALIZED -> QC ->
+READY/REVIEW/REJECT`; only `READY` enters the default training index. A crash
+during QC or publication is recovered by revalidating artifact hashes and
+quality evidence, so `READY` must never be inferred from an MP4/Parquet file
+alone.
+
+For each deployment acceptance run, archive the command-line configuration,
+camera serials, source/collector clock evidence, code commit, start/end time,
+queue-depth and disk/RSS/CPU status, deadline-miss counters, materialization
+job history, and the results of the dual-camera reconnect, process-kill,
+10 x 60-second, and 60-minute soak tests. These measurements are deployment
+evidence; the unit tests do not replace them.
 
 The recommended `configs/collection_fields.yml` also stores
 `observation.state.joint_position` and `action.policy_action`, so the same
@@ -357,6 +431,11 @@ The converter writes compact OpenPI keys `head_image`, `ego_image`, `state`,
 embedded as PNG-backed Hugging Face image columns in parquet, matching the
 OpenPI G1 LeRobot training layout. It exits with an error if the source dataset
 lacks the required head/ego camera streams or selected 29-dim vector columns.
+
+Both converters preserve per-Episode source provenance. The aggregate index is
+`meta/raw_provenance.json`; immutable raw-materialization entries are also
+written under `meta/raw_provenance/<source_episode_id>.json`. Converters reject
+raw Episodes that are not QC `READY`.
 
 ## Acknowledgement
 

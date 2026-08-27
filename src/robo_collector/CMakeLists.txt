@@ -33,6 +33,21 @@ if(BUILD_TESTING)
     ament_add_pytest_test(test_lerobot_dataset test/test_lerobot_dataset.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
+    ament_add_pytest_test(test_raw_episode test/test_raw_episode.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_raw_materializer test/test_raw_materializer.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_raw_converters test/test_raw_converters.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_episode_quality test/test_episode_quality.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_spec_acceptance test/test_spec_acceptance.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
     ament_add_pytest_test(test_gr00t_converter test/test_gr00t_converter.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )

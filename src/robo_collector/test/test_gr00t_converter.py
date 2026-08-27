@@ -66,6 +66,31 @@ class Gr00tConverterTest(unittest.TestCase):
                     / "videos/chunk-000/observation.images.ego_view/episode_000000.mp4"
                 ).exists()
             )
+            provenance = json.loads(
+                (output_root / "meta/raw_provenance.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                provenance["source_episode_id"], "episode-000000"
+            )
+            self.assertEqual(
+                provenance["converter_version"],
+                "robo_collector.gr00t_converter.v1",
+            )
+            self.assertEqual(provenance["output_schema_version"], "gr00t.v1")
+            self.assertTrue(provenance["source_manifest_hash"])
+            self.assertEqual(provenance["action_source"], "aligned_target_pos")
+            self.assertTrue(provenance["state_source"].startswith("policy_state:"))
+            self.assertEqual(provenance["selection_policy"], "source_frame_index_order")
+
+            reused = convert_dataset(
+                source_root,
+                "source_dataset",
+                dest_root,
+                output_name="converted_dataset",
+                action_source="aligned_target_pos",
+            )
+            self.assertEqual(reused.output_dataset, output_root)
+            self.assertEqual(reused.frame_count, result.frame_count)
 
             table = pq.read_table(output_root / "data/chunk-000/episode_000000.parquet")
             row = table.slice(0, 1).to_pylist()[0]
@@ -427,7 +452,7 @@ def _create_source_dataset(
         field_selection=field_selection or _policy_selection(),
         video_sink_factory=FakeVideoSink,
     )
-    writer.start_episode("pick the red cup")
+    writer.start_episode("pick the red cup", "episode-000000")
     writer.add_frame(
         _robot_frame(),
         {"head": FakeFrame(), "ego_view": FakeFrame()},

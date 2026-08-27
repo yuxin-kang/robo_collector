@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 from typing import Any
 
+from .conversion_provenance import (
+    is_raw_episode,
+    materialize_raw_source,
+    reusable_conversion,
+    validate_raw_source_ready,
+    write_conversion_provenance,
+    episode_provenance_from_row,
+)
 from .lerobot_dataset import ALIGNED_TARGET_POS_DIM, DOF, STATE_FIELD_SHAPES
 
 
@@ -60,6 +69,7 @@ class _EpisodeConversionPlan:
     source_video_paths: dict[str, Path]
     task_strings: list[str]
     fps: int
+    source_provenance: dict[str, Any] = field(default_factory=dict)
 
 
 def convert_dataset(
@@ -69,6 +79,7 @@ def convert_dataset(
     *,
     output_name: str | None = None,
     action_source: str,
+    _provenance_source_dataset: Path | None = None,
 ) -> ConversionResult:
     if action_source not in ACTION_SOURCE_TO_KEY:
         supported = ",".join(sorted(ACTION_SOURCE_TO_KEY))
@@ -90,11 +101,51 @@ def convert_dataset(
     if not source_dataset.is_dir():
         raise ConversionError(f"source dataset is not a directory: {source_dataset}")
 
+    if is_raw_episode(source_dataset):
+        # Validate the current source before checking an existing output.  A
+        # READY conversion must not be reused after raw QC moves to REVIEW or
+        # REJECT.
+        try:
+            validate_raw_source_ready(source_dataset)
+        except ValueError as exc:
+            raise ConversionError(str(exc)) from exc
+
     output_dataset = dest_root_path / output_dataset_name
+    conversion_config = {"action_source": action_source, "output_name": output_dataset_name}
     if output_dataset.exists():
-        raise ConversionError(
-            f"output dataset already exists: {output_dataset}; choose a new --output-name"
+        if not reusable_conversion(output_dataset, source_dataset,
+                                   converter_version="robo_collector.gr00t_converter.v1",
+                                   output_schema_version="gr00t.v1",
+                                   conversion_config=conversion_config):
+            raise ConversionError(f"output dataset already exists and is not a complete matching conversion: {output_dataset}")
+        info = _load_json(output_dataset / "meta/info.json")
+        return ConversionResult(source_dataset, output_dataset, int(info["total_episodes"]), int(info["total_frames"]), action_source)
+
+    if is_raw_episode(source_dataset):
+        temporary_root, materialized_dataset = materialize_raw_source(
+            source_dataset,
+            dest_root_path,
+            profile="gr00t",
+            action_source=action_source,
         )
+        try:
+            converted = convert_dataset(
+                materialized_dataset.parent,
+                materialized_dataset.name,
+                dest_root_path,
+                output_name=output_dataset_name,
+                action_source=action_source,
+                _provenance_source_dataset=source_dataset,
+            )
+            return ConversionResult(
+                source_dataset=source_dataset,
+                output_dataset=converted.output_dataset,
+                episode_count=converted.episode_count,
+                frame_count=converted.frame_count,
+                action_source=converted.action_source,
+            )
+        finally:
+            shutil.rmtree(temporary_root, ignore_errors=True)
 
     source_info = _load_json(source_dataset / "meta/info.json")
     source_episodes = _load_jsonl(source_dataset / "meta/episodes.jsonl")
@@ -157,7 +208,19 @@ def convert_dataset(
             action_source=action_source,
             camera_keys=camera_keys,
         )
+        write_conversion_provenance(
+            staging_output,
+            _provenance_source_dataset or source_dataset,
+            converter_version="robo_collector.gr00t_converter.v1",
+            output_schema_version="gr00t.v1",
+            conversion_config=conversion_config,
+            action_source=action_source,
+            state_source="policy_state:" + ",".join(POLICY_STATE_ORDER),
+            selection_policy="source_frame_index_order",
+        )
+        _fsync_tree(staging_output)
         staging_output.replace(output_dataset)
+        _fsync_dir(dest_root_path)
     except Exception:
         shutil.rmtree(staging_output, ignore_errors=True)
         raise
@@ -169,6 +232,27 @@ def convert_dataset(
         frame_count=total_frames,
         action_source=action_source,
     )
+
+
+def _fsync_tree(root: Path) -> None:
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+    for path in sorted((p for p in root.rglob("*") if p.is_dir()), reverse=True):
+        _fsync_dir(path)
+    _fsync_dir(root)
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -279,6 +363,7 @@ def _preflight_episode(
         _task_string_from_index(task_lookup, int(task_index))
         for task_index in sorted(task_indices)
     ]
+    source_provenance = episode_provenance_from_row(source_episode)
     return (
         _EpisodeConversionPlan(
             episode_index=episode_index,
@@ -290,6 +375,7 @@ def _preflight_episode(
             source_video_paths=source_video_paths,
             task_strings=task_strings,
             fps=fps,
+            source_provenance=source_provenance,
         ),
         next_task_index,
     )
@@ -345,6 +431,12 @@ def _materialize_dataset(
                 camera_key: str(video_rel_path)
                 for camera_key, video_rel_path in episode_plan.dest_video_rel_paths.items()
             },
+            **episode_plan.source_provenance,
+            **(
+                {"source_provenance": dict(episode_plan.source_provenance)}
+                if episode_plan.source_provenance
+                else {}
+            ),
         }
         for episode_plan in episode_plans
     ]

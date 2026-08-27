@@ -152,6 +152,56 @@ class LeRobotV21WriterTest(unittest.TestCase):
             ],
         )
 
+    def test_unpublished_save_defers_shared_index_until_publish(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("deferred publish", "raw-episode-1")
+            writer.add_frame(_robot_frame(), FakeFrame())
+
+            staged = writer.save_episode_unpublished()
+
+            root = Path(tmp) / "dataset"
+            self.assertTrue(staged.saved)
+            self.assertIsNotNone(writer.active_episode_index)
+            self.assertTrue(staged.data_path.exists())
+            self.assertFalse((root / "meta/episodes.jsonl").exists())
+            self.assertFalse((root / "meta/info.json").exists())
+
+            published = writer.publish_unpublished_episode()
+
+            self.assertTrue(published.saved)
+            self.assertIsNone(writer.active_episode_index)
+            self.assertTrue((root / "meta/episodes.jsonl").exists())
+            episode = json.loads(
+                (root / "meta/episodes.jsonl").read_text(encoding="utf-8").strip()
+            )
+            self.assertEqual(episode["episode_id"], "raw-episode-1")
+
+    def test_unpublished_review_is_retained_without_shared_index(self):
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp)
+            writer.start_episode("review sample", "raw-episode-review")
+            writer.add_frame(_robot_frame(), FakeFrame())
+            provenance = writer.root / "meta" / "raw_provenance.json"
+            provenance.parent.mkdir(parents=True, exist_ok=True)
+            provenance.write_text('{"source_episode_id":"raw-episode-review"}\n')
+            writer.save_episode_unpublished()
+
+            review_root = Path(tmp) / "review" / "raw-episode-review"
+            retained = writer.retain_unpublished_episode(
+                review_root, extra_paths=(provenance,)
+            )
+
+            self.assertTrue(retained.saved)
+            self.assertIsNone(writer.active_episode_index)
+            self.assertTrue((review_root / "data/train-000000.parquet").exists())
+            self.assertTrue(
+                (review_root / "videos/observation.images.ego_view/episode_000000.mp4").exists()
+            )
+            self.assertTrue((review_root / "meta/raw_provenance.json").exists())
+            self.assertFalse((writer.root / "meta/episodes.jsonl").exists())
+            self.assertFalse((writer.root / "meta/raw_provenance.json").exists())
+
     def test_save_progress_callback_failure_does_not_fail_commit(self):
         def fail_progress(_phase):
             raise RuntimeError("status transport failed")
@@ -392,6 +442,44 @@ class LeRobotV21WriterTest(unittest.TestCase):
             )
             self.assertEqual(
                 rows[1]["source_timestamp.camera.ego_view"], 100.10
+            )
+
+    def test_alignment_provenance_is_written_per_row(self):
+        parquet_rows = {}
+
+        def write_fake_parquet(path, rows):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            parquet_rows[path.name] = rows
+            path.write_text(json.dumps(rows), encoding="utf-8")
+
+        with TemporaryDirectory() as tmp:
+            writer = _writer(tmp, parquet_writer=write_fake_parquet)
+            writer.start_episode("aligned")
+            writer.add_frame(
+                _robot_frame(),
+                FakeFrame(),
+                alignment_metadata={
+                    "selection_policy": "fixed_rate_nearest_strict",
+                    "alignment_residual_sec": 0.02,
+                    "state_sequence": 7,
+                    "camera_sequences": {"ego_view": 8},
+                },
+            )
+            writer.save_episode()
+
+            row = parquet_rows["train-000000.parquet"][0]
+            self.assertEqual(
+                row["alignment.selection_policy"],
+                "fixed_rate_nearest_strict",
+            )
+            self.assertEqual(row["alignment.residual_sec"], 0.02)
+            self.assertEqual(row["alignment.source.state.sequence"], 7)
+            self.assertEqual(row["alignment.source.camera.ego_view.sequence"], 8)
+            info = json.loads(
+                (Path(tmp) / "dataset/meta/info.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                info["features"]["alignment.residual_sec"]["dtype"], "float64"
             )
 
     def test_source_timestamps_must_be_finite_and_monotonic(self):

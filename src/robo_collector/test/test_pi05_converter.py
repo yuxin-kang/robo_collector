@@ -15,6 +15,8 @@ from robo_collector.lerobot_dataset import DOF, LeRobotV21Writer, RobotFrame
 from robo_collector.pi05_converter import (
     EGO_IMAGE_KEY,
     HEAD_IMAGE_KEY,
+    DEFAULT_ACTION_KEY,
+    DEFAULT_STATE_KEY,
     convert_dataset,
     main,
     OpenCvFrameReader,
@@ -91,6 +93,31 @@ class Pi05ConverterTest(unittest.TestCase):
             self.assertTrue(data_path.exists())
             self.assertTrue((output_root / "meta/info.json").exists())
             self.assertTrue((output_root / "meta/episodes_stats.jsonl").exists())
+            provenance = json.loads(
+                (output_root / "meta/raw_provenance.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                provenance["source_episode_id"], "episode-000000"
+            )
+            self.assertEqual(
+                provenance["converter_version"],
+                "robo_collector.pi05_converter.v1",
+            )
+            self.assertEqual(provenance["output_schema_version"], "openpi.pi05.v1")
+            self.assertTrue(provenance["source_manifest_hash"])
+            self.assertEqual(provenance["action_source"], DEFAULT_ACTION_KEY)
+            self.assertEqual(provenance["state_source"], DEFAULT_STATE_KEY)
+            self.assertEqual(provenance["selection_policy"], "source_frame_index_order")
+
+            reused = convert_dataset(
+                source_root,
+                "source_dataset",
+                dest_root,
+                output_name="converted_dataset",
+                frame_reader_factory=FakeFrameReader,
+            )
+            self.assertEqual(reused.output_dataset, output_root)
+            self.assertEqual(reused.frame_count, result.frame_count)
 
             table = pq.read_table(data_path)
             row = table.slice(0, 1).to_pylist()[0]
@@ -533,7 +560,7 @@ def _create_source_dataset(
         field_selection=field_selection or _default_selection(),
         video_sink_factory=FakeVideoSink,
     )
-    writer.start_episode("pick the red cup")
+    writer.start_episode("pick the red cup", "episode-000000")
     frame = _robot_frame(policy_state=policy_state)
     frame_bundle = _frame_bundle(camera_keys or writer.camera_keys)
     writer.add_frame(frame, frame_bundle)
