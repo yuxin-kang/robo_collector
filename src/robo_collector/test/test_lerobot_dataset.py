@@ -400,7 +400,7 @@ class LeRobotV21WriterTest(unittest.TestCase):
                 set(modality["observation"]["images"]), {"head", "ego_view"}
             )
 
-    def test_fixed_fps_timeline_keeps_source_timestamps_for_audit(self):
+    def test_output_timeline_keeps_source_timestamps_for_audit(self):
         parquet_rows = {}
 
         def write_fake_parquet(path, rows):
@@ -459,7 +459,7 @@ class LeRobotV21WriterTest(unittest.TestCase):
                 _robot_frame(),
                 FakeFrame(),
                 alignment_metadata={
-                    "selection_policy": "fixed_rate_nearest_strict",
+                    "selection_policy": "rgb_reference_nearest_strict",
                     "alignment_residual_sec": 0.02,
                     "state_sequence": 7,
                     "camera_sequences": {"ego_view": 8},
@@ -470,7 +470,7 @@ class LeRobotV21WriterTest(unittest.TestCase):
             row = parquet_rows["train-000000.parquet"][0]
             self.assertEqual(
                 row["alignment.selection_policy"],
-                "fixed_rate_nearest_strict",
+                "rgb_reference_nearest_strict",
             )
             self.assertEqual(row["alignment.residual_sec"], 0.02)
             self.assertEqual(row["alignment.source.state.sequence"], 7)

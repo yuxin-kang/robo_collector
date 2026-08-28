@@ -216,9 +216,11 @@ class RawCaptureSpecAcceptanceTest(unittest.TestCase):
 
         selections = _align_records(camera, state, config)
 
-        self.assertEqual(len(selections), 3)
+        self.assertEqual(len(selections), 2)
+        self.assertIsNotNone(selections[0])
         self.assertIsNotNone(selections[1])
-        self.assertEqual(selections[1].action_record["sequence"], 0)
+        self.assertEqual(selections[0].action_record["sequence"], 0)
+        self.assertEqual(selections[1].action_record["sequence"], 1)
 
     def test_cross_clock_alignment_requires_host_time_provenance(self):
         config = MaterializationConfig(

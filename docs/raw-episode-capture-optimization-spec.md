@@ -253,21 +253,21 @@ selection_gap  ：已收到，但物化时没有满足时间窗口的样本
 
 ### 6.2 物化阶段
 
-默认使用固定目标时间轴：
+默认使用配置中第一路 RGB stream 的真实采集时间戳作为目标时间轴。每一帧参考 RGB 都对应一行候选输出，不能根据 `output_fps` 重新合成目标时刻：
 
 ```text
-t_k = k / output_fps
+t_k = timestamp(reference_rgb[k])
 ```
 
-对每个目标时刻：
+对每个参考 RGB 时刻：
 
-- 图像使用有界最近邻，不在图像之间插值。
-- 机器人状态默认使用最近的有效样本；线性插值必须通过配置显式打开。
-- 动作默认使用目标时刻之前最近的有效动作，即 zero-order hold。
+- 参考 RGB 直接作为该行图像；其他相机图像使用相对于参考 RGB 时刻的有界最近邻，不在图像之间插值。
+- 机器人状态使用相对于参考 RGB 时刻的有界最近邻；因此最终保存的机器人状态是对齐 RGB，而不是让 RGB 去追随机器人频率。
+- 动作默认使用参考 RGB 时刻之前最近的有效动作，即 zero-order hold。
 - 标准 LeRobot 物化使用 `strict` 策略：任意必需相机在窗口内没有有效帧时，丢弃整个目标采样点，不复制旧图像或生成黑帧。
 - `strict` 策略下，Parquet 行数与每路视频帧数必须一致；被丢弃的目标采样点只进入 QC 报告，并计为 `selection_gap`。
 - 可选的 `sparse` 策略仅用于诊断导出：保留行并写入 `camera_valid_<stream>=false`，不作为标准 LeRobot 训练数据发布。
-- 每一行保存选择来源和 `alignment_residual_sec`，保证对齐过程可复现。
+- LeRobot 的 `timestamp` 仍按成功写入行的 `frame_index / output_fps` 生成，以满足固定帧率视频和训练接口；每行另外保存真实 RGB 目标时间戳、来源 sequence 和 `alignment_residual_sec`，保证对齐过程可复现。
 
 ### 6.3 同步质量
 

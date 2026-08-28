@@ -315,7 +315,7 @@ class RawMaterializerTest(unittest.TestCase):
             self.assertEqual(len(writers[0].frames), 2)
             self.assertEqual(
                 writers[0].frames[0][3]["selection_policy"],
-                "fixed_rate_nearest_strict",
+                "rgb_reference_nearest_strict",
             )
             self.assertEqual(writers[0].frames[0][3]["state_sequence"], 0)
             self.assertAlmostEqual(
@@ -349,7 +349,7 @@ class RawMaterializerTest(unittest.TestCase):
         cv2 is not None and np is not None and parquet is not None and pa is not None,
         "pyarrow/opencv are required for real artifact validation",
     )
-    def test_selected_dataset_timestamps_are_dense_after_dropped_targets(self):
+    def test_rgb_reference_timeline_aligns_robot_to_each_rgb_frame(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             recorder = RawEpisodeRecorder(
@@ -358,13 +358,13 @@ class RawMaterializerTest(unittest.TestCase):
                 source_scope="camera_capture",
                 task_prompt="pick",
             )
-            for timestamp in (0.0, 2.0):
+            for index, timestamp in enumerate((0.0, 0.07, 0.2)):
                 for stream in ("head", "ego_view"):
                     recorder.append_camera(
                         stream,
                         b"image",
                         {
-                            "sequence": int(timestamp),
+                            "sequence": index,
                             "clock_domain": f"camera:{stream}",
                             "timestamp_quality": "device",
                             "device_timestamp": timestamp,
@@ -374,10 +374,11 @@ class RawMaterializerTest(unittest.TestCase):
                         },
                         payload_encoding="image/jpeg",
                     )
+            for sequence, timestamp in enumerate((0.0, 0.04, 0.07, 0.14, 0.2)):
                 recorder.append_robot_state(
                     _state(timestamp),
                     {
-                        "sequence": int(timestamp),
+                        "sequence": sequence,
                         "clock_domain": "robot_state",
                         "timestamp_quality": "ros_message",
                         "record_monotonic_timestamp": timestamp,
@@ -397,23 +398,26 @@ class RawMaterializerTest(unittest.TestCase):
                 MaterializationConfig(
                     output_root=root / "derived",
                     dataset_name="dataset",
-                    fps=1,
+                    fps=30,
                     camera_streams=("head", "ego_view"),
-                    max_alignment_residual_sec=0.1,
+                    max_alignment_residual_sec=0.03,
                 ),
                 image_decoder=lambda payload, encoding: payload,
                 writer_factory=writer_factory,
             ).materialize(root / "raw" / "episode-dense-timestamps")
 
-            self.assertEqual(result.frame_count, 2)
-            self.assertEqual(result.dropped_selection_count, 1)
+            self.assertEqual(result.frame_count, 3)
+            self.assertEqual(result.dropped_selection_count, 0)
             rows = [item[3] for item in writers[0].frames]
             self.assertEqual(
-                [row["selected_dataset_timestamp"] for row in rows], [0.0, 1.0]
+                [row["selected_dataset_timestamp"] for row in rows],
+                [0.0, 1 / 30, 2 / 30],
             )
             self.assertEqual(
-                [row["alignment_target_source_timestamp"] for row in rows], [0.0, 2.0]
+                [row["alignment_target_source_timestamp"] for row in rows],
+                [0.0, 0.07, 0.2],
             )
+            self.assertEqual([row["state_sequence"] for row in rows], [0, 2, 4])
 
     @unittest.skipUnless(
         cv2 is not None and np is not None and parquet is not None and pa is not None,

@@ -234,7 +234,10 @@ class RawEpisodeMaterializer:
                             "converter_version": "robo_collector.raw_materializer.v1",
                             "conversion_config_hash": conversion_config_hash,
                             "output_schema_version": self.config.output_schema_version,
-                            "selection_policy": "fixed_rate_nearest_strict",
+                            "selection_policy": "rgb_reference_nearest_strict",
+                            "reference_camera_stream": _reference_camera_stream(
+                                self.config
+                            ),
                             "encoder_identity": video_encoder_identity(),
                         }
                     )
@@ -588,20 +591,43 @@ class _DiskRecordIndex:
     def target_times(
         self, camera_streams: Sequence[str], fps: int
     ) -> Any:
-        """Yield the fixed-rate timeline without allocating a target list."""
+        """Yield timestamps from the reference RGB stream.
+
+        ``fps`` is retained for callers written against the original fixed-rate
+        helper, but it is intentionally not used to synthesize timestamps.  The
+        first configured RGB stream is the reference timeline; every accepted
+        output row therefore corresponds to one real RGB frame.
+        """
+        reference_stream = _reference_camera_streams(camera_streams)
+        for record in self.reference_camera_records(reference_stream):
+            yield _record_time(record)
+
+    def reference_camera_records(self, reference_stream: str) -> Any:
+        """Yield reference RGB records in capture-time order.
+
+        Returning the actual record, rather than only its timestamp, prevents a
+        duplicate timestamp from selecting the same camera frame twice.
+        """
         self.finish()
-        keys = [("robot", "state"), *[("camera", str(stream)) for stream in camera_streams]]
-        if any(key not in self._bounds for key in keys):
+        key = ("camera", str(reference_stream))
+        if key not in self._bounds:
             return
-        starts = [float(self._bounds[key][0]) for key in keys]
-        ends = [float(self._bounds[key][1]) for key in keys]
-        start = min(starts)
-        end = max(ends)
-        if end < start:
-            return
-        count = int(math.floor((end - start) * fps + 1e-9)) + 1
-        for index in range(count):
-            yield start + index / fps
+        cursor = self._connection.execute(
+            """
+            SELECT record_json
+            FROM records
+            WHERE category = 'camera' AND stream = ?
+            ORDER BY timestamp ASC, record_id ASC
+            """,
+            (str(reference_stream),),
+        )
+        for row in cursor:
+            value = json.loads(str(row[0]))
+            if not isinstance(value, dict):
+                raise MaterializationError(
+                    "indexed reference camera record is not an object"
+                )
+            yield value
 
     def nearest(
         self,
@@ -749,9 +775,9 @@ def _write_indexed_frames(
     dropped = 0
     metrics = _AlignmentAccumulator()
     dataset_frame_index = 0
-    for _candidate_frame_index, target in enumerate(
-        record_index.target_times(config.camera_streams, config.fps)
-    ):
+    reference_stream = _reference_camera_stream(config)
+    for reference_record in record_index.reference_camera_records(reference_stream):
+        target = _record_time(reference_record)
         state_record, state_residual = record_index.nearest(
             "robot",
             "state",
@@ -760,11 +786,13 @@ def _write_indexed_frames(
         )
         if state_record is None or state_residual is None:
             selection_gaps["state"] += 1
-            # Attribute the same incomplete fixed-rate target to any camera
-            # that is also outside the matching residual.  This preserves the
-            # per-stream gap accounting of the original alignment pass while
-            # keeping all candidate payloads on disk.
+            # The reference RGB frame is present by construction.  Attribute
+            # this RGB target to any non-reference stream that is also outside
+            # the matching residual so per-stream gap accounting remains
+            # meaningful without inventing an image.
             for stream in config.camera_streams:
+                if stream == reference_stream:
+                    continue
                 candidate, residual = record_index.nearest(
                     "camera",
                     stream,
@@ -775,10 +803,17 @@ def _write_indexed_frames(
                     selection_gaps[stream] += 1
             dropped += 1
             continue
-        camera_by_stream: dict[str, dict[str, Any]] = {}
-        residuals: dict[str, float] = {"state": state_residual}
+        camera_by_stream: dict[str, dict[str, Any]] = {
+            reference_stream: reference_record
+        }
+        residuals: dict[str, float] = {
+            "state": state_residual,
+            reference_stream: 0.0,
+        }
         complete = True
         for stream in config.camera_streams:
+            if stream == reference_stream:
+                continue
             candidate, residual = record_index.nearest(
                 "camera",
                 stream,
@@ -839,8 +874,8 @@ def _write_indexed_frames(
                 for stream in config.camera_streams
             },
             alignment_metadata={
-                "selection_policy": "fixed_rate_nearest_strict",
-                "alignment_selection_policy": "fixed_rate_nearest_bounded",
+                "selection_policy": "rgb_reference_nearest_strict",
+                "alignment_selection_policy": "rgb_reference_nearest_bounded",
                 "action_policy": "latest_at_or_before_zoh",
                 "target_timestamp_sec": selection.target_time,
                 "alignment_target_source_timestamp": selection.target_time,
@@ -889,9 +924,10 @@ def _align_records(
     }
     state_times = [_record_time(record) for record in ordered_state_records]
     _validate_clock_domains([*ordered_state_records, *(record for values in ordered_camera_records.values() for record in values)])
-    target_times = _target_times(ordered_camera_records, ordered_state_records, config)
+    reference_stream = _reference_camera_stream(config)
     selections: list[_Selection | None] = []
-    for target in target_times:
+    for reference_record in ordered_camera_records.get(reference_stream, []):
+        target = _record_time(reference_record)
         state_index = _nearest_index(
             ordered_state_records,
             target,
@@ -903,10 +939,12 @@ def _align_records(
             selections.append(None)
             continue
         state_record = ordered_state_records[state_index]
-        selected: dict[str, dict[str, Any]] = {}
-        residuals: dict[str, float] = {}
+        selected: dict[str, dict[str, Any]] = {reference_stream: reference_record}
+        residuals: dict[str, float] = {reference_stream: 0.0}
         complete = True
         for stream in config.camera_streams:
+            if stream == reference_stream:
+                continue
             records = ordered_camera_records.get(stream, [])
             index = _nearest_index(
                 records,
@@ -941,7 +979,7 @@ def _selection_gap_counts(
     state_records: list[dict[str, Any]],
     config: MaterializationConfig,
 ) -> dict[str, int]:
-    """Attribute every incomplete fixed-rate target to its missing streams."""
+    """Attribute every incomplete RGB-reference target to missing streams."""
     ordered_camera = {stream: sorted(records, key=_record_time) for stream, records in camera_records.items()}
     ordered_state = sorted(state_records, key=_record_time)
     camera_times = {
@@ -977,26 +1015,26 @@ def _target_times(
     state_records: list[dict[str, Any]],
     config: MaterializationConfig,
 ) -> list[float]:
-    """Build a fixed-rate timeline spanning the union of raw capture boundaries."""
+    """Build the target axis from the configured reference RGB stream."""
 
-    if not state_records or any(
-        not camera_records.get(stream) for stream in config.camera_streams
-    ):
-        return []
-    starts = [
-        _record_time(state_records[0]),
-        *(_record_time(camera_records[stream][0]) for stream in config.camera_streams),
+    del state_records
+    reference_stream = _reference_camera_stream(config)
+    return [
+        _record_time(record)
+        for record in sorted(
+            camera_records.get(reference_stream, []), key=_record_time
+        )
     ]
-    ends = [
-        _record_time(state_records[-1]),
-        *(_record_time(camera_records[stream][-1]) for stream in config.camera_streams),
-    ]
-    start = min(starts)
-    end = max(ends)
-    if end < start:
-        return []
-    count = int(math.floor((end - start) * config.fps + 1e-9)) + 1
-    return [start + index / config.fps for index in range(count)]
+
+
+def _reference_camera_stream(config: MaterializationConfig) -> str:
+    return _reference_camera_streams(config.camera_streams)
+
+
+def _reference_camera_streams(camera_streams: Sequence[str]) -> str:
+    if not camera_streams:
+        raise MaterializationError("at least one reference RGB stream is required")
+    return str(camera_streams[0])
 
 
 def _nearest_index(

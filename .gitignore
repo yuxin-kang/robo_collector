@@ -87,6 +87,7 @@ compile_commands.json
 # Local design notes and development plans
 docs/*
 !docs/raw-episode-capture-optimization-spec.md
+!docs/robo-collector-interview-guide.md
 
 # Legacy root camera artifacts after moving source package to src/camera/
 /camera/
