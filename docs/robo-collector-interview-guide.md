@@ -232,7 +232,7 @@ recording  ：队列有限，但不能静默丢弃；满载要暴露为失败/�
 
 ### 4.4 Episode 录制：Raw-first 是主路径
 
-当前 `recording_mode` 默认是 `raw_first`，`legacy` 只是迁移/对比模式。
+当前 `recording_mode` 默认是 `raw_v1`；`raw_first` 是兼容别名，`dual_write` 用于迁移/对比，`mcap_first` 是 gated release candidate。
 
 Raw-first 的核心原则是：
 
@@ -407,7 +407,7 @@ DISCARD 会记录原因并将 Raw Episode 标记为 `DISCARDED`。默认保留 R
 | --- | --- | --- | --- |
 | ZMQ/latest 可能跳帧 | latest 只保留最新 bundle，PUB/SUB 也可能存在传输缺口 | 每路 sequence + producer/publisher/transport gap 分类；相机侧可选 Raw Spool 在发送前保存 payload；主机 Raw 明确标记 `transport_observed` | “我没有把接收端副本冒充完整相机事实源，先区分可观察范围，再用 spool 覆盖传输前的帧。” |
 | 相机停止和 spool 关闭竞态 | 读取线程可能还在 `wait_for_frames()` 或 append，服务端已经 close spool | `RealSenseReader.stop()` 先停止 pipeline，再 join capture thread；确认线程退出后再关闭 spool；`RawSpool.append()` 和 `close()` 共享生命周期锁 | “我把停止顺序定义成 pipeline stop → thread join → spool close，并用锁保护 append/close 的临界区。” |
-| 采集线程被 MP4 编码拖慢 | JPEG 解码、OpenCV 编码和磁盘写入都可能阻塞采集 hot path | 默认 `raw_first`，采集期只写 Raw；STOP 后由 `EpisodeSaveWorker` 异步物化 Parquet/MP4 | “把高延迟编码从实时采集路径移出，代价是需要更多 Raw 磁盘和后台任务管理。” |
+| 采集线程被 MP4 编码拖慢 | JPEG 解码、OpenCV 编码和磁盘写入都可能阻塞采集 hot path | 默认 `raw_v1`，采集期只写 Raw；STOP 后由 `EpisodeSaveWorker` 异步物化 Parquet/MP4 | “把高延迟编码从实时采集路径移出，代价是需要更多 Raw 磁盘和后台任务管理。” |
 | 状态和相机时间不能直接比较 | 不同源可能使用设备时钟、ROS 时间、server wall time 或接收时间 | 保存原始时间戳和 clock domain；采集 gate 使用本地 monotonic receive time；camera source 导入使用有证据的时钟映射并记录 uncertainty | “这是可量化的 best-effort 对齐，不是硬件级同步。” |
 | Episode 崩溃后只剩半个文件 | 只有 MP4/Parquet 文件，没有唯一生命周期状态 | Raw manifest 作为持久状态源；chunk framing + CRC32；manifest、checksums、临时目录和原子 rename；启动扫描恢复 job | “重启时根据 durable state 恢复或隔离，而不是根据文件名猜状态。” |
 | QC/持久化失败仍显示保存成功 | 结果函数吞异常，调用方无条件 `mark_saved()` | `_mark_raw_materialization_succeeded()` 返回质量状态并对持久化错误抛出；只有 `READY` 才 `mark_saved()` | “把保存成功从‘函数返回了’改成‘产物、证据、QC 都通过’。” |
@@ -545,7 +545,7 @@ RGB source timestamps → robot/camera bounded nearest neighbor → residual →
 
 > 我的项目是给 Unitree G1 遥操作采集训练数据。输入端一边是 StepIt/ROS2 的关节、IMU、目标和策略字段，另一边是两路 RealSense RGB。我先通过 `robo_state_node` 把上游状态统一成带维度校验和时间戳的 `RoboStateSample`；相机端由独立 server 读取多路 RealSense，给每帧保留 sequence、设备/服务端时间和 JPEG payload，再通过 ZMQ 发到采集主机。
 >
-> 采集器不直接把所有事情塞在一个 callback 里。相机 client 先把不同协议标准化成统一 envelope，`CameraFrameCache` 用有界队列接收，同时维护最新完整 bundle 和 producer、publisher、transport gap 统计。Episode 开始后，我把相机原始包、机器人状态和命令事件写进 Raw Episode；默认的 raw-first 模式只做有界原始落盘，不在实时路径里做 MP4 编码。
+> 采集器不直接把所有事情塞在一个 callback 里。相机 client 先把不同协议标准化成统一 envelope，`CameraFrameCache` 用有界队列接收，同时维护最新完整 bundle 和 producer、publisher、transport gap 统计。Episode 开始后，我把相机原始包、机器人状态和命令事件写进 Raw Episode；默认的 `raw_v1` 模式只做有界原始落盘，不在实时路径里做 MP4 编码。
 >
 > STOP 时先把已经收到的相机 callback 排空，再关闭 Raw，创建持久化的 materialization job。物化阶段用磁盘上的 SQLite 时间索引，以第一路 RGB 的真实时间戳建立目标时间轴，把机器人状态和其他相机对齐到每个 RGB 帧，对动作使用 before-or-equal 的 zero-order hold；如果必需数据超出 residual 窗口，就丢弃该 RGB 目标点并计为 selection gap，不复制旧图像。然后生成 LeRobot Parquet/MP4，写入 source sequence、residual 和 selection policy，最后经过质量门，只有 READY 才能算保存成功。
 >
@@ -698,6 +698,22 @@ RGB source timestamps → robot/camera bounded nearest neighbor → residual →
 > 当前仓库已经完成了结构化实现和自动化测试，但 CPU、RSS、丢帧率和长时间 soak 的最终数字需要在目标 G1、相机和 ROS2 部署环境中采集，不能用本地单元测试结果替代。
 
 ---
+
+## 15.1 Phase 6/7 MCAP 工具和 rollout 说法
+
+可以这样描述运维链路：`info` 查看 MCAP 摘要，`doctor --group` 校验指定
+canonical MCAP 的结构和 checksum；Episode 的 manifest、source fence 和质量状态
+由 ingestion/QC 发布门统一校验。`recover` 从可恢复前缀生成新 artifact，
+`replay` 检查事件顺序，`migration` 比较 Raw-v1/MCAP，`benchmark` 记录本地
+诊断指标。所有命令对路径错误、checksum 损坏、非 READY 或不完整 source
+证据 fail-closed，不覆盖 sealed `*.mcap`。
+
+shadow rollout 的验收是逐 Episode 对比 accepted frontier、sequence/gap、
+时间戳、选帧数、manifest/config hash 和最终质量状态；`raw_v1` 仍是默认，
+`dual_write` 只用于迁移证据，`mcap_first` 是 release candidate。单元测试、
+本地 benchmark 或短时 harness 不能声称完成真实硬件 soak；面试中应明确说明
+仍需在目标 G1、相机和 ROS2 环境采集 process-kill、reconnect、10×60 秒及
+60 分钟 soak 的部署证据。
 
 ## 16. 最后记忆版
 

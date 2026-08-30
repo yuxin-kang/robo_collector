@@ -100,6 +100,28 @@ Legacy single-camera mode:
 bash scripts/run_realsense_server.sh --serial <SERIAL> --port 5555 --no-depth
 ```
 
+## Phase 6/7 MCAP shadow operations
+
+After an Episode is closed, run the host-side operations CLI against the task
+directory (never against a live spool):
+
+```bash
+python -m robo_collector.mcap_tool info <mcap-file>
+python -m robo_collector.mcap_tool doctor <mcap-file> --group camera
+python -m robo_collector.mcap_tool replay <manifest.json> --format json
+python -m robo_collector.mcap_tool recover --attempt 1 <episode-dir>
+```
+
+`doctor --group` runs the internal canonical-MCAP structural/checksum validator
+for the selected stream; Episode-level manifest, source-fence, and terminal-QC
+promotion checks remain in the ingestion pipeline. `recover` creates a new
+artifact from a durable prefix and never replaces a sealed MCAP. For Raw-v1 versus MCAP shadow
+parity, compare accepted frontiers, sequence/gap counters, timestamps, source
+manifest hash, and `READY`/`REVIEW`/`REJECT`; a host copy remains
+`transport_observed` unless camera spool binding is proven. Local replay,
+benchmark, and short fault harness runs are diagnostics only and do not satisfy
+real-hardware reconnect or 60-minute soak acceptance.
+
 ## Host Side: Camera Client
 
 On the host:

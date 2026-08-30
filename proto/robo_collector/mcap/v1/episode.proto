@@ -1,0 +1,236 @@
+syntax = "proto3";
+
+package robo_collector.mcap.v1;
+
+enum ClockDomainV1 {
+  CLOCK_DOMAIN_UNSPECIFIED = 0;
+  CLOCK_DOMAIN_DEVICE = 1;
+  CLOCK_DOMAIN_SOURCE_MONOTONIC = 2;
+  CLOCK_DOMAIN_COLLECTOR_MONOTONIC = 3;
+  CLOCK_DOMAIN_WALL_UTC = 4;
+  reserved 1000 to max;
+}
+
+enum NormalizationModeV1 {
+  NORMALIZATION_MODE_UNSPECIFIED = 0;
+  NORMALIZATION_MODE_AFFINE_V2 = 1;
+  NORMALIZATION_MODE_RECEIVE_FALLBACK = 2;
+  NORMALIZATION_MODE_COLLECTOR_DIRECT = 3;
+  NORMALIZATION_MODE_LEGACY_V1 = 4;
+  reserved 1000 to max;
+}
+
+enum ClockFallbackReasonV1 {
+  CLOCK_FALLBACK_REASON_NONE = 0;
+  CLOCK_FALLBACK_REASON_SOURCE_TIME_MISSING = 1;
+  CLOCK_FALLBACK_REASON_INSUFFICIENT_VALID_EDGES = 2;
+  CLOCK_FALLBACK_REASON_AFFINE_UNCERTAINTY = 3;
+  reserved 1000 to max;
+}
+
+enum PixelFormatV1 {
+  PIXEL_FORMAT_UNSPECIFIED = 0;
+  PIXEL_FORMAT_RGB8 = 1;
+  PIXEL_FORMAT_BGR8 = 2;
+  PIXEL_FORMAT_RGBA8 = 3;
+  PIXEL_FORMAT_BGRA8 = 4;
+  PIXEL_FORMAT_YUYV = 5;
+  reserved 1000 to max;
+}
+
+enum PayloadEncodingV1 {
+  PAYLOAD_ENCODING_UNSPECIFIED = 0;
+  PAYLOAD_ENCODING_RAW = 1;
+  PAYLOAD_ENCODING_JPEG = 2;
+  PAYLOAD_ENCODING_PNG = 3;
+  PAYLOAD_ENCODING_H264_ANNEX_B = 4;
+  reserved 1000 to max;
+}
+
+enum GapClassV1 {
+  GAP_CLASS_UNSPECIFIED = 0;
+  GAP_CLASS_PRODUCER = 1;
+  GAP_CLASS_PUBLISHER = 2;
+  GAP_CLASS_TRANSPORT = 3;
+  GAP_CLASS_SELECTION = 4;
+  GAP_CLASS_QUEUE_OVERFLOW = 5;
+  GAP_CLASS_RESTART = 6;
+  reserved 1000 to max;
+}
+
+enum SelectionKindV1 {
+  SELECTION_KIND_UNSPECIFIED = 0;
+  SELECTION_KIND_REFERENCE = 1;
+  SELECTION_KIND_NEAREST = 2;
+  SELECTION_KIND_CAUSAL_ZOH = 3;
+  SELECTION_KIND_MISSING = 4;
+  reserved 1000 to max;
+}
+
+enum DropReasonV1 {
+  DROP_REASON_NONE = 0;
+  DROP_REASON_REQUIRED_STREAM_MISSING = 1;
+  DROP_REASON_STATE_OUT_OF_RANGE = 2;
+  DROP_REASON_ACTION_MISSING_OR_STALE = 3;
+  DROP_REASON_CLOCK_UNCERTAIN = 4;
+  DROP_REASON_DIVERGENT_DUPLICATE = 5;
+  reserved 1000 to max;
+}
+
+enum EpisodeEventTypeV1 {
+  EPISODE_EVENT_UNSPECIFIED = 0;
+  EPISODE_EVENT_START = 1;
+  EPISODE_EVENT_STOP = 2;
+  EPISODE_EVENT_DISCARD = 3;
+  EPISODE_EVENT_FAULT = 4;
+  EPISODE_EVENT_RECOVERY = 5;
+  EPISODE_EVENT_SOURCE_RECONNECT = 6;
+  EPISODE_EVENT_SELECTION_GAP = 7;
+  reserved 1000 to max;
+}
+
+message TimestampSetV1 {
+  optional sint64 source_time_ns = 1;
+  sint64 receive_time_ns = 2;
+  sint64 normalized_time_ns = 3;
+  ClockDomainV1 source_clock_domain = 4;
+  string clock_session_id = 5;
+  NormalizationModeV1 normalization_mode = 6;
+  uint64 uncertainty_ns = 7;
+  ClockFallbackReasonV1 fallback_reason = 8;
+  string policy_version = 9;
+  reserved 1000 to max;
+}
+
+message GapEvidenceV1 {
+  GapClassV1 gap_class = 1;
+  uint64 first_missing_sequence = 2;
+  uint64 last_missing_sequence = 3;
+  uint64 count = 4;
+  string source_id = 5;
+  string details_code = 6;
+  reserved 1000 to max;
+}
+
+message VectorFieldV1 {
+  string field_name = 1;
+  repeated string element_names = 2;
+  repeated double values = 3 [packed = true];
+  bytes validity_bitmap_lsb0 = 4;
+  repeated string units = 5;
+  reserved 1000 to max;
+}
+
+message SourceFenceV1 {
+  string source_id = 1;
+  string session_id = 2;
+  uint64 start_sequence_exclusive = 3;
+  optional uint64 end_sequence_inclusive = 4;
+  uint64 accepted_count = 5;
+  uint64 written_count = 6;
+  uint64 durable_count = 7;
+  optional uint64 accepted_high_watermark = 8;
+  optional uint64 written_high_watermark = 9;
+  optional uint64 durable_high_watermark = 10;
+  reserved 1000 to max;
+}
+
+message CameraSampleV1 {
+  string stream_id = 1;
+  uint64 source_sequence = 2;
+  uint64 packet_sequence = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+  PixelFormatV1 pixel_format = 6;
+  PayloadEncodingV1 payload_encoding = 7;
+  oneof payload {
+    bytes image_bytes = 8;
+  }
+  TimestampSetV1 timestamps = 9;
+  string source_session_id = 10;
+  repeated GapEvidenceV1 gaps = 11;
+  string calibration_revision = 12;
+  uint64 collector_record_id = 13;
+  reserved 1000 to max;
+}
+
+message VideoAccessUnitV1 {
+  string stream_id = 1;
+  uint64 source_sequence = 2;
+  uint64 collector_record_id = 3;
+  TimestampSetV1 timestamps = 4;
+  sint64 pts = 5;
+  sint64 dts = 6;
+  uint32 timebase_num = 7;
+  uint32 timebase_den = 8;
+  PayloadEncodingV1 codec = 9;
+  string profile = 10;
+  string level = 11;
+  bytes codec_config_annexb = 12;
+  bytes codec_config_sha256 = 13;
+  bool keyframe = 14;
+  uint32 config_generation = 15;
+  string source_session_id = 16;
+  bytes access_unit_annexb = 17;
+  uint32 width = 18;
+  uint32 height = 19;
+  reserved 20;
+  reserved 1000 to max;
+}
+
+message RobotStateV1 {
+  uint64 source_sequence = 1;
+  uint64 collector_record_id = 2;
+  TimestampSetV1 timestamps = 3;
+  string source_session_id = 4;
+  repeated VectorFieldV1 fields = 5;
+  repeated GapEvidenceV1 gaps = 6;
+  reserved 1000 to max;
+}
+
+message RobotActionV1 {
+  uint64 source_sequence = 1;
+  uint64 collector_record_id = 2;
+  TimestampSetV1 timestamps = 3;
+  string source_session_id = 4;
+  string action_source = 5;
+  repeated VectorFieldV1 fields = 6;
+  repeated GapEvidenceV1 gaps = 7;
+  reserved 1000 to max;
+}
+
+message StreamSelectionV1 {
+  string stream_id = 1;
+  string source_session_id = 2;
+  optional uint64 source_sequence = 3;
+  optional sint64 selected_time_ns = 4;
+  optional sint64 residual_ns = 5;
+  SelectionKindV1 selection_kind = 6;
+  bool present = 7;
+  reserved 1000 to max;
+}
+
+message AlignedSampleV1 {
+  uint64 aligned_row_index = 1;
+  string reference_stream_id = 2;
+  string reference_session_id = 3;
+  uint64 reference_source_sequence = 4;
+  sint64 reference_normalized_time_ns = 5;
+  repeated StreamSelectionV1 selections = 6;
+  string alignment_policy = 7;
+  DropReasonV1 drop_reason = 8;
+  optional uint64 selected_state_sequence = 9;
+  optional uint64 selected_action_sequence = 10;
+  reserved 1000 to max;
+}
+
+message EpisodeEventV1 {
+  uint64 event_sequence = 1;
+  EpisodeEventTypeV1 event_type = 2;
+  TimestampSetV1 timestamps = 3;
+  bytes details_canonical_json = 4;
+  uint32 lifecycle_attempt = 5;
+  optional uint64 collector_record_id = 6;
+  repeated SourceFenceV1 source_fences = 7;
+  reserved 1000 to max;
+}

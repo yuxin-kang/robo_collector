@@ -1,7 +1,10 @@
 import json
 import hashlib
 import tempfile
+import types
 import unittest
+from unittest.mock import Mock, patch
+import sys
 from pathlib import Path
 
 from robo_collector.episode_quality import EpisodeQualityGate
@@ -106,6 +109,53 @@ def _complete_capture_metadata(*, attached: bool = True) -> dict:
         "camera_capture_sources": [source],
     }
 class EpisodeQualityGateTest(unittest.TestCase):
+    def test_canonical_ready_requires_both_structural_groups_and_content_qc(self):
+        value = manifest(
+            status="MATERIALIZED",
+            canonical={
+                "status": "READY",
+                "camera_mcap": {"path": "/tmp/camera.mcap", "sha256": "a" * 64},
+                "robot_mcap": {"path": "/tmp/robot.mcap", "sha256": "b" * 64},
+                "content_qc": {"canonical_status": "READY"},
+            },
+        )
+        validator = lambda path, expected_group: {
+                "sha256": "a" * 64 if expected_group == "camera" else "b" * 64
+            }
+        validate = Mock(side_effect=validator)
+        fake_module = types.SimpleNamespace(validate_canonical_mcap=validate)
+        with patch.dict(sys.modules, {"robo_collector.canonical_mcap": fake_module}):
+            report = EpisodeQualityGate().evaluate(value)
+        # The fixture intentionally omits derived Raw-v1 artifacts; MCAP QC
+        # still runs, while the legacy artifact gate correctly stays closed.
+        self.assertEqual(report["status"], "REJECT")
+        self.assertEqual(validate.call_count, 2)
+        self.assertFalse(any("mcap_" in reason for reason in report["reason"]))
+
+    def test_canonical_structural_failure_and_content_reject_fail_closed(self):
+        value = manifest(
+            status="MATERIALIZED",
+            canonical={
+                "status": "READY",
+                "camera_mcap": "/tmp/camera.mcap",
+                "robot_mcap": "/tmp/robot.mcap",
+                "content_qc": {"canonical_status": "REJECT"},
+            },
+        )
+        validator = lambda path, expected_group: (_ for _ in ()).throw(
+            ValueError("wrong canonical group")
+        )
+        with patch.dict(
+            sys.modules,
+            {"robo_collector.canonical_mcap": types.SimpleNamespace(
+                validate_canonical_mcap=validator
+            )},
+        ):
+            report = EpisodeQualityGate().evaluate(value)
+        self.assertEqual(report["status"], "REJECT")
+        self.assertTrue(any("mcap_structural_qc" in r for r in report["reason"]))
+        self.assertIn("content_qc_reject", report["reason"])
+
     @unittest.skipUnless(
         cv2 is not None and np is not None and parquet is not None and pa is not None,
         "pyarrow/opencv are required for real artifact validation",

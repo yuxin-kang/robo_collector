@@ -85,6 +85,8 @@ if [[ ! -x "$VENV_DIR/bin/python" || ! -f "$VENV_DIR/bin/activate" ]]; then
   create_venv "$VENV_DIR"
 fi
 
+# The validated venv path is selected at runtime.
+# shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 python -m pip install -U pip setuptools wheel
 python -m pip install \
@@ -94,9 +96,28 @@ python -m pip install \
   msgpack \
   PyYAML \
   pyarrow
+python -m pip install -r requirements-mcap.txt
+
+python - <<'PY'
+from importlib.metadata import version
+
+expected = {
+    "av": "17.1.0",
+    "mcap": "1.4.0",
+    "protobuf": "6.31.1",
+    "rfc8785": "0.1.4",
+}
+for distribution, wanted in expected.items():
+    installed = version(distribution)
+    if installed != wanted:
+        raise SystemExit(
+            f"{distribution}=={wanted} is required, found {installed}"
+        )
+PY
+python -m pip check
 
 if [[ "$WITH_LEROBOT" == "1" ]]; then
-  python -m pip install lerobot av
+  python -m pip install lerobot
 fi
 
 python -m pip install -e src/camera

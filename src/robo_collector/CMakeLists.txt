@@ -9,6 +9,7 @@ ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   scripts/lerobot_collector_node
   scripts/gesture_trigger_node
+  scripts/mcap_tool
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -45,6 +46,33 @@ if(BUILD_TESTING)
     ament_add_pytest_test(test_episode_quality test/test_episode_quality.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
+    ament_add_pytest_test(test_mcap_contract test/test_mcap_contract.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_mcap_episode test/test_mcap_episode.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_mcap_landing test/test_mcap_landing.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_ingestion_pipeline test/test_ingestion_pipeline.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_canonical_mcap test/test_canonical_mcap.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_content_quality test/test_content_quality.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_episode_catalog test/test_episode_catalog.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_mcap_dataset test/test_mcap_dataset.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_mcap_tool test/test_mcap_tool.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
     ament_add_pytest_test(test_spec_acceptance test/test_spec_acceptance.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -67,6 +95,9 @@ if(BUILD_TESTING)
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
     ament_add_pytest_test(test_gesture_trigger_node test/test_gesture_trigger_node.py
+      APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    ament_add_pytest_test(test_collector_capture_modes test/test_collector_capture_modes.py
       APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
     )
   endif()

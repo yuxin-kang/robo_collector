@@ -161,23 +161,57 @@ bash scripts/launch_data_collection.sh \
   --camera-host 192.168.123.164 \
   --camera-port 5555 \
   --camera-streams head,ego_view \
+  --reference-camera-stream head \
+  --camera-stream-rate head=30 \
+  --camera-stream-rate ego_view=30 \
   --root-output-dir outputs \
-  --fps 30 \
   --max-episode-duration-sec 600 \
   --max-episode-frames 18000 \
   --min-free-disk-bytes 2147483648 \
   --max-camera-clock-mapping-uncertainty-sec 0.05 \
-  --recording-mode raw_first \
+  --recording-mode raw_v1 \
   --raw-episode-root outputs/.raw_episodes \
   --raw-source-scope transport_observed \
   --camera-callback-queue-size 128
 ```
 
-`raw_first` writes only bounded raw records during `RECORDING`; MP4/Parquet
-are materialized after `STOP`, then checked by the Episode quality gate. The
-host collector intentionally keeps `transport_observed` until the camera-side
-spool is linked to the same task Episode; complete-source capture must not be
-claimed from a receiver-only recording.
+`reference_camera_stream` selects the RGB timeline used for aligned output.
+Supply one `--camera-stream-rate STREAM=HZ` for every configured stream when
+the acquisition rates are known; the values are configuration evidence, not a
+substitute for timestamps or measured counts. The robot observation rate is
+measured independently from received state callbacks and is never inferred
+from a camera rate. The old `--fps HZ` flag remains an opt-in compatibility
+fallback for deployments that have not migrated, but the launch script no
+longer assumes either 30 Hz camera or 50 Hz robot data.
+
+`raw_v1` writes bounded Raw v1 records during `RECORDING`; MP4/Parquet are
+materialized after `STOP`, then checked by the Episode quality gate. The
+deprecated `raw_first` spelling is accepted as an alias for `raw_v1` during
+rollout and emits a warning. The host collector intentionally keeps
+`transport_observed` until the camera-side spool is linked to the same task
+Episode; complete-source capture must not be claimed from a receiver-only
+recording.
+
+Capture modes are explicit:
+
+| Mode | Required capture sinks | Save/publication rule |
+| --- | --- | --- |
+| `raw_v1` | Raw v1 | Current rollout default; materialize and quality-check after STOP. |
+| `dual_write` | Raw v1 and landing MCAP | Migration evidence only; any sink fault quarantines the episode and cannot report save success. |
+| `mcap_first` | landing MCAP | Opt-in release candidate; seal and validate MCAP before any ready publication. |
+
+`mcap_first` is **not** the default. Promote it only after the release gate
+below passes on the deployment hardware.
+
+MCAP candidates use the same side-effect-free `EpisodeQualityGate` entry point
+as Raw v1 manifests. When a manifest includes `canonical` (or
+`canonical_artifacts`) evidence, the gate validates both immutable
+`camera_mcap` and `robot_mcap` files with the internal structural validator,
+checks the recorded SHA-256 values, and consumes `content_qc` status. A
+canonical `READY` candidate is rejected unless both modality groups and
+content QC pass; structural failures are fail-closed and never repair or
+rewrite a sealed MCAP. Raw v1 manifests without canonical evidence retain
+their existing validation path.
 
 For a mounted camera spool, use these raw options instead:
 
@@ -194,10 +228,40 @@ evidence stays `REVIEW`. A source with `REVIEW` or `REJECT` QC, or a
 transport-only source when complete capture is required, is not accepted by
 the GR00T/OpenPI raw-input path.
 
+### Phase 6/7 MCAP operations (local, fail-closed)
+
+The repository also provides an operator CLI for inspecting and validating an
+Episode without changing the sealed source artifacts:
+
+```bash
+python -m robo_collector.mcap_tool info <mcap-file>
+python -m robo_collector.mcap_tool doctor <mcap-file> --group camera
+python -m robo_collector.mcap_tool recover --attempt 1 <episode-dir>
+python -m robo_collector.mcap_tool replay <manifest.json> --format json
+python -m robo_collector.mcap_tool migration <manifest.json>
+python -m robo_collector.mcap_tool benchmark <mcap-file> --iterations 1
+```
+
+Run these commands from an activated workspace (or set `PYTHONPATH` to the
+Python package). Use `--group robot` for the robot stream. `info` and `doctor` are read-only; `recover` writes only an
+explicitly named recovery artifact and never replaces a sealed `*.mcap`.
+Replay and migration preserve source ordering and report parity differences
+instead of silently repairing them. Commands fail closed for missing paths,
+non-`READY` manifests, checksum failures, or incomplete source evidence.
+Benchmark output is diagnostic only and is not a hardware acceptance result.
+
+For shadow rollout, run the same Episode through Raw v1 and MCAP and compare
+accepted frontiers, per-stream sequences, timestamps, selected frame counts,
+manifest/config hashes, and terminal quality state. A parity report is
+evidence for promotion, not a replacement for the process-kill, reconnect, and
+soak gates below. The launch script keeps `raw_v1` as the default; select
+`dual_write` for migration evidence and `mcap_first` only after these gates
+pass.
+
 ### Recovery and acceptance evidence
 
-`raw_first` is the default recording mode. `legacy` is an explicit migration
-comparison mode; it is not the final raw-first publication path. At startup the
+`raw_v1` is the rollout default recording mode; `raw_first` is only its
+deprecated compatibility alias. At startup the
 collector scans `<raw-episode-root>` and retries pending or partially committed
 materialization jobs. Until that scan completes, `START` is rejected. If the
 scan or recovery coordinator fails, the node stays fail-closed and publishes an
@@ -218,6 +282,23 @@ queue-depth and disk/RSS/CPU status, deadline-miss counters, materialization
 job history, and the results of the dual-camera reconnect, process-kill,
 10 x 60-second, and 60-minute soak tests. These measurements are deployment
 evidence; the unit tests do not replace them.
+
+Before promoting `mcap_first`, run the same capture once in `dual_write` and
+verify all of the following against one episode ID:
+
+1. Raw v1 and MCAP terminal accepted frontiers match, with no missing or
+   unclassified per-sink disposition.
+2. Every camera source fence is bound to one spool generation/session and has
+   START/STOP evidence plus accepted, written, and durable high-watermarks.
+3. The sealed MCAP validates against its expected inventory and source fences;
+   Raw materialization and MCAP-derived output agree on selected RGB/state
+   counts and reference stream.
+4. Injected Raw-sink and MCAP-sink failures both quarantine `dual_write`; a
+   fault must never leave a READY pointer or saved-success status.
+5. Restart, reconnect, disk-full/write-failure, process-kill, soak, and normal
+   STOP runs retain their manifests, checksums, quality results, and operator
+   command line. Hardware results remain release evidence outside the unit
+   suite.
 
 The recommended `configs/collection_fields.yml` also stores
 `observation.state.joint_position` and `action.policy_action`, so the same

@@ -79,6 +79,25 @@ bash scripts/test_camera_client.sh --host 192.168.123.164 --port 5555
 bash scripts/run_camera_viewer.sh --host 192.168.123.164 --port 5555
 ```
 
+## Phase 6/7 运维检查与 shadow 回放
+
+采集主机上的 MCAP 运维命令应在 Episode 关闭后执行；不要在相机发布进程
+运行期间重写或替换源文件：
+
+```bash
+python -m robo_collector.mcap_tool info <mcap-file>
+python -m robo_collector.mcap_tool doctor <mcap-file> --group camera
+python -m robo_collector.mcap_tool replay <manifest.json> --format json
+python -m robo_collector.mcap_tool recover --attempt 1 <episode-dir>
+```
+
+`doctor --group` 校验指定 canonical MCAP 的结构和 checksum；Episode 级的
+manifest、source session、水位与质量门仍由 ingestion/QC 流程在发布前校验。
+`recover` 只能生成新的、可追溯的 recovery artifact，不能覆盖 sealed MCAP。
+shadow 对比时保留 Raw-v1 与 MCAP 两条输入的 episode ID、source manifest hash、
+sequence/gap 计数、时间戳和 READY/REVIEW/REJECT 结果；接收端
+`transport_observed` 不能被描述为相机侧完整事实源。
+
 ## Python 调用入口
 
 ```python

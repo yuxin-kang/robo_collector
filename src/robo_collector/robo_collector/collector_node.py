@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-import math
-import json
 import hashlib
+import json
+import math
 import os
-import subprocess
-import threading
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Mapping
-from dataclasses import dataclass
+import warnings
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -22,10 +23,21 @@ import rclpy
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, qos_profile_sensor_data
+
 from robo_collector_msgs.msg import RecordCommand
 from robo_state_msgs.msg import RoboStateSample
 
+from . import mcap_contract
 from .camera_cache import CameraFrameCache, parse_camera_streams
+from .capture_coordinator import (
+    CaptureCoordinator,
+    CaptureEnvelope,
+    CaptureMode,
+    CaptureResult,
+    CaptureSourceFence,
+    CaptureStatus,
+    SinkDisposition,
+)
 from .collector_state import (
     CollectorMode,
     CommandFingerprint,
@@ -33,13 +45,22 @@ from .collector_state import (
     RecordStateMachine,
     recording_safety_reason,
 )
+from .episode_quality import EpisodeQualityGate, write_quality_report
 from .field_config import (
     FieldConfigError,
     default_field_selection,
     load_optional_field_selection,
 )
 from .lerobot_dataset import LeRobotV21Writer, RobotFrame, SaveResult
-from .episode_quality import EpisodeQualityGate, write_quality_report
+from .mcap_episode import publish_raw_closed_manifest, validate_sealed_mcap
+from .mcap_landing import (
+    LandingChannel,
+    LandingRecord,
+    LandingSeal,
+    LandingWriter,
+    RequiredSource,
+    SourceFence,
+)
 from .raw_episode import (
     RawEpisodeRecorder,
     _hash_manifest,
@@ -48,14 +69,18 @@ from .raw_episode import (
     scan_startup,
     update_materialization_job,
 )
-from .raw_materializer import MaterializationConfig, MaterializationResult, RawEpisodeMaterializer
-from .save_worker import EpisodeSaveWorker
+from .raw_materializer import (
+    MaterializationConfig,
+    MaterializationResult,
+    RawEpisodeMaterializer,
+)
 from .sample_alignment import (
     message_stamp_sec,
     selected_missing_inputs,
     selected_source_timestamps_sec,
     source_timestamp_skew_sec,
 )
+from .save_worker import EpisodeSaveWorker
 
 try:
     import resource
@@ -63,15 +88,430 @@ except ImportError:  # pragma: no cover - non-POSIX deployment
     resource = None
 
 try:
-    from robo_collector_camera.raw_spool import read_camera_spool_snapshot
+    from robo_collector_camera.raw_spool import (
+        read_camera_spool_snapshot,
+        read_camera_spool_status,
+    )
 except ImportError:  # pragma: no cover - camera package is a deployment dependency
     read_camera_spool_snapshot = None
+    read_camera_spool_status = None
 
 
 @dataclass(frozen=True)
 class CachedStateSample:
     msg: RoboStateSample
     received_monotonic_sec: float
+
+
+def normalize_recording_mode(value: str) -> CaptureMode:
+    """Normalize the public capture mode while preserving the legacy alias."""
+    return CaptureMode.parse(value)
+
+
+def parse_camera_stream_rates(
+    value: str,
+    camera_streams: Sequence[str],
+    *,
+    fps_alias: float,
+) -> dict[str, float]:
+    """Parse ``STREAM=HZ`` entries or apply the temporary global fps alias."""
+    streams = tuple(str(item).strip() for item in camera_streams)
+    if not streams or any(not item for item in streams) or len(set(streams)) != len(streams):
+        raise ValueError("camera streams must be non-empty and unique")
+    text = str(value).strip()
+    if not text:
+        if not math.isfinite(fps_alias) or fps_alias <= 0:
+            raise ValueError("fps alias must be finite and positive")
+        return {stream: float(fps_alias) for stream in streams}
+    result: dict[str, float] = {}
+    for raw_entry in text.split(","):
+        name, separator, raw_rate = raw_entry.partition("=")
+        name = name.strip()
+        if not separator or name not in streams or name in result:
+            raise ValueError("camera_stream_rates_hz must uniquely configure each stream")
+        try:
+            rate = float(raw_rate)
+        except ValueError as exc:
+            raise ValueError("camera stream rate must be numeric") from exc
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("camera stream rate must be finite and positive")
+        result[name] = rate
+    if set(result) != set(streams):
+        raise ValueError("camera_stream_rates_hz must configure every camera stream")
+    return result
+
+
+def select_reference_camera_stream(value: str, camera_streams: Sequence[str]) -> str:
+    streams = tuple(str(item) for item in camera_streams)
+    selected = str(value).strip() or (streams[0] if streams else "")
+    if selected not in streams:
+        raise ValueError("reference_camera_stream must name a configured camera stream")
+    return selected
+
+
+def observe_callback_rate_hz(
+    previous_time: float | None,
+    previous_rate_hz: float | None,
+    current_time: float,
+) -> tuple[float, float | None]:
+    """Update an actual callback-rate estimate without using camera cadence."""
+    if previous_time is None or current_time <= previous_time:
+        return current_time, previous_rate_hz
+    instantaneous = 1.0 / (current_time - previous_time)
+    if not math.isfinite(instantaneous) or instantaneous <= 0:
+        return current_time, previous_rate_hz
+    estimated = (
+        instantaneous
+        if previous_rate_hz is None
+        else 0.9 * previous_rate_hz + 0.1 * instantaneous
+    )
+    return current_time, estimated
+
+
+def _canonical_rate(value: float) -> str:
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def camera_landing_sequence(source_sequence: int) -> int:
+    """Map source sequence 0 to landing sequence 1, reserving 0 for pre-frame START."""
+    if source_sequence < 0:
+        raise ValueError("camera source sequence must be non-negative")
+    return source_sequence + 1
+
+
+def camera_landing_high_watermark(source_sequence: Any) -> int:
+    """Normalize a nullable camera HWM onto the same landing-only offset."""
+    return 0 if source_sequence is None else camera_landing_sequence(int(source_sequence))
+
+
+@dataclass(frozen=True)
+class CollectorCaptureOperation:
+    """One format-neutral operation admitted once before sink fanout."""
+
+    raw_write: Callable[[RawEpisodeRecorder], None] | None
+    mcap_record: Callable[[int], LandingRecord]
+
+
+class RawEpisodeSinkAdapter:
+    def __init__(
+        self,
+        recorder: RawEpisodeRecorder,
+        *,
+        before_seal: Callable[[RawEpisodeRecorder], None] | None = None,
+    ) -> None:
+        self.recorder = recorder
+        self.before_seal = before_seal
+        self.command = "STOP"
+        self.reason = "user_stop"
+
+    def submit(self, envelope: CaptureEnvelope) -> SinkDisposition:
+        operation = _capture_operation(envelope)
+        if operation.raw_write is not None:
+            operation.raw_write(self.recorder)
+        return SinkDisposition.WRITTEN
+
+    def seal(self, source_fences: tuple[CaptureSourceFence, ...]) -> None:
+        if self.before_seal is not None:
+            self.before_seal(self.recorder)
+        self.recorder.update_metadata(
+            {"capture_source_fences": [fence.__dict__ for fence in source_fences]}
+        )
+        if self.command == "DISCARD":
+            self.recorder.discard(reason=self.reason)
+        else:
+            self.recorder.close(command=self.command, reason=self.reason)
+
+    def close(self) -> None:
+        return
+
+
+class McapLandingSinkAdapter:
+    def __init__(self, writer: LandingWriter) -> None:
+        self.writer = writer
+        self.seal_result: LandingSeal | None = None
+        self.manifest_path: Path | None = None
+
+    def submit(self, envelope: CaptureEnvelope) -> SinkDisposition:
+        record = _capture_operation(envelope).mcap_record(envelope.collector_record_id)
+        if record.collector_record_id != envelope.collector_record_id:
+            raise ValueError("MCAP record collector_record_id changed during fanout")
+        self.writer.submit(record)
+        return SinkDisposition.ACCEPTED
+
+    def seal(self, source_fences: tuple[CaptureSourceFence, ...]) -> None:
+        fences = tuple(
+            SourceFence(
+                item.source_id,
+                item.session_id,
+                item.start_sequence_exclusive,
+                item.end_sequence_inclusive,
+            )
+            for item in source_fences
+        )
+        self.seal_result = self.writer.stop(source_fences=fences)
+        validate_sealed_mcap(self.seal_result.sealed_path)
+        self.manifest_path = publish_raw_closed_manifest(
+            self.writer.episode_dir,
+            self.seal_result.sealed_path,
+            self.seal_result.last_checkpoint,
+            source_complete=all(item.end_sequence_inclusive is not None for item in fences),
+        )
+
+    def close(self) -> None:
+        self.writer.close()
+
+
+def camera_source_fences_from_status(
+    start_status: Mapping[str, Any],
+    stop_status: Mapping[str, Any],
+    camera_streams: Sequence[str],
+) -> tuple[CaptureSourceFence, ...]:
+    """Bind same-session/generation durable camera START and STOP evidence."""
+    if start_status.get("session_id") != stop_status.get("session_id"):
+        raise ValueError("camera source session changed during capture")
+    if not stop_status.get("source_complete") or stop_status.get("close_failures"):
+        raise ValueError("camera source has no clean durable STOP")
+    session_id = str(stop_status.get("session_id") or "")
+    start_streams = start_status.get("streams")
+    stop_streams = stop_status.get("streams")
+    if not session_id or not isinstance(start_streams, Mapping) or not isinstance(stop_streams, Mapping):
+        raise ValueError("camera source status is incomplete")
+    result: list[CaptureSourceFence] = []
+    for stream in sorted(str(item) for item in camera_streams):
+        start = start_streams.get(stream)
+        stop = stop_streams.get(stream)
+        if not isinstance(start, Mapping) or not isinstance(stop, Mapping):
+            raise ValueError(f"camera source status is missing stream {stream}")
+        if start.get("generation") != stop.get("generation"):
+            raise ValueError(f"camera source generation changed for {stream}")
+        if not stop.get("source_complete") or stop.get("close_error"):
+            raise ValueError(f"camera source {stream} did not close cleanly")
+        start_fence = start.get("start_fence")
+        stop_fence = stop.get("stop_fence")
+        if not isinstance(start_fence, Mapping) or not isinstance(stop_fence, Mapping):
+            raise ValueError(f"camera stream {stream} lacks durable START/STOP")
+        start_watermark = camera_landing_high_watermark(
+            start.get("durable_high_watermark")
+        )
+        stop_watermark = stop.get("durable_high_watermark")
+        if stop_watermark is None:
+            raise ValueError(f"camera stream {stream} lacks a durable STOP watermark")
+        end_watermark = camera_landing_high_watermark(stop_watermark)
+        result.append(
+            CaptureSourceFence(
+                source_id=f"camera.{stream}",
+                session_id=session_id,
+                start_sequence_exclusive=int(start_watermark),
+                end_sequence_inclusive=int(end_watermark),
+            )
+        )
+    return tuple(result)
+
+
+def required_camera_sources_from_status(
+    status: Mapping[str, Any], camera_streams: Sequence[str]
+) -> tuple[RequiredSource, ...]:
+    session_id = str(status.get("session_id") or "")
+    streams = status.get("streams")
+    if not session_id or not isinstance(streams, Mapping):
+        raise ValueError("camera START status is incomplete")
+    required: list[RequiredSource] = []
+    for stream in sorted(str(item) for item in camera_streams):
+        stream_status = streams.get(stream)
+        if not isinstance(stream_status, Mapping):
+            raise ValueError(f"camera START status is missing stream {stream}")
+        if not isinstance(stream_status.get("start_fence"), Mapping):
+            raise ValueError(f"camera stream {stream} lacks a durable START fence")
+        watermark = camera_landing_high_watermark(
+            stream_status.get("durable_high_watermark")
+        )
+        required.append(
+            RequiredSource(
+                source_id=f"camera.{stream}",
+                session_id=session_id,
+                start_sequence_exclusive=int(watermark),
+            )
+        )
+    return tuple(required)
+
+
+def mcap_event_record(
+    collector_record_id: int,
+    *,
+    event_name: str,
+    details: Mapping[str, Any],
+    source_id: str = "collector",
+    session_id: str = "",
+    source_sequence: int | None = None,
+    packet_sequence: int | None = None,
+    source_fences: Sequence[CaptureSourceFence] = (),
+) -> LandingRecord:
+    message_type = mcap_contract.MESSAGE_TYPES["EpisodeEventV1"]
+    event_type = message_type.DESCRIPTOR.fields_by_name[
+        "event_type"
+    ].enum_type.values_by_name.get(f"EPISODE_EVENT_{event_name.upper()}")
+    message = message_type(
+        event_sequence=collector_record_id,
+        event_type=event_type.number if event_type is not None else 0,
+        details_canonical_json=mcap_contract.canonical_json_bytes(dict(details)),
+        lifecycle_attempt=1,
+        collector_record_id=collector_record_id,
+    )
+    for fence in source_fences:
+        end = fence.end_sequence_inclusive
+        count = 0 if end is None else end - fence.start_sequence_exclusive
+        message.source_fences.add(
+            source_id=fence.source_id,
+            session_id=fence.session_id,
+            start_sequence_exclusive=fence.start_sequence_exclusive,
+            end_sequence_inclusive=0 if end is None else end,
+            accepted_count=count,
+            written_count=count,
+            durable_count=count,
+            accepted_high_watermark=0 if end is None else end,
+            written_high_watermark=0 if end is None else end,
+            durable_high_watermark=0 if end is None else end,
+        )
+    timestamp_ns = time.time_ns()
+    return LandingRecord(
+        channel="/episode/event",
+        data=message.SerializeToString(deterministic=True),
+        log_time=timestamp_ns,
+        publish_time=timestamp_ns,
+        sequence=collector_record_id,
+        collector_record_id=collector_record_id,
+        source_id=source_id,
+        session_id=session_id,
+        source_sequence=source_sequence,
+        packet_sequence=packet_sequence,
+    )
+
+
+def mcap_robot_state_record(
+    collector_record_id: int,
+    *,
+    state: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+    source_sequence: int,
+    session_id: str,
+) -> LandingRecord:
+    message_type = mcap_contract.MESSAGE_TYPES["RobotStateV1"]
+    message = message_type(
+        source_sequence=source_sequence,
+        collector_record_id=collector_record_id,
+        source_session_id=session_id,
+    )
+    for field_name, values in _flatten_numeric_state(state):
+        field = message.fields.add(field_name=field_name)
+        field.values.extend(values)
+        field.validity_bitmap_lsb0 = bytes([0xFF] * ((len(values) + 7) // 8))
+    receive_monotonic = provenance.get("receive_monotonic_timestamp")
+    if isinstance(receive_monotonic, (int, float)) and math.isfinite(receive_monotonic):
+        message.timestamps.receive_time_ns = int(float(receive_monotonic) * 1e9)
+        message.timestamps.normalized_time_ns = message.timestamps.receive_time_ns
+        message.timestamps.source_clock_domain = 3
+        message.timestamps.normalization_mode = 3
+        message.timestamps.clock_session_id = session_id
+        message.timestamps.policy_version = "collector_callback_observed_v1"
+    timestamp_ns = time.time_ns()
+    return LandingRecord(
+        channel="/robot/state/raw",
+        data=message.SerializeToString(deterministic=True),
+        log_time=timestamp_ns,
+        publish_time=timestamp_ns,
+        sequence=collector_record_id,
+        collector_record_id=collector_record_id,
+        source_id="robot_state",
+        session_id=session_id,
+        source_sequence=source_sequence,
+    )
+
+
+def mcap_camera_record(
+    collector_record_id: int,
+    *,
+    stream: str,
+    payload: bytes,
+    payload_encoding: str,
+    provenance: Mapping[str, Any],
+    source_sequence: int,
+    packet_sequence: int | None,
+    session_id: str,
+) -> LandingRecord:
+    normalized_encoding = payload_encoding.strip().lower()
+    is_h264 = "h264" in normalized_encoding or "annex" in normalized_encoding
+    if is_h264:
+        message = mcap_contract.MESSAGE_TYPES["VideoAccessUnitV1"](
+            stream_id=stream,
+            source_sequence=source_sequence,
+            collector_record_id=collector_record_id,
+            codec=4,
+            source_session_id=session_id,
+            access_unit_annexb=payload,
+            width=int(provenance.get("width") or 0),
+            height=int(provenance.get("height") or 0),
+        )
+    else:
+        encoding_value = 3 if "png" in normalized_encoding else 2
+        message = mcap_contract.MESSAGE_TYPES["CameraSampleV1"](
+            stream_id=stream,
+            source_sequence=source_sequence,
+            packet_sequence=packet_sequence or 0,
+            width=int(provenance.get("width") or 0),
+            height=int(provenance.get("height") or 0),
+            payload_encoding=encoding_value,
+            image_bytes=payload,
+            source_session_id=session_id,
+            calibration_revision=str(provenance.get("calibration_revision") or ""),
+            collector_record_id=collector_record_id,
+        )
+    receive_monotonic = provenance.get("receive_monotonic_timestamp")
+    if isinstance(receive_monotonic, (int, float)) and math.isfinite(receive_monotonic):
+        message.timestamps.receive_time_ns = int(float(receive_monotonic) * 1e9)
+        message.timestamps.normalized_time_ns = message.timestamps.receive_time_ns
+        message.timestamps.source_clock_domain = 3
+        message.timestamps.normalization_mode = 3
+        message.timestamps.clock_session_id = session_id
+        message.timestamps.policy_version = "camera_callback_observed_v1"
+    timestamp_ns = time.time_ns()
+    return LandingRecord(
+        channel=mcap_contract.camera_topic(stream, h264=is_h264),
+        data=message.SerializeToString(deterministic=True),
+        log_time=timestamp_ns,
+        publish_time=timestamp_ns,
+        sequence=collector_record_id,
+        collector_record_id=collector_record_id,
+        source_id=f"camera.{stream}",
+        session_id=session_id,
+        source_sequence=camera_landing_sequence(source_sequence),
+        packet_sequence=packet_sequence,
+    )
+
+
+def _flatten_numeric_state(
+    state: Mapping[str, Any], prefix: str = ""
+) -> tuple[tuple[str, tuple[float, ...]], ...]:
+    fields: list[tuple[str, tuple[float, ...]]] = []
+    for key, value in sorted(state.items()):
+        field_name = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, Mapping):
+            fields.extend(_flatten_numeric_state(value, field_name))
+            continue
+        values = value if isinstance(value, (list, tuple)) else (value,)
+        if values and all(
+            isinstance(item, (int, float))
+            and not isinstance(item, bool)
+            and math.isfinite(float(item))
+            for item in values
+        ):
+            fields.append((field_name, tuple(float(item) for item in values)))
+    return tuple(fields)
+
+
+def _capture_operation(envelope: CaptureEnvelope) -> CollectorCaptureOperation:
+    if not isinstance(envelope.payload, CollectorCaptureOperation):
+        raise TypeError("collector fanout payload must be CollectorCaptureOperation")
+    return envelope.payload
 
 
 class LeRobotCollectorNode(Node):
@@ -87,6 +527,8 @@ class LeRobotCollectorNode(Node):
         self.declare_parameter("camera_port", 5555)
         self.declare_parameter("camera_stream", "")
         self.declare_parameter("camera_streams", "head,ego_view")
+        self.declare_parameter("reference_camera_stream", "")
+        self.declare_parameter("camera_stream_rates_hz", "")
         self.declare_parameter("dataset_name", "")
         self.declare_parameter("root_output_dir", "outputs")
         self.declare_parameter("field_config_path", "")
@@ -109,10 +551,7 @@ class LeRobotCollectorNode(Node):
         self.declare_parameter("max_episode_frames", 18000)
         self.declare_parameter("min_free_disk_bytes", 2147483648)
         self.declare_parameter("save_shutdown_grace_sec", 10.0)
-        # Raw-first is the safe final-spec default.  ``legacy`` remains an
-        # explicit migration/comparison mode and must not be treated as the
-        # authoritative publication path.
-        self.declare_parameter("recording_mode", "raw_first")
+        self.declare_parameter("recording_mode", "raw_v1")
         self.declare_parameter("raw_recording_enabled", True)
         self.declare_parameter("raw_episode_root", "")
         self.declare_parameter("raw_source_scope", "transport_observed")
@@ -170,18 +609,37 @@ class LeRobotCollectorNode(Node):
         self._save_shutdown_grace_sec = float(
             self.get_parameter("save_shutdown_grace_sec").value
         )
-        self._recording_mode = str(self.get_parameter("recording_mode").value).strip().lower()
-        if self._recording_mode not in {"legacy", "raw_first"}:
-            raise RuntimeError("recording_mode must be 'legacy' or 'raw_first'")
+        configured_recording_mode = str(
+            self.get_parameter("recording_mode").value
+        ).strip().lower()
+        if configured_recording_mode == "raw_first":
+            self.get_logger().warn(
+                "recording_mode=raw_first is deprecated; use raw_v1"
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            try:
+                self._capture_mode = normalize_recording_mode(
+                    configured_recording_mode
+                )
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+        self._recording_mode = self._capture_mode.value
         self._raw_recording_enabled = bool(
             self.get_parameter("raw_recording_enabled").value
         )
-        if self._recording_mode == "raw_first" and not self._raw_recording_enabled:
-            raise RuntimeError("raw_first recording_mode requires raw_recording_enabled")
+        if (
+            self._capture_mode in {CaptureMode.RAW_V1, CaptureMode.DUAL_WRITE}
+            and not self._raw_recording_enabled
+        ):
+            raise RuntimeError(
+                f"{self._recording_mode} recording_mode requires raw_recording_enabled"
+            )
         raw_root_parameter = str(self.get_parameter("raw_episode_root").value).strip()
         output_root_parameter = Path(
             str(self.get_parameter("root_output_dir").value)
         ).expanduser()
+        self._mcap_episode_root = output_root_parameter / ".mcap_episodes"
         self._raw_episode_root = (
             Path(raw_root_parameter).expanduser()
             if raw_root_parameter
@@ -255,6 +713,18 @@ class LeRobotCollectorNode(Node):
             camera_streams = parse_camera_streams(
                 self.get_parameter("camera_streams").value
             )
+        try:
+            self._reference_camera_stream = select_reference_camera_stream(
+                self.get_parameter("reference_camera_stream").value,
+                camera_streams,
+            )
+            self._camera_stream_rates_hz = parse_camera_stream_rates(
+                self.get_parameter("camera_stream_rates_hz").value,
+                camera_streams,
+                fps_alias=self._fps,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         dataset_name = str(self.get_parameter("dataset_name").value).strip() or None
         field_config_path = str(self.get_parameter("field_config_path").value).strip()
         try:
@@ -289,10 +759,13 @@ class LeRobotCollectorNode(Node):
                 "host": str(self.get_parameter("camera_host").value),
                 "port": int(self.get_parameter("camera_port").value),
                 "streams": list(camera_streams),
+                "reference_stream": self._reference_camera_stream,
+                "configured_rates_hz": dict(self._camera_stream_rates_hz),
                 "callback_queue_size": self._camera_callback_queue_size,
             },
             "alignment": {
                 "fps": self._fps,
+                "reference_camera_stream": self._reference_camera_stream,
                 "max_state_age_sec": self._max_state_age_sec,
                 "max_camera_age_sec": self._max_camera_age_sec,
                 "max_inter_camera_skew_sec": self._max_inter_camera_skew_sec,
@@ -354,6 +827,8 @@ class LeRobotCollectorNode(Node):
         self._last_episode_outcome = ""
         self._command_receipts = CommandReceiptLedger()
         self._state_sample_count = 0
+        self._last_state_callback_monotonic_sec: float | None = None
+        self._robot_callback_rate_hz: float | None = None
         self._last_state_sample_log_monotonic_sec = 0.0
         self._state_camera_skew_samples: list[float] = []
         self._state_camera_skew_sample_cursor = 0
@@ -362,6 +837,11 @@ class LeRobotCollectorNode(Node):
         self._camera_age_samples: list[float] = []
         self._camera_age_sample_cursor = 0
         self._raw_recorder: RawEpisodeRecorder | None = None
+        self._capture_coordinator: CaptureCoordinator | None = None
+        self._capture_result: CaptureResult | None = None
+        self._raw_sink_adapter: RawEpisodeSinkAdapter | None = None
+        self._mcap_sink_adapter: McapLandingSinkAdapter | None = None
+        self._camera_source_start_status: Mapping[str, Any] | None = None
         self._raw_episode_path: Path | None = None
         self._raw_materialization_job: dict[str, Any] | None = None
         self._raw_state_sequence = 0
@@ -424,15 +904,17 @@ class LeRobotCollectorNode(Node):
             camera_streams,
             self.get_logger(),
             max_inter_camera_skew_sec=self._max_inter_camera_skew_sec,
-            expected_fps=self._fps,
+            expected_fps=self._camera_stream_rates_hz[
+                self._reference_camera_stream
+            ],
             receive_mode="recording",
-            decode_images=self._recording_mode == "legacy",
+            decode_images=False,
             callback_queue_size=self._camera_callback_queue_size,
         )
         self._camera_cache.set_packet_callback(self._on_camera_packet)
         self._camera_cache.start()
 
-        if self._raw_recording_enabled:
+        if self._capture_mode in {CaptureMode.RAW_V1, CaptureMode.DUAL_WRITE}:
             try:
                 pending_jobs = scan_startup(
                     self._raw_episode_root,
@@ -537,6 +1019,14 @@ class LeRobotCollectorNode(Node):
 
     def _on_state(self, msg: RoboStateSample) -> None:
         now = time.monotonic()
+        (
+            self._last_state_callback_monotonic_sec,
+            self._robot_callback_rate_hz,
+        ) = observe_callback_rate_hz(
+            self._last_state_callback_monotonic_sec,
+            self._robot_callback_rate_hz,
+            now,
+        )
         was_unavailable_or_stale = self._latest_state is None or (
             now - self._latest_state.received_monotonic_sec > self._max_state_age_sec
         )
@@ -544,14 +1034,13 @@ class LeRobotCollectorNode(Node):
         self._state_sample_count += 1
         with self._lifecycle_lock:
             recorder = self._raw_recorder
-            recording_raw = (
+            recording_capture = (
                 self._state_machine.mode == CollectorMode.RECORDING
-                and recorder is not None
-                and not recorder.closed
+                and self._capture_coordinator is not None
             )
             capture_start = self._raw_capture_start_monotonic_time
             if (
-                recording_raw
+                recording_capture
                 and capture_start is not None
                 and now < capture_start
             ):
@@ -560,15 +1049,16 @@ class LeRobotCollectorNode(Node):
                 # preview sample, but never attribute a pre-START message to
                 # the new raw Episode.
                 recorder = None
-        if recording_raw:
+        if recording_capture:
             try:
                 with self._lifecycle_lock:
-                    if self._raw_recorder is recorder and not recorder.closed:
+                    if self._capture_coordinator is not None:
                         self._append_raw_state(msg, now, now)
             except Exception as exc:
-                reason = f"raw state append failed: {exc}"
+                reason = f"capture state append failed: {exc}"
                 self.get_logger().error(reason)
-                self._isolate_raw_failure(recorder, reason)
+                if recorder is not None:
+                    self._isolate_raw_failure(recorder, reason)
                 if self._state_machine.mode == CollectorMode.RECORDING:
                     try:
                         self._state_machine.mark_failed(reason)
@@ -1009,6 +1499,24 @@ class LeRobotCollectorNode(Node):
         return True
 
     def _begin_save_episode(self) -> None:
+        if self._capture_mode is CaptureMode.MCAP_FIRST:
+            session = self._state_machine.session
+            if self._capture_result is None or not self._capture_result.success:
+                self._state_machine.mark_failed("MCAP capture is not durably sealed")
+                self._publish_status(
+                    DiagnosticStatus.ERROR,
+                    "save failed; DISCARD required: MCAP capture is not durably sealed",
+                )
+                return
+            self._state_machine.mark_saving()
+            self._state_machine.mark_saved()
+            self._last_episode_id = session.episode_id if session is not None else ""
+            self._last_episode_outcome = "SAVED"
+            self._publish_status(
+                DiagnosticStatus.OK,
+                f"MCAP sealed: episode={self._last_episode_id}",
+            )
+            return
         if self._save_worker.has_active:
             reason = "cannot start save because another save task is active"
             self._state_machine.mark_failed(reason)
@@ -1024,7 +1532,7 @@ class LeRobotCollectorNode(Node):
         self._save_phase = "queued"
         try:
             self._state_machine.mark_saving()
-            if self._recording_mode == "raw_first":
+            if self._capture_mode in {CaptureMode.RAW_V1, CaptureMode.DUAL_WRITE}:
                 if self._raw_episode_path is None or self._raw_materialization_job is None:
                     self._mark_no_materialized_artifact()
                     raise RuntimeError("raw-first STOP has no durable materialization job")
@@ -1145,8 +1653,6 @@ class LeRobotCollectorNode(Node):
         )
 
     def _start_raw_episode(self, task_prompt: str, requested_episode_id: str) -> None:
-        if not self._raw_recording_enabled:
-            return
         self._camera_cache.reset_episode_window()
         self._last_stale_camera_identity = None
         self._camera_callback_overflow_at_start = int(
@@ -1171,6 +1677,24 @@ class LeRobotCollectorNode(Node):
         self._raw_camera_packet_high_watermarks.clear()
         self._raw_camera_binding_checkpoint_signature = None
         self._raw_recording_failed_reason = None
+        if self._capture_mode is CaptureMode.MCAP_FIRST:
+            self._raw_episode_path = None
+            self._raw_recorder = None
+            self._raw_capture_start_wall_time = time.time()
+            self._raw_capture_start_monotonic_time = time.monotonic()
+            self._raw_state_sequence = 0
+            self._raw_event_sequence = 0
+            self._raw_frame_count = 0
+            self._record_tick_count = 0
+            self._timer_deadline_misses = 0
+            self._last_record_tick_monotonic_sec = None
+            self._start_capture_coordinator(
+                recorder=None,
+                episode_id=raw_episode_id,
+                task_prompt=task_prompt,
+                requested_episode_id=requested_episode_id,
+            )
+            return
         common_metadata = {
             "requested_episode_id": requested_episode_id,
             "collector_session_id": raw_session_id,
@@ -1186,8 +1710,16 @@ class LeRobotCollectorNode(Node):
             "collector_git_commit": self._collector_git_commit,
             "config_hash": self._collector_config_hash,
             "capture_config": self._capture_config,
-            "materialization_role": "primary" if self._recording_mode == "raw_first" else "comparison_shadow",
-            "primary_output": "raw_materialization" if self._recording_mode == "raw_first" else "legacy_writer",
+            "materialization_role": (
+                "primary"
+                if self._capture_mode is CaptureMode.RAW_V1
+                else "dual_write_compatibility"
+            ),
+            "primary_output": (
+                "raw_materialization"
+                if self._capture_mode is CaptureMode.RAW_V1
+                else "raw_and_mcap"
+            ),
             "camera_raw_spool_root": (
                 str(self._camera_raw_spool_root)
                 if self._camera_raw_spool_root is not None
@@ -1257,23 +1789,187 @@ class LeRobotCollectorNode(Node):
         self._record_tick_count = 0
         self._timer_deadline_misses = 0
         self._last_record_tick_monotonic_sec = None
+        self._start_capture_coordinator(
+            recorder=recorder,
+            episode_id=str(recorder.manifest["episode_id"]),
+            task_prompt=task_prompt,
+            requested_episode_id=requested_episode_id,
+        )
+
+    def _start_capture_coordinator(
+        self,
+        *,
+        recorder: RawEpisodeRecorder | None,
+        episode_id: str,
+        task_prompt: str,
+        requested_episode_id: str,
+    ) -> None:
+        raw_adapter = None
+        if recorder is not None:
+            raw_adapter = RawEpisodeSinkAdapter(
+                recorder,
+                before_seal=(
+                    self._attach_camera_spool
+                    if self._raw_source_scope == "camera_capture"
+                    else None
+                ),
+            )
+        mcap_adapter = None
+        self._camera_source_start_status = self._read_camera_source_status()
+        if self._capture_mode in {CaptureMode.DUAL_WRITE, CaptureMode.MCAP_FIRST}:
+            if self._robot_callback_rate_hz is None:
+                raise RuntimeError(
+                    "MCAP capture requires an observed robot callback rate before START"
+                )
+            required_sources: tuple[RequiredSource, ...] = ()
+            if self._camera_source_start_status is not None:
+                required_sources = required_camera_sources_from_status(
+                    self._camera_source_start_status,
+                    self._camera_cache.streams,
+                )
+            elif self._raw_source_scope == "camera_capture":
+                raise RuntimeError("camera_capture requires durable camera START status")
+            writer = LandingWriter(
+                self._mcap_episode_root / episode_id,
+                episode_id=episode_id,
+                collection_mode=self._capture_mode.value,
+                required_sources=required_sources,
+                queue_capacity=self._camera_callback_queue_size,
+            )
+            robot_rate_metadata = (
+                {
+                    "robo.nominal_rate_hz": _canonical_rate(
+                        self._robot_callback_rate_hz
+                    ),
+                    "robo.observed_rate_hz": _canonical_rate(
+                        self._robot_callback_rate_hz
+                    ),
+                }
+                if self._robot_callback_rate_hz is not None
+                else {}
+            )
+            writer.register_channel(
+                LandingChannel(
+                    topic="/episode/event",
+                    schema_name="EpisodeEventV1",
+                    schema_data=mcap_contract.descriptor_set_bytes(),
+                    metadata={
+                        "robo.robot_id": "collector",
+                        "robo.schema_version": "1",
+                        "robo.pipeline_version": "collector_node",
+                    },
+                )
+            )
+            writer.register_channel(
+                LandingChannel(
+                    topic="/robot/state/raw",
+                    schema_name="RobotStateV1",
+                    schema_data=mcap_contract.descriptor_set_bytes(),
+                    metadata={
+                        "robo.source_id": "robot_state",
+                        "robo.robot_id": "collector",
+                        "robo.frame_id": "base",
+                        "robo.clock_domain": "robot_state_callback",
+                        "robo.schema_version": "1",
+                        "robo.pipeline_version": "collector_node",
+                        **robot_rate_metadata,
+                    },
+                )
+            )
+            for stream in self._camera_cache.streams:
+                for h264, schema_name in (
+                    (False, "CameraSampleV1"),
+                    (True, "VideoAccessUnitV1"),
+                ):
+                    writer.register_channel(
+                        LandingChannel(
+                            topic=mcap_contract.camera_topic(stream, h264=h264),
+                            schema_name=schema_name,
+                            schema_data=mcap_contract.descriptor_set_bytes(),
+                            metadata={
+                                "robo.stream_id": str(stream),
+                                "robo.source_id": f"camera.{stream}",
+                                "robo.sensor_id": str(stream),
+                                "robo.frame_id": str(stream),
+                                "robo.calibration_revision": "unknown",
+                                "robo.schema_version": "1",
+                                "robo.pipeline_version": "collector_node",
+                                "robo.nominal_rate_hz": _canonical_rate(
+                                    self._camera_stream_rates_hz[str(stream)]
+                                ),
+                                "robo.observed_rate_hz": "0",
+                                "robo.clock_domain": "camera_source",
+                                **(
+                                    {"robo.codec": "h264"}
+                                    if h264
+                                    else {"robo.pixel_format": "rgb8"}
+                                ),
+                            },
+                        )
+                    )
+            writer.start()
+            mcap_adapter = McapLandingSinkAdapter(writer)
+        coordinator = CaptureCoordinator(
+            self._capture_mode,
+            raw_sink=raw_adapter,
+            mcap_sink=mcap_adapter,
+            queue_capacity=self._camera_callback_queue_size,
+        ).start()
+        self._raw_sink_adapter = raw_adapter
+        self._mcap_sink_adapter = mcap_adapter
+        self._capture_coordinator = coordinator
+        self._capture_result = None
         self._append_raw_event(
             "START",
-            {"task_prompt": task_prompt, "requested_episode_id": requested_episode_id},
+            {
+                "task_prompt": task_prompt,
+                "requested_episode_id": requested_episode_id,
+                "recording_mode": self._capture_mode.value,
+            },
         )
+
+    def _read_camera_source_status(self) -> Mapping[str, Any] | None:
+        if self._camera_raw_spool_root is None or read_camera_spool_status is None:
+            return None
+        root = self._camera_raw_spool_root
+        if (root / "manifest.inprogress.json").exists() or (
+            root / "manifest.json"
+        ).exists():
+            return read_camera_spool_status(root)
+        sessions = sorted(
+            (
+                path
+                for path in root.iterdir()
+                if path.is_dir()
+                and (
+                    (path / "manifest.inprogress.json").exists()
+                    or (path / "manifest.json").exists()
+                )
+            ),
+            key=lambda path: path.stat().st_mtime_ns,
+        )
+        return read_camera_spool_status(sessions[-1]) if sessions else None
 
     def _on_camera_packet(self, packet: Any) -> None:
         """Persist received encoded payloads while an Episode is active."""
         with self._lifecycle_lock:
             recorder = self._raw_recorder
-            recording_raw = self._state_machine.mode == CollectorMode.RECORDING
+            recording_capture = (
+                self._state_machine.mode == CollectorMode.RECORDING
+                and self._capture_coordinator is not None
+            )
         session_value = _packet_member(packet, "session_id", "")
         session_id = str(session_value or "")
         frames = _packet_member(packet, "frames", {})
-        if recording_raw and self._packet_received_before_capture_start(packet, frames):
+        if recording_capture and self._packet_received_before_capture_start(packet, frames):
             return
         self._observe_camera_clock_mapping(session_id, frames)
-        if not recording_raw or recorder is None or recorder.closed:
+        if not recording_capture:
+            return
+        if recorder is None:
+            self._append_mcap_camera_frames(packet, session_id, frames)
+            return
+        if recorder.closed:
             return
         if self._raw_source_scope == "camera_capture":
             # The source-side spool is the authoritative camera stream in
@@ -1311,7 +2007,7 @@ class LeRobotCollectorNode(Node):
             packet_sequence = packet.get("packet_sequence")
         cameras = metadata.get("cameras", {}) if isinstance(metadata, dict) else {}
         if not isinstance(frames, Mapping):
-            if recording_raw and recorder is not None and not recorder.closed:
+            if recording_capture and not recorder.closed:
                 self._record_raw_rejection(recorder, "camera_packet", "invalid_frames")
             return
         if not isinstance(producer_gaps, Mapping):
@@ -1408,18 +2104,36 @@ class LeRobotCollectorNode(Node):
                         or recorder.closed
                     ):
                         return
-                    recorder.append_camera(
-                        str(stream),
-                        payload,
-                        provenance,
-                        payload_encoding=str(
+                    raw_kwargs = {
+                        "payload_encoding": str(
                             _packet_member(frame, "payload_encoding") or "image/jpeg"
                         ),
-                        serial=serial,
-                        producer_gap_count=producer_gap_count,
-                        publisher_gap_count=publisher_gap_count,
-                        transport_gap_count=transport_gap_count,
-                        unattributed_gap_count=unattributed_gap_count,
+                        "serial": serial,
+                        "producer_gap_count": producer_gap_count,
+                        "publisher_gap_count": publisher_gap_count,
+                        "transport_gap_count": transport_gap_count,
+                        "unattributed_gap_count": unattributed_gap_count,
+                    }
+                    self._submit_capture_operation(
+                        CollectorCaptureOperation(
+                            raw_write=lambda raw_recorder, stream=str(stream), payload=bytes(payload), provenance=dict(provenance), raw_kwargs=dict(raw_kwargs): raw_recorder.append_camera(
+                                stream, payload, provenance, **raw_kwargs
+                            ),
+                            mcap_record=lambda record_id, stream=str(stream), payload=bytes(payload), payload_encoding=raw_kwargs["payload_encoding"], provenance=dict(provenance), sequence=sequence: mcap_camera_record(
+                                record_id,
+                                stream=stream,
+                                payload=payload,
+                                payload_encoding=payload_encoding,
+                                provenance=provenance,
+                                session_id=session_id,
+                                source_sequence=sequence,
+                                packet_sequence=packet_sequence,
+                            ),
+                        ),
+                        source_id=f"camera.{stream}",
+                        session_id=session_id,
+                        source_sequence=sequence,
+                        packet_sequence=packet_sequence,
                     )
                 if sequence is not None:
                     appended_sequences[str(stream)] = sequence
@@ -1440,6 +2154,46 @@ class LeRobotCollectorNode(Node):
                     self._state_machine.mark_failed(f"raw camera append failed: {exc}")
                 except RuntimeError:
                     pass
+
+    def _append_mcap_camera_frames(
+        self, packet: Any, session_id: str, frames: Any
+    ) -> None:
+        if not isinstance(frames, Mapping):
+            raise ValueError("camera packet frames must be a mapping")
+        packet_sequence = _optional_sequence(
+            _packet_member(packet, "packet_sequence", None)
+        )
+        for stream, frame in frames.items():
+            payload = _packet_member(frame, "payload")
+            sequence = _optional_sequence(_packet_member(frame, "sequence"))
+            if not isinstance(payload, (bytes, bytearray, memoryview)) or sequence is None:
+                raise ValueError(f"invalid camera frame for {stream}")
+            details = {
+                "stream": str(stream),
+                "payload_size_bytes": len(payload),
+                "payload_encoding": str(
+                    _packet_member(frame, "payload_encoding") or "image/jpeg"
+                ),
+            }
+            self._submit_capture_operation(
+                CollectorCaptureOperation(
+                    raw_write=None,
+                    mcap_record=lambda record_id, stream=str(stream), payload=bytes(payload), payload_encoding=details["payload_encoding"], sequence=sequence: mcap_camera_record(
+                        record_id,
+                        stream=stream,
+                        payload=payload,
+                        payload_encoding=payload_encoding,
+                        provenance={},
+                        session_id=session_id,
+                        source_sequence=sequence,
+                        packet_sequence=packet_sequence,
+                    ),
+                ),
+                source_id=f"camera.{stream}",
+                session_id=session_id,
+                source_sequence=sequence,
+                packet_sequence=packet_sequence,
+            )
 
     def _isolate_raw_failure(self, recorder: RawEpisodeRecorder, reason: str) -> None:
         """Detach a broken recorder so overflow/I/O failures cannot keep appending."""
@@ -1677,39 +2431,95 @@ class LeRobotCollectorNode(Node):
         received_monotonic_sec: float,
         record_monotonic_sec: float,
     ) -> None:
-        recorder = self._raw_recorder
-        if recorder is None or recorder.closed:
+        coordinator = self._capture_coordinator
+        if coordinator is None:
             return
         sequence = self._raw_state_sequence
         self._raw_state_sequence += 1
-        recorder.append_robot_state(
-            _robot_state_mapping(msg),
-            {
-                "sequence": sequence,
-                "clock_domain": "robot_state",
-                "timestamp_quality": "ros_message",
-                "server_wall_timestamp": time.time(),
-                "receive_monotonic_timestamp": received_monotonic_sec,
-                "record_monotonic_timestamp": record_monotonic_sec,
-                "session_id": self._raw_session_id or f"collector:{recorder.manifest['episode_id']}",
-            },
+        state = _robot_state_mapping(msg)
+        session_id = self._raw_session_id or "collector"
+        provenance = {
+            "sequence": sequence,
+            "clock_domain": "robot_state",
+            "timestamp_quality": "ros_message",
+            "server_wall_timestamp": time.time(),
+            "receive_monotonic_timestamp": received_monotonic_sec,
+            "record_monotonic_timestamp": record_monotonic_sec,
+            "session_id": session_id,
+        }
+        self._submit_capture_operation(
+            CollectorCaptureOperation(
+                raw_write=lambda recorder: recorder.append_robot_state(
+                    state, provenance
+                ),
+                mcap_record=lambda record_id: mcap_robot_state_record(
+                    record_id,
+                    state=state,
+                    provenance=provenance,
+                    session_id=session_id,
+                    source_sequence=sequence,
+                ),
+            ),
+            source_id="robot_state",
+            session_id=session_id,
+            source_sequence=sequence,
         )
 
-    def _append_raw_event(self, name: str, details: dict[str, Any]) -> None:
-        recorder = self._raw_recorder
-        if recorder is None or recorder.closed:
+    def _append_raw_event(
+        self,
+        name: str,
+        details: dict[str, Any],
+        *,
+        source_fences: Sequence[CaptureSourceFence] = (),
+    ) -> None:
+        if self._capture_coordinator is None:
             return
         sequence = self._raw_event_sequence
         self._raw_event_sequence += 1
-        recorder.append_event(
-            {"name": name, **details},
-            {
-                "sequence": sequence,
-                "clock_domain": "collector_monotonic",
-                "timestamp_quality": "host_monotonic",
-                "record_monotonic_timestamp": time.monotonic(),
-                "session_id": self._raw_session_id or f"collector:{recorder.manifest['episode_id']}",
-            },
+        event = {"name": name, **details}
+        session_id = self._raw_session_id or "collector"
+        provenance = {
+            "sequence": sequence,
+            "clock_domain": "collector_monotonic",
+            "timestamp_quality": "host_monotonic",
+            "record_monotonic_timestamp": time.monotonic(),
+            "session_id": session_id,
+        }
+        self._submit_capture_operation(
+            CollectorCaptureOperation(
+                raw_write=lambda recorder: recorder.append_event(event, provenance),
+                mcap_record=lambda record_id: mcap_event_record(
+                    record_id,
+                    event_name=name,
+                    details=event,
+                    session_id=session_id,
+                    source_sequence=sequence,
+                    source_fences=source_fences,
+                ),
+            ),
+            source_id="collector",
+            session_id=session_id,
+            source_sequence=sequence,
+        )
+
+    def _submit_capture_operation(
+        self,
+        operation: CollectorCaptureOperation,
+        *,
+        source_id: str,
+        session_id: str,
+        source_sequence: int | None = None,
+        packet_sequence: int | None = None,
+    ) -> int:
+        coordinator = self._capture_coordinator
+        if coordinator is None:
+            raise RuntimeError("capture coordinator is not active")
+        return coordinator.submit(
+            operation,
+            source_id=source_id,
+            session_id=session_id,
+            source_sequence=source_sequence,
+            packet_sequence=packet_sequence,
         )
 
     def _close_raw_episode(self, *, command: str, reason: str) -> None:
@@ -2488,16 +3298,55 @@ class LeRobotCollectorNode(Node):
 
     def _freeze_raw_capture(self, *, command: str, reason: str) -> None:
         """Freeze per-episode quality, detach callbacks, then seal raw."""
-        recorder = self._raw_recorder
-        if recorder is not None and self._raw_source_scope == "camera_capture":
-            self._attach_camera_spool(recorder)
         self._frozen_quality = {
             "camera_stats": self._camera_cache.stats,
             "camera_quality": self._camera_cache.quality_statistics,
             "state_camera_skew_samples": list(self._state_camera_skew_samples),
             "state_camera_skew": _residual_statistics(self._state_camera_skew_samples),
         }
-        self._close_raw_episode(command=command, reason=reason)
+        coordinator = self._capture_coordinator
+        if coordinator is not None:
+            source_fences: tuple[CaptureSourceFence, ...] = ()
+            if self._camera_source_start_status is not None:
+                stop_status = self._read_camera_source_status()
+                if stop_status is None:
+                    raise RuntimeError("camera source STOP status is unavailable")
+                source_fences = camera_source_fences_from_status(
+                    self._camera_source_start_status,
+                    stop_status,
+                    self._camera_cache.streams,
+                )
+            self._append_raw_event(
+                command,
+                {"reason": reason},
+                source_fences=source_fences,
+            )
+            if self._raw_sink_adapter is not None:
+                self._raw_sink_adapter.command = command
+                self._raw_sink_adapter.reason = reason
+            self._capture_result = coordinator.stop(source_fences=source_fences)
+            self._capture_coordinator = None
+            self._raw_recorder = None
+            if self._capture_result.status is not CaptureStatus.READY:
+                failure = "; ".join(self._capture_result.errors) or "capture sink failure"
+                if (
+                    self._raw_episode_path is not None
+                    and (self._raw_episode_path / "manifest.json").exists()
+                ):
+                    discard_sealed_episode(self._raw_episode_path, reason=failure)
+                if self._mcap_sink_adapter is not None:
+                    _write_json_atomic(
+                        self._mcap_sink_adapter.writer.episode_dir
+                        / "quarantine.json",
+                        {
+                            "status": "QUARANTINED",
+                            "reason": failure,
+                            "recording_mode": self._capture_mode.value,
+                        },
+                    )
+                raise RuntimeError(
+                    "capture sinks failed closed: " + failure
+                )
         path = self._raw_episode_path
         quality = self._frozen_quality
         if path is None or quality is None or not (path / "manifest.json").exists():
@@ -2583,7 +3432,10 @@ class LeRobotCollectorNode(Node):
         write_quality_report(path, quality_report)
         # A host receiver recording is an auditable shadow only.  It must never
         # enqueue a derived-artifact job claiming complete camera capture.
-        if self._recording_mode == "raw_first" and manifest.get("status") != "QUARANTINED":
+        if (
+            self._capture_mode in {CaptureMode.RAW_V1, CaptureMode.DUAL_WRITE}
+            and manifest.get("status") != "QUARANTINED"
+        ):
             self._raw_materialization_job = create_materialization_job(
                 path,
                 self._materialization_job_config(),
@@ -2670,6 +3522,35 @@ class LeRobotCollectorNode(Node):
         )
 
     def _discard_raw_episode(self, *, reason: str) -> None:
+        coordinator = self._capture_coordinator
+        if coordinator is not None:
+            self._append_raw_event("DISCARD", {"reason": reason})
+            if self._raw_sink_adapter is not None:
+                self._raw_sink_adapter.command = "DISCARD"
+                self._raw_sink_adapter.reason = reason
+            result = coordinator.stop()
+            self._capture_result = replace(
+                result,
+                status=(
+                    CaptureStatus.QUARANTINED
+                    if result.status is CaptureStatus.READY
+                    else result.status
+                ),
+                errors=(*result.errors, f"capture discarded: {reason}"),
+            )
+            if self._mcap_sink_adapter is not None:
+                _write_json_atomic(
+                    self._mcap_sink_adapter.writer.episode_dir / "quarantine.json",
+                    {
+                        "status": "QUARANTINED",
+                        "reason": reason,
+                        "recording_mode": self._capture_mode.value,
+                    },
+                )
+            self._capture_coordinator = None
+            self._raw_recorder = None
+            self._raw_materialization_job = None
+            return
         recorder = self._raw_recorder
         self._raw_recorder = None
         if recorder is not None:

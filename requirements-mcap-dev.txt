@@ -1,0 +1,2 @@
+-r requirements-mcap.txt
+grpcio-tools==1.74.0

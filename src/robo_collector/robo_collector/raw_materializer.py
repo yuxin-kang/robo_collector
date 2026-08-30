@@ -40,6 +40,9 @@ from .raw_episode import (
 )
 
 
+MATERIALIZER_VERSION = "robo_collector.raw_materializer.v2"
+ALIGNMENT_POLICY_VERSION = "rgb_affine_v2"
+
 ImageDecoder = Callable[[bytes, str], Any]
 WriterFactory = Callable[[Path, str, int, Sequence[str]], LeRobotV21Writer]
 
@@ -52,7 +55,7 @@ class MaterializationConfig:
     camera_streams: tuple[str, ...]
     alignment_policy: str = "strict"
     max_alignment_residual_sec: float = 0.1
-    output_schema_version: str = "lerobot.v2.1.raw_materialization.v1"
+    output_schema_version: str = "lerobot.v2.1.raw_materialization.v2"
     require_complete_capture: bool = False
     max_camera_clock_mapping_uncertainty_sec: float | None = None
     max_state_age_sec: float | None = None
@@ -70,6 +73,8 @@ class MaterializationConfig:
             "fps": self.fps,
             "camera_streams": list(self.camera_streams),
             "alignment_policy": self.alignment_policy,
+            "alignment_policy_version": ALIGNMENT_POLICY_VERSION,
+            "materializer_version": MATERIALIZER_VERSION,
             "max_alignment_residual_sec": self.max_alignment_residual_sec,
             "output_schema_version": self.output_schema_version,
             "require_complete_capture": self.require_complete_capture,
@@ -155,9 +160,24 @@ class RawEpisodeMaterializer:
                 "sparse materialization is diagnostic-only and requires a sparse writer"
             )
         path = Path(episode).resolve()
-        reader = RawEpisodeReader(path)
+        try:
+            manifest_probe = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            manifest_probe = {}
+        if isinstance(manifest_probe, dict) and manifest_probe.get("format") == "robo_collector.mcap_landing":
+            from .mcap_episode import McapEpisodeReader
+            reader = McapEpisodeReader(path)
+        else:
+            reader = RawEpisodeReader(path)
         reader.validate()
         manifest = reader.manifest
+        if manifest.get("format") == "robo_collector.mcap_landing":
+            manifest = dict(manifest)
+            identity = manifest.get("identity")
+            if isinstance(identity, Mapping):
+                manifest.setdefault("episode_id", identity.get("episode_id"))
+            manifest.setdefault("episode_id", path.name)
+            manifest.setdefault("task_prompt", "MCAP episode")
         if self._persist_job:
             job = create_materialization_job(path, self.config.as_dict(), self.config.output_schema_version)
             completed = _reuse_materialized_job(path, manifest, job, self._quality_gate)
@@ -202,6 +222,8 @@ class RawEpisodeMaterializer:
                         record_index.add("camera", stream, record)
                 for record in reader.records("robot", "state"):
                     record_index.add("robot", "state", record)
+                for record in reader.records("robot", "action"):
+                    record_index.add("robot", "action", record)
                 if record_index.count("robot", "state") == 0:
                     raise MaterializationError("robot state records are required")
 
@@ -231,11 +253,11 @@ class RawEpisodeMaterializer:
                         {
                             "source_episode_id": source_episode_id,
                             "source_manifest_hash": source_manifest_hash,
-                            "converter_version": "robo_collector.raw_materializer.v1",
+                            "converter_version": MATERIALIZER_VERSION,
                             "conversion_config_hash": conversion_config_hash,
                             "output_schema_version": self.config.output_schema_version,
                             "selection_policy": "rgb_reference_nearest_strict",
-                            "reference_camera_stream": _reference_camera_stream(
+                                        "reference_camera_stream": _reference_camera_stream(
                                 self.config
                             ),
                             "encoder_identity": video_encoder_identity(),
@@ -835,7 +857,7 @@ def _write_indexed_frames(
             residuals=residuals,
             target_time=target,
             action_record=record_index.latest_at_or_before(
-                "robot", "state", target
+                "robot", "action", target
             ),
         )
         state = state_record.get("state")
@@ -875,7 +897,7 @@ def _write_indexed_frames(
             },
             alignment_metadata={
                 "selection_policy": "rgb_reference_nearest_strict",
-                "alignment_selection_policy": "rgb_reference_nearest_bounded",
+                            "alignment_selection_policy": "rgb_reference_nearest_bounded",
                 "action_policy": "latest_at_or_before_zoh",
                 "target_timestamp_sec": selection.target_time,
                 "alignment_target_source_timestamp": selection.target_time,
@@ -1400,7 +1422,7 @@ def _write_provenance_file(
     episode_metadata = {
         "source_episode_id": source_episode_id,
         "source_manifest_hash": source_manifest_hash,
-        "converter_version": "robo_collector.raw_materializer.v1",
+        "converter_version": MATERIALIZER_VERSION,
         "conversion_config_hash": conversion_config_hash,
         "output_schema_version": config.output_schema_version,
         "encoder_identity": dict(encoder_identity or video_encoder_identity()),

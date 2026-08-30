@@ -38,6 +38,9 @@ _REJECT_REASON_PREFIXES = (
     "timer_deadline_",
     "state_age_",
     "camera_age_",
+    "mcap_",
+    "canonical_",
+    "content_qc_",
 )
 
 _MIN_CLOCK_MAPPING_SAMPLES = 2
@@ -263,6 +266,7 @@ class EpisodeQualityGate:
         self._check_capture_health(manifest, stats, reasons)
         self._check_strict(manifest, reasons)
         self._check_artifacts(manifest, reasons)
+        self._check_mcap_quality(manifest, reasons)
         self._check_raw_integrity(episode_path, manifest, reasons)
         if episode_path is not None and manifest.get("status") in {
             "MATERIALIZED", "QC", "READY", "REVIEW", "REJECT"
@@ -1087,6 +1091,77 @@ class EpisodeQualityGate:
                             reasons.append(f"invalid_provenance_field: {field}")
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 reasons.append("invalid_provenance_document")
+
+    @staticmethod
+    def _check_mcap_quality(manifest: Mapping[str, Any], reasons: list[str]) -> None:
+        """Validate canonical MCAP evidence when a manifest supplies it.
+
+        Raw v1 manifests do not have canonical fields and retain their historic
+        behavior.  MCAP candidates, however, must run the internal structural
+        validator for both modality-group files before they can be READY.
+        The validator is intentionally read-only; sealed sources are never
+        opened for append or repaired in place.
+        """
+        canonical = manifest.get("canonical")
+        if not isinstance(canonical, Mapping):
+            canonical = manifest.get("canonical_artifacts")
+        if not isinstance(canonical, Mapping):
+            # A top-level status is also a canonical manifest signal, while
+            # avoiding accidental validation of legacy raw materialization.
+            if "canonical_status" not in manifest and "camera_mcap" not in manifest:
+                return
+            canonical = manifest
+
+        status = canonical.get("canonical_status", canonical.get("status"))
+        if status is not None and status not in {
+            "READY", "REVIEW", "REJECT", "QUARANTINED", "DERIVED_REVIEW"
+        }:
+            reasons.append(f"canonical_invalid_status: {status!r}")
+
+        try:
+            from .canonical_mcap import validate_canonical_mcap
+        except ImportError:
+            reasons.append("mcap_validator_unavailable")
+            return
+
+        found = 0
+        for group in ("camera", "robot"):
+            candidate = canonical.get(f"{group}_mcap")
+            if candidate is None and isinstance(canonical.get("files"), Mapping):
+                candidate = canonical["files"].get(f"{group}.mcap")
+            if isinstance(candidate, Mapping):
+                path = candidate.get("path")
+                expected_hash = candidate.get("sha256")
+            else:
+                path, expected_hash = candidate, None
+            if not isinstance(path, str) or not path:
+                # A canonical status without both files is not publishable.
+                if status == "READY":
+                    reasons.append(f"mcap_missing_{group}_file")
+                continue
+            found += 1
+            try:
+                evidence = validate_canonical_mcap(path, expected_group=group)
+            except Exception as exc:
+                reasons.append(f"mcap_structural_qc_{group}_failed: {exc}")
+                continue
+            if expected_hash is not None and evidence.get("sha256") != expected_hash:
+                reasons.append(f"mcap_hash_mismatch: {group}")
+
+        if status == "READY" and found != 2:
+            reasons.append("canonical_missing_modality_group")
+
+        content = canonical.get("content_qc", canonical.get("content_quality"))
+        if content is None and isinstance(manifest.get("quality"), Mapping):
+            content = manifest["quality"].get("content_qc")
+        if isinstance(content, Mapping):
+            content_status = content.get("canonical_status", content.get("status"))
+            if content_status in {"QUARANTINED", "REJECT", "REVIEW"}:
+                reasons.append(f"content_qc_{str(content_status).lower()}")
+            elif content_status not in {None, "READY", "PASS"}:
+                reasons.append(f"content_qc_invalid_status: {content_status!r}")
+        elif status == "READY":
+            reasons.append("content_qc_missing")
 
     @staticmethod
     def _check_raw_integrity(

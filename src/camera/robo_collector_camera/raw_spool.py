@@ -3,10 +3,11 @@
 Records are msgpack values in length/CRC framed files. A damaged or partially
 written final frame is discarded on open, making interrupted writes recoverable.
 """
+
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import math
 import os
 import shutil
@@ -15,8 +16,9 @@ import threading
 import time
 import uuid
 import zlib
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import msgpack
 
@@ -36,13 +38,20 @@ class _TruncatedSpoolFrame(ValueError):
 
 
 class RawSpool:
-    def __init__(self, root: str | os.PathLike[str], *, stream: str,
-                 max_records: int | None = None, max_bytes: int = _DEFAULT_MAX_BYTES,
-                 chunk_records: int = 1024, session_id: str | None = None,
-                 strict_records: bool = False,
-                 manifest_checkpoint_records: int = 1,
-                 manifest_checkpoint_interval_sec: float = 0.0,
-                 durability_interval_sec: float = 0.0) -> None:
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        *,
+        stream: str,
+        max_records: int | None = None,
+        max_bytes: int = _DEFAULT_MAX_BYTES,
+        chunk_records: int = 1024,
+        session_id: str | None = None,
+        strict_records: bool = False,
+        manifest_checkpoint_records: int = 1,
+        manifest_checkpoint_interval_sec: float = 0.0,
+        durability_interval_sec: float = 0.0,
+    ) -> None:
         if not stream or "/" in stream or "\\" in stream or stream in {".", ".."}:
             raise ValueError("invalid spool stream")
         if max_records is not None and max_records <= 0:
@@ -68,9 +77,7 @@ class RawSpool:
         self.max_bytes = int(max_bytes)
         self.chunk_records = int(chunk_records)
         self.manifest_checkpoint_records = int(manifest_checkpoint_records)
-        self.manifest_checkpoint_interval_sec = float(
-            manifest_checkpoint_interval_sec
-        )
+        self.manifest_checkpoint_interval_sec = float(manifest_checkpoint_interval_sec)
         self.durability_interval_sec = float(durability_interval_sec)
         self.directory = self.root / "camera" / stream
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -78,16 +85,21 @@ class RawSpool:
         self.final_manifest_path = self.root / "manifest.json"
         self._lifecycle_lock = threading.RLock()
         self._dirty_chunks: set[Path] = set()
+        self._durable_chunk_sizes: dict[str, int] = {}
         self._last_durability_sync_monotonic = time.monotonic()
         self._records_since_manifest_checkpoint = 0
         self._last_manifest_checkpoint_monotonic = time.monotonic()
         old = self._read_manifest()
         self.session_id = str(session_id or old.get("session_id") or uuid.uuid4().hex)
         old_streams = old.get("streams", {})
-        old_stream = old_streams.get(stream, {}) if isinstance(old_streams, dict) else {}
+        old_stream = (
+            old_streams.get(stream, {}) if isinstance(old_streams, dict) else {}
+        )
         events = old_stream.get("events", {}) if isinstance(old_stream, dict) else {}
         if not isinstance(events, dict):
-            events = old.get("events", {}) if isinstance(old.get("events", {}), dict) else {}
+            events = (
+                old.get("events", {}) if isinstance(old.get("events", {}), dict) else {}
+            )
         self._strict_records = bool(
             strict_records
             or (
@@ -109,6 +121,7 @@ class RawSpool:
         self._chunk_count = 0
         self._first_sequence: int | None = None
         self._last_sequence: int | None = None
+        self._sequence_high_watermark: int | None = None
         self._sequence_gap_count = 0
         self._producer_gap_count = 0
         self._transport_gap_count = 0
@@ -136,7 +149,31 @@ class RawSpool:
         )
         self._closed = bool(old_stream.get("closed", False))
         self._close_reason = str(old_stream.get("close_reason") or "")
+        self._close_error = str(old_stream.get("close_error") or "")
+        self._generation = max(1, int(old_stream.get("generation", 1)))
+        self._start_fence = _normalise_fence(old_stream.get("start_fence"))
+        self._stop_fence = _normalise_fence(old_stream.get("stop_fence"))
+        self._accepted_count = 0
+        self._written_count = 0
+        self._durable_count = 0
+        self._accepted_high_watermark: int | None = None
+        self._written_high_watermark: int | None = None
+        self._durable_high_watermark: int | None = None
         self._recover_files()
+        # Recovered complete frames are the only trustworthy prefix after an
+        # interrupted process. Bind counters to that prefix rather than to a
+        # possibly stale in-progress manifest.
+        self._accepted_count = self._count
+        self._written_count = self._count
+        self._durable_count = self._count
+        self._accepted_high_watermark = self._sequence_high_watermark
+        self._written_high_watermark = self._sequence_high_watermark
+        self._durable_high_watermark = self._sequence_high_watermark
+        self._durable_chunk_sizes = {
+            path.name: path.stat().st_size for path in self._chunk_paths()
+        }
+        if self._start_fence is None:
+            self._start_fence = self._new_fence("START")
         self._write_manifest(include_checksums=self._closed, force=True)
 
     def append(self, record: dict[str, Any]) -> bool:
@@ -172,13 +209,18 @@ class RawSpool:
                 if self._strict_records:
                     self.record_rejection("record_too_large")
                 raise ValueError("spool record is too large")
-            frame = _HEADER.pack(
-                _MAGIC, len(payload), zlib.crc32(payload) & 0xFFFFFFFF
-            ) + payload
+            frame = (
+                _HEADER.pack(_MAGIC, len(payload), zlib.crc32(payload) & 0xFFFFFFFF)
+                + payload
+            )
             if self._bytes + len(frame) > self.max_bytes:
                 self._overflow += 1
                 self.record_rejection("spool_overflow")
                 return False
+            self._accepted_count += 1
+            self._accepted_high_watermark = _advance_high_watermark(
+                self._accepted_high_watermark, record.get("sequence")
+            )
             if self._chunk_count >= self.chunk_records:
                 # Never rotate away from a chunk whose bytes have not been
                 # durably flushed.
@@ -190,6 +232,10 @@ class RawSpool:
                 handle.write(frame)
                 handle.flush()
             self._dirty_chunks.add(chunk_path)
+            self._written_count += 1
+            self._written_high_watermark = _advance_high_watermark(
+                self._written_high_watermark, record.get("sequence")
+            )
             self._count += 1
             self._bytes += len(frame)
             self._chunk_count += 1
@@ -211,6 +257,19 @@ class RawSpool:
             if self._closed:
                 raise RuntimeError("raw spool is closed")
             self._restarts += 1
+            self._generation += 1
+            self._start_fence = self._new_fence("START")
+            self._stop_fence = None
+            self._close_error = ""
+            self._write_manifest(force=True)
+
+    def mark_start(self) -> None:
+        """Persist the START fence before a producer can append."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("raw spool is closed")
+            if self._start_fence is None:
+                self._start_fence = self._new_fence("START")
             self._write_manifest(force=True)
 
     def mark_gap(self, count: int = 1) -> None:
@@ -232,13 +291,13 @@ class RawSpool:
             errors["by_stream"][self.stream] = (
                 errors["by_stream"].get(self.stream, 0) + amount
             )
-            errors["by_error_type"][key] = (
-                errors["by_error_type"].get(key, 0) + amount
-            )
+            errors["by_error_type"][key] = errors["by_error_type"].get(key, 0) + amount
             self._record_errors = errors
             self._write_manifest(force=True)
 
-    def close(self, *, reason: str = "process_stop") -> None:
+    def close(
+        self, *, reason: str = "process_stop", source_stop_observed: bool = True
+    ) -> None:
         """Durably mark this stream closed without deleting its raw chunks."""
         with self._lifecycle_lock:
             if self._closed:
@@ -246,9 +305,39 @@ class RawSpool:
             # The final checksum/manifest is the authoritative close boundary.
             # Flush every pending chunk before calculating either one.
             self._sync_dirty_chunks(force=True)
+            self._stop_fence = self._new_fence("STOP") if source_stop_observed else None
             self._closed = True
             self._close_reason = str(reason)
-            self._write_manifest(include_checksums=True, force=True)
+            self._close_error = (
+                "" if source_stop_observed else "source STOP was not observed"
+            )
+            try:
+                self._write_manifest(include_checksums=True, force=True)
+            except Exception as exc:
+                # A failed STOP publication must remain retryable and must not
+                # be represented as a complete camera source.
+                self._closed = False
+                self._stop_fence = None
+                self._close_error = f"{type(exc).__name__}: {exc}"
+                raise
+
+    def mark_close_failed(self, error: BaseException | str) -> None:
+        """Best-effort persistence of a server-side close failure."""
+        with self._lifecycle_lock:
+            self._closed = False
+            self._stop_fence = None
+            self._close_error = (
+                str(error)
+                if isinstance(error, str)
+                else f"{type(error).__name__}: {error}"
+            )
+            self._close_reason = "close_failed"
+            self._write_manifest(force=True)
+
+    def status(self) -> dict[str, Any]:
+        """Return a stable, payload-free source fence/status projection."""
+        with self._lifecycle_lock:
+            return self._status_projection()
 
     def recover(self) -> Iterator[dict[str, Any]]:
         for path in self._chunk_paths():
@@ -350,6 +439,9 @@ class RawSpool:
         sequence = record.get("sequence")
         if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
             return
+        self._sequence_high_watermark = _advance_high_watermark(
+            self._sequence_high_watermark, sequence
+        )
         if self._first_sequence is None:
             self._first_sequence = sequence
         if self._last_sequence is not None:
@@ -363,7 +455,9 @@ class RawSpool:
                 explicit = record.get("producer_gap_count")
                 producer = (
                     int(explicit)
-                    if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit >= 0
+                    if isinstance(explicit, int)
+                    and not isinstance(explicit, bool)
+                    and explicit >= 0
                     else missing
                 )
                 producer = min(producer, missing)
@@ -409,9 +503,7 @@ class RawSpool:
                 return
             self._sync_dirty_chunks(force=True)
             with _MANIFEST_LOCKS_GUARD:
-                lock = _MANIFEST_LOCKS.setdefault(
-                    self.manifest_path, threading.Lock()
-                )
+                lock = _MANIFEST_LOCKS.setdefault(self.manifest_path, threading.Lock())
             with lock:
                 self._write_manifest_locked(include_checksums=include_checksums)
             self._records_since_manifest_checkpoint = 0
@@ -430,17 +522,59 @@ class RawSpool:
     def _sync_dirty_chunks(self, *, force: bool = False) -> None:
         if not self._dirty_chunks:
             return
-        if not force and self.durability_interval_sec > 0:
-            if (
-                time.monotonic() - self._last_durability_sync_monotonic
-                < self.durability_interval_sec
-            ):
-                return
+        if (
+            not force
+            and self.durability_interval_sec > 0
+            and time.monotonic() - self._last_durability_sync_monotonic
+            < self.durability_interval_sec
+        ):
+            return
         for path in sorted(self._dirty_chunks):
             with path.open("rb") as handle:
                 os.fsync(handle.fileno())
+            self._durable_chunk_sizes[path.name] = path.stat().st_size
         self._dirty_chunks.clear()
+        self._durable_count = self._written_count
+        self._durable_high_watermark = self._written_high_watermark
         self._last_durability_sync_monotonic = time.monotonic()
+
+    def _new_fence(self, event: str) -> dict[str, Any]:
+        return {
+            "event": event,
+            "session_id": self.session_id,
+            "stream_id": self.stream,
+            "generation": self._generation,
+            "restart_count": self._restarts,
+            "timestamp_ns": time.time_ns(),
+            "accepted_count": self._accepted_count,
+            "written_count": self._written_count,
+            "durable_count": self._durable_count,
+            "accepted_high_watermark": self._accepted_high_watermark,
+            "written_high_watermark": self._written_high_watermark,
+            "durable_high_watermark": self._durable_high_watermark,
+        }
+
+    def _status_projection(self) -> dict[str, Any]:
+        complete = bool(self._closed and self._stop_fence is not None)
+        return {
+            "schema": "robo_collector.camera_spool_status.v1",
+            "session_id": self.session_id,
+            "stream_id": self.stream,
+            "generation": self._generation,
+            "restart_count": self._restarts,
+            "accepted_count": self._accepted_count,
+            "written_count": self._written_count,
+            "durable_count": self._durable_count,
+            "accepted_high_watermark": self._accepted_high_watermark,
+            "written_high_watermark": self._written_high_watermark,
+            "durable_high_watermark": self._durable_high_watermark,
+            "durable_chunks": dict(sorted(self._durable_chunk_sizes.items())),
+            "start_fence": dict(self._start_fence) if self._start_fence else None,
+            "stop_fence": dict(self._stop_fence) if self._stop_fence else None,
+            "source_complete": complete,
+            "close_reason": self._close_reason or None,
+            "close_error": self._close_error or None,
+        }
 
     def _write_manifest_locked(self, *, include_checksums: bool = False) -> None:
         existing = self._read_manifest()
@@ -462,18 +596,28 @@ class RawSpool:
             "timestamp_quality": self._timestamp_quality,
             "timestamp_domain": self._timestamp_domain,
             "session_id": self.session_id,
+            **self._status_projection(),
             "record_errors": self._record_errors,
             "closed": self._closed,
             "close_reason": self._close_reason or None,
-            "events": {"sent": self._sent, "restart": self._restarts,
-                       "gap": self._gaps, "spool_overflow": self._overflow,
-                       "corrupt_tail_bytes": self._corrupt_tail_bytes},
+            "events": {
+                "sent": self._sent,
+                "restart": self._restarts,
+                "gap": self._gaps,
+                "spool_overflow": self._overflow,
+                "corrupt_tail_bytes": self._corrupt_tail_bytes,
+            },
         }
         if self._strict_records:
             stream_manifest["record_schema"] = _CAMERA_RECORD_SCHEMA
         streams[self.stream] = stream_manifest
-        totals = {"sent": 0, "restart": 0, "gap": 0, "spool_overflow": 0,
-                  "corrupt_tail_bytes": 0}
+        totals = {
+            "sent": 0,
+            "restart": 0,
+            "gap": 0,
+            "spool_overflow": 0,
+            "corrupt_tail_bytes": 0,
+        }
         record_errors = {
             "total": 0,
             "by_stream": {},
@@ -501,9 +645,19 @@ class RawSpool:
         stream_entries = [
             stream for stream in streams.values() if isinstance(stream, dict)
         ]
-        session_closed = bool(stream_entries) and all(
+        session_finalized = bool(stream_entries) and all(
             bool(stream.get("closed")) for stream in stream_entries
         )
+        session_complete = session_finalized and all(
+            bool(stream.get("source_complete"))
+            and isinstance(stream.get("stop_fence"), dict)
+            for stream in stream_entries
+        )
+        close_failures = {
+            str(name): str(stream.get("close_error"))
+            for name, stream in streams.items()
+            if isinstance(stream, dict) and stream.get("close_error")
+        }
         manifest = {
             # The source-side framed-msgpack spool has a different on-disk
             # record contract from the host-side RER1 JSON Raw Episode.  Keep
@@ -512,16 +666,43 @@ class RawSpool:
             "schema": _CAMERA_SPOOL_SCHEMA,
             "format": "raw_spool.msgpack_crc32.v1",
             "episode_id": self.session_id,
-            "status": "RAW_CLOSED" if session_closed else "RAW_IN_PROGRESS",
+            "status": (
+                "RAW_CLOSED"
+                if session_complete
+                else "RAW_INCOMPLETE"
+                if session_finalized
+                else "RAW_IN_PROGRESS"
+            ),
             "source_scope": "camera_capture",
             "capture_plane": "camera_side",
             "session_id": self.session_id,
             "stream_id": self.stream,
             "streams": streams,
+            "source_fences": {
+                str(name): {
+                    "start": stream.get("start_fence"),
+                    "stop": stream.get("stop_fence"),
+                    "generation": stream.get("generation"),
+                    "restart_count": stream.get("restart_count"),
+                    "source_complete": bool(stream.get("source_complete")),
+                }
+                for name, stream in streams.items()
+                if isinstance(stream, dict)
+            },
+            "source_complete": session_complete,
+            "close_failures": close_failures,
             "events": {"spool_records": records, "produced": records, **totals},
             "record_errors": record_errors,
             "termination": (
-                {"reason": "all_streams_closed"} if session_closed else None
+                {
+                    "reason": (
+                        "all_streams_closed"
+                        if session_complete
+                        else "closed_without_source_stop"
+                    )
+                }
+                if session_finalized
+                else None
             ),
         }
         if include_checksums:
@@ -530,7 +711,7 @@ class RawSpool:
                 for path in sorted(self.root.glob("camera/*/chunk-*.msgpack"))
                 if path.is_file()
             }
-        if session_closed:
+        if session_finalized:
             # The final source manifest is immutable after all camera streams
             # have closed.  Keep an explicit digest so a collector can bind a
             # task episode to this exact source session rather than to a
@@ -551,10 +732,17 @@ class RawSpool:
             handle.write(json.dumps(manifest, sort_keys=True).encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
-        target = self.final_manifest_path if session_closed else self.manifest_path
+        target = self.final_manifest_path if session_finalized else self.manifest_path
         os.replace(temporary, target)
-        if session_closed and self.manifest_path.exists():
-            self.manifest_path.unlink()
+        if session_finalized and self.manifest_path.exists():
+            try:
+                self.manifest_path.unlink()
+            except OSError:
+                # The final manifest is already authoritative. A stale
+                # in-progress name is harmless because all readers prefer the
+                # final path and startup scanning only considers sessions below
+                # the configured spool parent.
+                pass
         try:
             directory_fd = os.open(self.root, os.O_RDONLY)
             try:
@@ -630,10 +818,7 @@ def _camera_record_error(
         not isinstance(record_session, str) or not record_session.strip()
     ):
         return "missing_session_id"
-    if (
-        session_id is not None
-        and str(record_session) != str(session_id)
-    ):
+    if session_id is not None and str(record_session) != str(session_id):
         return "invalid_session"
     timestamp = record.get("server_wall_timestamp")
     if timestamp is None:
@@ -661,9 +846,10 @@ def scan_camera_spools(root: str | os.PathLike[str]) -> list[dict[str, Any]]:
     """Recover interrupted camera sessions below ``root``.
 
     A camera process receives a fresh session directory on every start.  An
-    older session that still has an in-progress manifest is therefore sealed
-    as a crash-recovered raw source before the next process starts.  No chunk
-    is deleted; a damaged non-final chunk raises and is quarantined instead.
+    older session that still has an in-progress manifest is therefore finalized
+    as an incomplete crash-recovered source before the next process starts. A
+    missing source STOP is retained explicitly and never promoted to complete.
+    No chunk is deleted; damaged non-final chunks are quarantined instead.
     """
     root_path = Path(root)
     if not root_path.exists():
@@ -682,8 +868,7 @@ def scan_camera_spools(root: str | os.PathLike[str]) -> list[dict[str, Any]]:
             if not isinstance(streams, dict):
                 raise ValueError("camera spool streams must be a mapping")
             stream_names = [
-                name for name in sorted(streams)
-                if isinstance(streams[name], dict)
+                name for name in sorted(streams) if isinstance(streams[name], dict)
             ]
             if not stream_names:
                 continue
@@ -700,7 +885,7 @@ def scan_camera_spools(root: str | os.PathLike[str]) -> list[dict[str, Any]]:
                 for name in stream_names
             ]
             for spool in spools:
-                spool.close(reason="process_crash")
+                spool.close(reason="process_crash", source_stop_observed=False)
             final = session_path / "manifest.json"
             recovered.append(json.loads(final.read_text(encoding="utf-8")))
         except Exception as exc:
@@ -747,10 +932,7 @@ def read_camera_spool_snapshot(
     }:
         raise ValueError("unsupported camera spool schema")
     if server_wall_window is not None:
-        if (
-            not isinstance(server_wall_window, tuple)
-            or len(server_wall_window) != 2
-        ):
+        if not isinstance(server_wall_window, tuple) or len(server_wall_window) != 2:
             raise ValueError("server_wall_window must be a (start, end) tuple")
         try:
             window_start = float(server_wall_window[0])
@@ -772,7 +954,10 @@ def read_camera_spool_snapshot(
         "raw_manifest_hash", manifest.get("manifest_hash")
     )
     if declared_manifest_hash is not None:
-        if not isinstance(declared_manifest_hash, str) or len(declared_manifest_hash) != 64:
+        if (
+            not isinstance(declared_manifest_hash, str)
+            or len(declared_manifest_hash) != 64
+        ):
             raise ValueError("camera spool manifest hash is invalid")
         if _manifest_hash(manifest) != declared_manifest_hash:
             raise ValueError("camera spool manifest hash mismatch")
@@ -780,10 +965,29 @@ def read_camera_spool_snapshot(
     snapshot_paths: dict[str, tuple[Path, int]] = {}
     for stream_name in sorted(streams):
         stream_dir = session_path / "camera" / str(stream_name)
+        stream_manifest = streams.get(stream_name)
+        durable_chunks = (
+            stream_manifest.get("durable_chunks")
+            if isinstance(stream_manifest, dict)
+            else None
+        )
         for path in sorted(stream_dir.glob("chunk-*.msgpack")):
+            current_size = path.stat().st_size
+            if isinstance(durable_chunks, dict):
+                declared_size = durable_chunks.get(path.name)
+                if (
+                    not isinstance(declared_size, int)
+                    or isinstance(declared_size, bool)
+                    or declared_size <= 0
+                ):
+                    continue
+                snapshot_size = min(current_size, declared_size)
+            else:
+                # Compatibility spools predate explicit durable chunk bounds.
+                snapshot_size = current_size
             snapshot_paths[path.relative_to(session_path).as_posix()] = (
                 path,
-                path.stat().st_size,
+                snapshot_size,
             )
     snapshot_chunks = {
         relative: {
@@ -803,10 +1007,7 @@ def read_camera_spool_snapshot(
     selected_record_counts: dict[str, int] = {
         str(stream_name): 0 for stream_name in streams
     }
-    stream_positions = {
-        str(stream_name): [None, None, 0]
-        for stream_name in streams
-    }
+    stream_positions = {str(stream_name): [None, None, 0] for stream_name in streams}
     for stream_name in sorted(streams):
         paths = [
             path
@@ -911,7 +1112,9 @@ def read_camera_spool_snapshot(
                     stream_position[1] = record.get("server_wall_timestamp")
                     stream_position[2] += 1
                     if handle.tell() <= offset:
-                        raise ValueError(f"camera spool reader made no progress: {path}")
+                        raise ValueError(
+                            f"camera spool reader made no progress: {path}"
+                        )
     final_snapshot_paths = {
         path.relative_to(session_path).as_posix(): path.stat().st_size
         for stream_name in sorted(streams)
@@ -931,7 +1134,10 @@ def read_camera_spool_snapshot(
             stable = False
             break
         try:
-            if _sha256_prefix(path, snapshot_size) != snapshot_chunks[relative]["sha256"]:
+            if (
+                _sha256_prefix(path, snapshot_size)
+                != snapshot_chunks[relative]["sha256"]
+            ):
                 stable = False
                 break
         except (OSError, ValueError):
@@ -940,7 +1146,9 @@ def read_camera_spool_snapshot(
     snapshot = {
         "schema": "robo_collector.camera_spool_snapshot.v1",
         "session_id": str(
-            manifest.get("session_id") or manifest.get("episode_id") or session_path.name
+            manifest.get("session_id")
+            or manifest.get("episode_id")
+            or session_path.name
         ),
         "captured_wall_time": time.time(),
         "manifest_hash": manifest.get(
@@ -949,19 +1157,34 @@ def read_camera_spool_snapshot(
         "chunks": snapshot_chunks,
         "stable": stable,
         "server_wall_window": (
-            [window_start, window_end]
-            if window_start is not None
-            else None
+            [window_start, window_end] if window_start is not None else None
         ),
         "stream_high_watermarks": {
             stream: {
                 "last_sequence": values[0],
                 "last_server_wall_timestamp": values[1],
                 "record_count": values[2],
+                "accepted_count": streams.get(stream, {}).get("accepted_count"),
+                "written_count": streams.get(stream, {}).get("written_count"),
+                "durable_count": streams.get(stream, {}).get("durable_count"),
+                "accepted_high_watermark": streams.get(stream, {}).get(
+                    "accepted_high_watermark"
+                ),
+                "written_high_watermark": streams.get(stream, {}).get(
+                    "written_high_watermark"
+                ),
+                "durable_high_watermark": streams.get(stream, {}).get(
+                    "durable_high_watermark"
+                ),
+                "generation": streams.get(stream, {}).get("generation"),
+                "restart_count": streams.get(stream, {}).get("restart_count"),
             }
             for stream, values in stream_positions.items()
         },
-        # ``record_count`` is the complete durable prefix count.  The selected
+        "source_fences": manifest.get("source_fences", {}),
+        "source_complete": bool(manifest.get("source_complete", False)),
+        "close_failures": manifest.get("close_failures", {}),
+        # ``record_count`` is the complete durable prefix count. The selected
         # count is separate because a task-window snapshot may return only a
         # bounded subset to the collector.
         "record_count": total_record_count,
@@ -971,6 +1194,65 @@ def read_camera_spool_snapshot(
     }
     manifest["_snapshot"] = snapshot
     return manifest, records
+
+
+def read_camera_spool_status(
+    session: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Read the durable payload-free source status published by a camera."""
+    session_path = Path(session).resolve()
+    manifest_path = (
+        session_path / "manifest.json"
+        if (session_path / "manifest.json").exists()
+        else session_path / "manifest.inprogress.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("schema") not in {
+        _CAMERA_SPOOL_SCHEMA,
+        _LEGACY_CAMERA_SPOOL_SCHEMA,
+    }:
+        raise ValueError("unsupported camera spool status")
+    declared_hash = manifest.get("raw_manifest_hash", manifest.get("manifest_hash"))
+    if declared_hash is not None and _manifest_hash(manifest) != declared_hash:
+        raise ValueError("camera spool manifest hash mismatch")
+    streams = manifest.get("streams", {})
+    if not isinstance(streams, dict):
+        raise ValueError("camera spool status streams must be a mapping")
+    return {
+        "schema": "robo_collector.camera_spool_status.v1",
+        "session_id": str(
+            manifest.get("session_id")
+            or manifest.get("episode_id")
+            or session_path.name
+        ),
+        "status": manifest.get("status"),
+        "source_complete": bool(manifest.get("source_complete", False)),
+        "source_fences": manifest.get("source_fences", {}),
+        "close_failures": manifest.get("close_failures", {}),
+        "streams": {
+            str(name): {
+                key: stream.get(key)
+                for key in (
+                    "generation",
+                    "restart_count",
+                    "accepted_count",
+                    "written_count",
+                    "durable_count",
+                    "accepted_high_watermark",
+                    "written_high_watermark",
+                    "durable_high_watermark",
+                    "durable_chunks",
+                    "start_fence",
+                    "stop_fence",
+                    "source_complete",
+                    "close_reason",
+                    "close_error",
+                )
+            }
+            for name, stream in streams.items()
+            if isinstance(stream, dict)
+        },
+    }
 
 
 def _sha256_prefix(path: Path, size: int) -> str:
@@ -1048,7 +1330,9 @@ def _verify_snapshot_checksums(session_path: Path, manifest: dict[str, Any]) -> 
         try:
             path.relative_to(session_path)
         except ValueError as exc:
-            raise ValueError(f"camera spool checksum escapes session: {relative!r}") from exc
+            raise ValueError(
+                f"camera spool checksum escapes session: {relative!r}"
+            ) from exc
         if not path.is_file():
             raise ValueError(f"camera spool checksum file is missing: {relative!r}")
         actual_hash = _sha256_file(path)
@@ -1121,4 +1405,24 @@ def _positive_count(value: int) -> int:
     return value
 
 
-__all__ = ["RawSpool", "read_camera_spool_snapshot", "scan_camera_spools"]
+def _advance_high_watermark(current: int | None, candidate: Any) -> int | None:
+    if not isinstance(candidate, int) or isinstance(candidate, bool) or candidate < 0:
+        return current
+    return candidate if current is None else max(current, candidate)
+
+
+def _normalise_fence(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    event = value.get("event")
+    if event not in {"START", "STOP"}:
+        return None
+    return dict(value)
+
+
+__all__ = [
+    "RawSpool",
+    "read_camera_spool_snapshot",
+    "read_camera_spool_status",
+    "scan_camera_spools",
+]

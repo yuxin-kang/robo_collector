@@ -3,7 +3,7 @@
 <package format="3">
   <name>robo_collector</name>
   <version>0.1.0</version>
-  <description>Final LeRobot episode collector for Robo Collector.</description>
+  <description>Crash-safe Raw v1 and MCAP episode collector for Robo Collector.</description>
   <maintainer email="yuxin-kang@users.noreply.github.com">Yuxin Kang</maintainer>
   <license>MIT</license>
 
@@ -11,6 +11,8 @@
   <build_depend>ament_cmake_python</build_depend>
 
   <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>python3-av</exec_depend>
+  <exec_depend>python3-protobuf</exec_depend>
   <exec_depend>python3-pyarrow</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>rclpy</exec_depend>

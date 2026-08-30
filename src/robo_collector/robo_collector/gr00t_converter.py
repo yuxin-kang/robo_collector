@@ -13,6 +13,7 @@ from typing import Any
 
 from .conversion_provenance import (
     is_raw_episode,
+    is_mcap_episode,
     materialize_raw_source,
     reusable_conversion,
     validate_raw_source_ready,
@@ -101,7 +102,7 @@ def convert_dataset(
     if not source_dataset.is_dir():
         raise ConversionError(f"source dataset is not a directory: {source_dataset}")
 
-    if is_raw_episode(source_dataset):
+    if is_raw_episode(source_dataset) or is_mcap_episode(source_dataset):
         # Validate the current source before checking an existing output.  A
         # READY conversion must not be reused after raw QC moves to REVIEW or
         # REJECT.
@@ -121,7 +122,7 @@ def convert_dataset(
         info = _load_json(output_dataset / "meta/info.json")
         return ConversionResult(source_dataset, output_dataset, int(info["total_episodes"]), int(info["total_frames"]), action_source)
 
-    if is_raw_episode(source_dataset):
+    if is_raw_episode(source_dataset) or is_mcap_episode(source_dataset):
         temporary_root, materialized_dataset = materialize_raw_source(
             source_dataset,
             dest_root_path,

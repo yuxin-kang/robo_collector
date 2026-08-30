@@ -475,6 +475,24 @@ DISCARDED：用户或安全策略主动丢弃
 - LeRobot 从 Raw Episode 生成，输出 schema 尽量与现有数据兼容。
 - 通过回放和帧级对比测试后切换默认路径；首版不承诺崩溃后继续追加同一个 Episode。
 
+### 阶段 4：MCAP 运维工具和可重复回放
+
+- 提供 `mcap_tool info/doctor/recover/replay`，所有操作默认只读或写入新
+  recovery artifact；禁止原地覆盖 sealed MCAP。
+- `doctor` 以 manifest、checksum、source fence、session 和 terminal quality
+  为输入，任一缺失或损坏都 fail-closed。
+- `replay` 必须保持 source sequence、payload 和事件顺序，并输出可机器比较
+  的诊断结果；不能用补帧或重排掩盖 gap。
+
+### 阶段 5：shadow parity、迁移和部署验收
+
+- 对同一 Episode 同时运行 Raw-v1 与 MCAP shadow，比较 accepted frontier、
+  stream sequence、timestamp、选帧计数、source/config hash 及最终质量状态。
+- `migration` 和 `benchmark` 只产生诊断/报告，不得将本地测试或 benchmark
+  结果当作真实硬件吞吐、长时稳定性或 soak 证据。
+- `dual_write` 用于迁移证据，`mcap_first` 只有在 parity、故障注入、重连、
+  process-kill 和部署 soak 证据齐全后才能启用；默认仍是 `raw_v1`。
+
 ### 阶段 3：质量门和多格式派生
 
 - QC 结果参与 READY/REVIEW/REJECT 发布。

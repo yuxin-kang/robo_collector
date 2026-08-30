@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import math
-from pathlib import Path
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -26,7 +26,9 @@ except ImportError:  # pragma: no cover - hardware dependency
 
 
 def encode_jpeg_bgr(image_bgr: np.ndarray, quality: int) -> bytes:
-    ok, buffer = cv2.imencode(".jpg", image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    ok, buffer = cv2.imencode(
+        ".jpg", image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    )
     if not ok:
         raise RuntimeError("Failed to encode RGB image as JPEG")
     return buffer.tobytes()
@@ -177,14 +179,16 @@ class RealSenseReader:
         self._error = ""
         self.device_info: dict[str, str] = {}
         self._started = False
+        self._pipeline_stop_succeeded = False
 
     def start(self) -> None:
         if self.raw_spool is not None:
-            self.raw_spool.mark_restart()
+            self.raw_spool.mark_start()
         if self.depth_raw_spool is not None:
-            self.depth_raw_spool.mark_restart()
+            self.depth_raw_spool.mark_start()
         profile = self.pipeline.start(self.config)
         self._started = True
+        self._pipeline_stop_succeeded = False
         self.device_info = get_device_info(profile)
         self._thread = threading.Thread(
             target=self._run,
@@ -201,8 +205,10 @@ class RealSenseReader:
             # leave the reader alive while the server closes its raw spool.
             try:
                 self.pipeline.stop()
+                self._pipeline_stop_succeeded = True
             except Exception as exc:  # pragma: no cover - hardware/runtime path
                 stop_error = exc
+                self._pipeline_stop_succeeded = False
             finally:
                 self._started = False
         if self._thread is not None:
@@ -221,6 +227,11 @@ class RealSenseReader:
     def capture_thread_alive(self) -> bool:
         """Whether the producer thread still owns access to its raw spool."""
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def capture_stopped_cleanly(self) -> bool:
+        """Whether it is safe to publish the source STOP fence."""
+        return self._pipeline_stop_succeeded and not self.capture_thread_alive
 
     def latest(self) -> EncodedFrame | None:
         with self._lock:
@@ -256,11 +267,15 @@ class RealSenseReader:
                     else "unknown"
                 )
                 timestamp_quality = (
-                    "device" if device_timestamp_ms is not None else "host_after_capture"
+                    "device"
+                    if device_timestamp_ms is not None
+                    else "host_after_capture"
                 )
                 clock_domain = (
-                    f"realsense:{self.device_info.get('serial_number', self.spec.serial)}"
-                    if device_timestamp_ms is not None else "server_wall"
+                    "realsense:"
+                    f"{self.device_info.get('serial_number', self.spec.serial)}"
+                    if device_timestamp_ms is not None
+                    else "server_wall"
                 )
                 color_bgr = np.asanyarray(color_frame.get_data())
                 depth_png = None
@@ -281,7 +296,8 @@ class RealSenseReader:
                     device_sequence = sequence
                 producer_gap_count = (
                     max(0, device_sequence - previous_sequence - 1)
-                    if previous_sequence is not None and device_sequence > previous_sequence
+                    if previous_sequence is not None
+                    and device_sequence > previous_sequence
                     else 0
                 )
                 encoded = EncodedFrame(
@@ -297,40 +313,50 @@ class RealSenseReader:
                     producer_gap_count=producer_gap_count,
                 )
                 if self.raw_spool is not None:
-                    if not self.raw_spool.append({
-                        "stream": self.spec.stream,
-                        "session_id": self.raw_spool.session_id,
-                        "serial": self.spec.serial,
-                        "sequence": device_sequence,
-                        "payload": encoded.image_jpeg,
-                        "payload_encoding": "image/jpeg",
-                        "device_timestamp": device_timestamp_ms,
-                        "device_unit": "ms" if device_timestamp_ms is not None else None,
-                        "timestamp_domain": timestamp_domain,
-                        "server_wall_timestamp": server_wall_timestamp,
-                        "server_monotonic_timestamp": server_monotonic_timestamp,
-                        "clock_domain": clock_domain,
-                        "timestamp_quality": timestamp_quality,
-                        "producer_gap_count": producer_gap_count,
-                    }):
-                        raise RuntimeError(f"camera raw spool full for {self.spec.stream}")
+                    if not self.raw_spool.append(
+                        {
+                            "stream": self.spec.stream,
+                            "session_id": self.raw_spool.session_id,
+                            "serial": self.spec.serial,
+                            "sequence": device_sequence,
+                            "payload": encoded.image_jpeg,
+                            "payload_encoding": "image/jpeg",
+                            "device_timestamp": device_timestamp_ms,
+                            "device_unit": "ms"
+                            if device_timestamp_ms is not None
+                            else None,
+                            "timestamp_domain": timestamp_domain,
+                            "server_wall_timestamp": server_wall_timestamp,
+                            "server_monotonic_timestamp": server_monotonic_timestamp,
+                            "clock_domain": clock_domain,
+                            "timestamp_quality": timestamp_quality,
+                            "producer_gap_count": producer_gap_count,
+                        }
+                    ):
+                        raise RuntimeError(
+                            f"camera raw spool full for {self.spec.stream}"
+                        )
                 if self.depth_raw_spool is not None and depth_png is not None:
-                    if not self.depth_raw_spool.append({
-                        "stream": f"{self.spec.stream}_depth",
-                        "session_id": self.depth_raw_spool.session_id,
-                        "serial": self.spec.serial,
-                        "sequence": device_sequence,
-                        "payload": depth_png,
-                        "payload_encoding": "image/png",
-                        "device_timestamp": device_timestamp_ms,
-                        "device_unit": "ms" if device_timestamp_ms is not None else None,
-                        "timestamp_domain": timestamp_domain,
-                        "server_wall_timestamp": server_wall_timestamp,
-                        "server_monotonic_timestamp": server_monotonic_timestamp,
-                        "clock_domain": clock_domain,
-                        "timestamp_quality": timestamp_quality,
-                        "producer_gap_count": producer_gap_count,
-                    }):
+                    if not self.depth_raw_spool.append(
+                        {
+                            "stream": f"{self.spec.stream}_depth",
+                            "session_id": self.depth_raw_spool.session_id,
+                            "serial": self.spec.serial,
+                            "sequence": device_sequence,
+                            "payload": depth_png,
+                            "payload_encoding": "image/png",
+                            "device_timestamp": device_timestamp_ms,
+                            "device_unit": "ms"
+                            if device_timestamp_ms is not None
+                            else None,
+                            "timestamp_domain": timestamp_domain,
+                            "server_wall_timestamp": server_wall_timestamp,
+                            "server_monotonic_timestamp": server_monotonic_timestamp,
+                            "clock_domain": clock_domain,
+                            "timestamp_quality": timestamp_quality,
+                            "producer_gap_count": producer_gap_count,
+                        }
+                    ):
                         raise RuntimeError(
                             f"camera depth raw spool full for {self.spec.stream}"
                         )
@@ -385,8 +411,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Wire packet schema. v3 remains the deployment default; v4 is opt-in.",
     )
     parser.add_argument(
-        "--raw-spool-dir", default=None,
-        help="Optional camera-side durable raw spool directory (source_scope=camera_capture).",
+        "--raw-spool-dir",
+        default=None,
+        help=(
+            "Optional camera-side durable raw spool directory "
+            "(source_scope=camera_capture)."
+        ),
     )
     parser.add_argument(
         "--raw-spool-manifest-checkpoint-records",
@@ -422,9 +452,7 @@ def main():
 
     if args.raw_spool_dir:
         if args.raw_spool_manifest_checkpoint_records <= 0:
-            raise SystemExit(
-                "--raw-spool-manifest-checkpoint-records must be positive"
-            )
+            raise SystemExit("--raw-spool-manifest-checkpoint-records must be positive")
         if (
             not math.isfinite(args.raw_spool_manifest_checkpoint_sec)
             or args.raw_spool_manifest_checkpoint_sec < 0
@@ -460,25 +488,32 @@ def main():
             fps=args.fps,
             jpeg_quality=args.jpeg_quality,
             depth=args.depth,
-            raw_spool=(RawSpool(
-                Path(args.raw_spool_dir) / session_id,
-                stream=spec.stream,
-                session_id=session_id,
-                strict_records=True,
-                manifest_checkpoint_records=args.raw_spool_manifest_checkpoint_records,
-                manifest_checkpoint_interval_sec=args.raw_spool_manifest_checkpoint_sec,
-                durability_interval_sec=args.raw_spool_durability_interval_sec,
-            )
-                       if args.raw_spool_dir else None),
-            depth_raw_spool=(RawSpool(
-                Path(args.raw_spool_dir) / session_id,
-                stream=f"{spec.stream}_depth",
-                session_id=session_id,
-                strict_records=True,
-                manifest_checkpoint_records=args.raw_spool_manifest_checkpoint_records,
-                manifest_checkpoint_interval_sec=args.raw_spool_manifest_checkpoint_sec,
-                durability_interval_sec=args.raw_spool_durability_interval_sec,
-            ) if args.raw_spool_dir and args.depth else None),
+            raw_spool=(
+                RawSpool(
+                    Path(args.raw_spool_dir) / session_id,
+                    stream=spec.stream,
+                    session_id=session_id,
+                    strict_records=True,
+                    manifest_checkpoint_records=args.raw_spool_manifest_checkpoint_records,
+                    manifest_checkpoint_interval_sec=args.raw_spool_manifest_checkpoint_sec,
+                    durability_interval_sec=args.raw_spool_durability_interval_sec,
+                )
+                if args.raw_spool_dir
+                else None
+            ),
+            depth_raw_spool=(
+                RawSpool(
+                    Path(args.raw_spool_dir) / session_id,
+                    stream=f"{spec.stream}_depth",
+                    session_id=session_id,
+                    strict_records=True,
+                    manifest_checkpoint_records=args.raw_spool_manifest_checkpoint_records,
+                    manifest_checkpoint_interval_sec=args.raw_spool_manifest_checkpoint_sec,
+                    durability_interval_sec=args.raw_spool_durability_interval_sec,
+                )
+                if args.raw_spool_dir and args.depth
+                else None
+            ),
         )
         for spec in camera_specs
     ]
@@ -487,9 +522,28 @@ def main():
         for reader in readers:
             reader.start()
             started_readers.append(reader)
-    except Exception:
+    except Exception as startup_error:
         for reader in started_readers:
-            reader.stop()
+            try:
+                reader.stop()
+            except Exception as cleanup_error:
+                print(
+                    f"failed to stop reader {reader.spec.stream} after "
+                    f"startup error: {cleanup_error}"
+                )
+        for reader in readers:
+            for spool in (reader.raw_spool, reader.depth_raw_spool):
+                if spool is None:
+                    continue
+                try:
+                    spool.mark_close_failed(
+                        f"camera server startup failed: {startup_error}"
+                    )
+                except Exception as status_error:
+                    print(
+                        f"failed to persist startup failure for "
+                        f"{reader.spec.stream}: {status_error}"
+                    )
         raise
 
     context = zmq.Context()
@@ -566,13 +620,14 @@ def main():
                 )
                 publisher_gaps[stream] = max(
                     0,
-                    published_missing - min(
-                        published_missing, frame.producer_gap_count
-                    ),
+                    published_missing
+                    - min(published_missing, frame.producer_gap_count),
                 )
                 provenance[stream] = {
                     "device": frame.device_timestamp_ms,
-                    "device_unit": "ms" if frame.device_timestamp_ms is not None else None,
+                    "device_unit": "ms"
+                    if frame.device_timestamp_ms is not None
+                    else None,
                     "device_clock_domain": frame.clock_domain,
                     "device_timestamp_domain_type": frame.timestamp_domain,
                     "server_wall": frame.timestamp_sec,
@@ -669,11 +724,27 @@ def main():
                 message = f"failed to stop reader {reader.spec.stream}: {exc}"
                 shutdown_failures.append(message)
                 print(message)
-            # A pipeline-stop error is reportable, but it does not make the
-            # spool unsafe to close if the producer thread has nevertheless
-            # exited.  The thread-exit check is the actual ownership boundary.
-            if not reader.capture_thread_alive:
+            # Publish STOP only after both boundaries are proven: the SDK
+            # pipeline stopped successfully and the producer thread joined.
+            if reader.capture_stopped_cleanly:
                 stopped_readers.add(id(reader))
+            else:
+                failure = RuntimeError(
+                    "camera source STOP fence withheld because pipeline stop "
+                    "or reader join was not successful"
+                )
+                for spool in (reader.raw_spool, reader.depth_raw_spool):
+                    if spool is None:
+                        continue
+                    try:
+                        spool.mark_close_failed(failure)
+                    except Exception as exc:
+                        message = (
+                            f"failed to persist incomplete source status for "
+                            f"{reader.spec.stream}: {exc}"
+                        )
+                        shutdown_failures.append(message)
+                        print(message)
         for reader in readers:
             if id(reader) not in stopped_readers:
                 continue
@@ -686,6 +757,15 @@ def main():
                     )
                     shutdown_failures.append(message)
                     print(message)
+                    try:
+                        reader.raw_spool.mark_close_failed(exc)
+                    except Exception as status_exc:
+                        status_message = (
+                            f"failed to persist raw spool close failure for "
+                            f"{reader.spec.stream}: {status_exc}"
+                        )
+                        shutdown_failures.append(status_message)
+                        print(status_message)
             if reader.depth_raw_spool is not None:
                 try:
                     reader.depth_raw_spool.close(reason="process_stop")
@@ -696,10 +776,21 @@ def main():
                     )
                     shutdown_failures.append(message)
                     print(message)
+                    try:
+                        reader.depth_raw_spool.mark_close_failed(exc)
+                    except Exception as status_exc:
+                        status_message = (
+                            f"failed to persist depth spool close failure for "
+                            f"{reader.spec.stream}: {status_exc}"
+                        )
+                        shutdown_failures.append(status_message)
+                        print(status_message)
         socket.close(linger=0)
         context.term()
         if shutdown_failures:
-            raise RuntimeError("camera shutdown failed: " + "; ".join(shutdown_failures))
+            raise RuntimeError(
+                "camera shutdown failed: " + "; ".join(shutdown_failures)
+            )
 
 
 if __name__ == "__main__":

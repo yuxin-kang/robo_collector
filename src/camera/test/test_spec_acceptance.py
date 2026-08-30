@@ -1,6 +1,6 @@
 import json
-import threading
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,12 +70,14 @@ class CameraRawCaptureSpecAcceptanceTest(unittest.TestCase):
             final = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(final["streams"]["head"]["frame_count"], 1)
             self.assertIn("camera/head/chunk-000000.msgpack", final["checksums"])
-            self.assertEqual(list(spool.recover()), [{"payload": b"raw", "sequence": 0}])
+            self.assertEqual(
+                list(spool.recover()), [{"payload": b"raw", "sequence": 0}]
+            )
 
     def test_corrupt_manifest_is_fail_closed_and_quarantine_preserves_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            spool = RawSpool(root / "direct", stream="head")
+            RawSpool(root / "direct", stream="head")
             corrupt = root / "direct" / "manifest.inprogress.json"
             corrupt_bytes = b"{not-json"
             corrupt.write_bytes(corrupt_bytes)
@@ -167,8 +169,9 @@ class CameraRawCaptureSpecAcceptanceTest(unittest.TestCase):
             ):
                 record = dict(base)
                 record.pop(field)
-                with self.subTest(field=field), self.assertRaisesRegex(
-                    ValueError, message
+                with (
+                    self.subTest(field=field),
+                    self.assertRaisesRegex(ValueError, message),
                 ):
                     spool.append(record)
 
@@ -208,7 +211,9 @@ class CameraRawCaptureSpecAcceptanceTest(unittest.TestCase):
 
             reopened = RawSpool(directory, stream="head", max_records=4)
 
-            self.assertEqual(list(reopened.recover()), [{"payload": b"raw", "sequence": 7}])
+            self.assertEqual(
+                list(reopened.recover()), [{"payload": b"raw", "sequence": 7}]
+            )
             self.assertTrue(reopened.append({"payload": b"next", "sequence": 8}))
 
     def test_gap_classes_and_restart_counters_are_persisted_per_stream(self):
@@ -256,10 +261,12 @@ class CameraRawCaptureSpecAcceptanceTest(unittest.TestCase):
             recovered = scan_camera_spools(root)
 
             self.assertEqual(len(recovered), 1)
-            self.assertEqual(recovered[0]["status"], "RAW_CLOSED")
+            self.assertEqual(recovered[0]["status"], "RAW_INCOMPLETE")
+            self.assertFalse(recovered[0]["source_complete"])
+            self.assertIsNone(recovered[0]["streams"]["head"]["stop_fence"])
             self.assertEqual(
                 recovered[0]["termination"],
-                {"reason": "all_streams_closed"},
+                {"reason": "closed_without_source_stop"},
             )
 
             damaged = root / "session-damaged"
@@ -277,7 +284,9 @@ class CameraRawCaptureSpecAcceptanceTest(unittest.TestCase):
                 (damaged / "manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(damaged_manifest["status"], "QUARANTINED")
-            self.assertIn("corrupt non-final spool chunk", damaged_manifest["quarantine_error"])
+            self.assertIn(
+                "corrupt non-final spool chunk", damaged_manifest["quarantine_error"]
+            )
             self.assertFalse((damaged / "manifest.inprogress.json").exists())
 
     def test_corrupt_final_frame_is_quarantined_but_truncated_tail_is_repaired(self):
@@ -344,9 +353,7 @@ class CameraRawCaptureSpecAcceptanceTest(unittest.TestCase):
             manifest, records = read_camera_spool_snapshot(session)
 
             self.assertEqual(manifest["status"], "RAW_IN_PROGRESS")
-            self.assertEqual(
-                manifest["schema"], "robo_collector.camera_spool.v1"
-            )
+            self.assertEqual(manifest["schema"], "robo_collector.camera_spool.v1")
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["session_id"], manifest["session_id"])
             self.assertEqual(records[0]["payload"], b"jpeg")
@@ -422,7 +429,9 @@ class CameraRawCaptureSpecAcceptanceTest(unittest.TestCase):
             manifest, _ = read_camera_spool_snapshot(session)
 
             self.assertEqual(
-                manifest["_snapshot"]["stream_high_watermarks"]["head"]["last_sequence"],
+                manifest["_snapshot"]["stream_high_watermarks"]["head"][
+                    "last_sequence"
+                ],
                 7,
             )
 

@@ -1,0 +1,212 @@
+{
+  "checkpoint": {
+    "frame_hex": "c8010000000000007b2261636365707465645f736e617073686f745f636f756e74223a2230222c2261636365707465645f736e617073686f745f66726f6e74696572223a6e756c6c2c226368616e6e656c73223a5b5d2c22636865636b706f696e745f73657175656e6365223a2230222c2264757261626c655f627974655f6f6666736574223a2230222c2264757261626c655f636f756e74223a2230222c2264757261626c655f66726f6e74696572223a6e756c6c2c22666f726d6174223a22726f626f5f636f6c6c6563746f722e6d6361705f636865636b706f696e74222c22666f726d61745f76657273696f6e223a312c2267656e65726174696f6e223a2230222c226c616e64696e675f7072656669785f736861323536223a2265336230633434323938666331633134396166626634633839393666623932343237616534316534363439623933346361343935393931623738353262383535222c226d61785f756e73796e6365645f7265636f726473223a2230222c2271756575655f6361706163697479223a223634222c22736f757263655f66656e636573223a5b5d2c227772697474656e5f636f756e74223a2230222c227772697474656e5f66726f6e74696572223a6e756c6c7d70f7b287",
+    "name": "empty-open",
+    "payload": {
+      "accepted_snapshot_count": "0",
+      "accepted_snapshot_frontier": null,
+      "channels": [],
+      "checkpoint_sequence": "0",
+      "durable_byte_offset": "0",
+      "durable_count": "0",
+      "durable_frontier": null,
+      "format": "robo_collector.mcap_checkpoint",
+      "format_version": 1,
+      "generation": "0",
+      "landing_prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "max_unsynced_records": "0",
+      "queue_capacity": "64",
+      "source_fences": [],
+      "written_count": "0",
+      "written_frontier": null
+    },
+    "payload_crc32": "87b2f770",
+    "payload_sha256": "08faa5824b3f747e0b0023e89f819c4b2dcaba6e0300ad0249dd7f5e7b66cdf4"
+  },
+  "format": "robo_collector.mcap_contract_golden",
+  "format_version": 1,
+  "inprogress_manifest": {
+    "payload": {
+      "attempt": "1",
+      "collection_mode": "mcap_first",
+      "created_time_ns": "0",
+      "episode_id": "episode.phase0",
+      "format": "robo_collector.mcap_landing",
+      "format_version": 1,
+      "landing": {
+        "checkpoint_path": "landing/checkpoints.bin",
+        "partial_path": "landing/episode.mcap.partial",
+        "writer_profile": "robo_collector.mcap.v1"
+      },
+      "required_sources": [],
+      "state": "OPEN",
+      "writer": {
+        "mcap_library": "mcap",
+        "mcap_version": "1.4.0",
+        "profile": "robo_collector.mcap.v1"
+      }
+    },
+    "sha256": "0ff8b4c92a5f6c920c22a7ddde059fcb26fa4ebfc4f7fd4c10b0f81e943f133e"
+  },
+  "keyframe_arrow_schema": [
+    [
+      "stream_id",
+      "string",
+      false
+    ],
+    [
+      "source_session_id",
+      "string",
+      false
+    ],
+    [
+      "source_sequence",
+      "uint64",
+      false
+    ],
+    [
+      "normalized_time_ns",
+      "int64",
+      false
+    ],
+    [
+      "mcap_log_time",
+      "uint64",
+      false
+    ],
+    [
+      "message_sequence",
+      "uint32",
+      false
+    ],
+    [
+      "config_generation",
+      "uint32",
+      false
+    ],
+    [
+      "pts",
+      "int64",
+      false
+    ],
+    [
+      "timebase_num",
+      "uint32",
+      false
+    ],
+    [
+      "timebase_den",
+      "uint32",
+      false
+    ],
+    [
+      "codec_config_sha256",
+      "fixed_size_binary[32]",
+      false
+    ]
+  ],
+  "proto": {
+    "descriptor_sha256": "3a72c9a1465fe3c42fcd87d5874bca7476c7a1bb563c54f1545856473d553f07",
+    "descriptor_size_bytes": "7294",
+    "messages": {
+      "AlignedSampleV1": {
+        "full_hex": "1204686561641a0863616d6572612e30200128c80132210a0b726f626f742e73746174651207726f626f742e30180320c8012800300238013a0d7267625f616666696e655f76324803",
+        "minimal_hex": ""
+      },
+      "CameraSampleV1": {
+        "full_hex": "0a046865616410011802200228013001380142066162636465664a2b08c80110c80118c80120032a07636c6f636b2e3030034a13636f6c6c6563746f725f6469726563745f7631520863616d6572612e30620563616c2e31680a",
+        "minimal_hex": ""
+      },
+      "EpisodeEventV1": {
+        "full_hex": "10011a2b08c80110c80118c80120032a07636c6f636b2e3030034a13636f6c6c6563746f725f6469726563745f763122117b226576656e74223a227374617274227d280130003a170a0b63616d6572612e68656164120863616d6572612e30",
+        "minimal_hex": ""
+      },
+      "RobotActionV1": {
+        "full_hex": "0804100c1a2b08c80110c80118c80120032a07636c6f636b2e3030034a13636f6c6c6563746f725f6469726563745f76312207726f626f742e302a06706f6c696379321f0a06616374696f6e120261301a08000000000000e0bf22045c7830312a0131",
+        "minimal_hex": ""
+      },
+      "RobotStateV1": {
+        "full_hex": "0803100b1a2b08c80110c80118c80120032a07636c6f636b2e3030034a13636f6c6c6563746f725f6469726563745f76312207726f626f742e302a200a056a6f696e7412026a301a08000000000000f43f22045c7830312a03726164",
+        "minimal_hex": ""
+      },
+      "VideoAccessUnitV1": {
+        "full_hex": "0a04686561641001180a222b08c80110c80118c80120032a07636c6f636b2e3030034a13636f6c6c6563746f725f6469726563745f763128c80130c8013801408094ebdc0348045204686967685a03342e3162036366676a20e67d23e7820c49a8051dac2831f38290f5e72f66c8db5079eeb60d82f14894c0700182010863616d6572612e308a01026175900102980101",
+        "minimal_hex": ""
+      }
+    }
+  },
+  "publication": {
+    "allowed_status": "READY",
+    "denied_statuses": [
+      "REVIEW",
+      "REJECT",
+      "QUARANTINED"
+    ]
+  },
+  "qc_precedence": [
+    {
+      "conditions": [
+        "critical_fail",
+        "quarantined"
+      ],
+      "expected": "QUARANTINED"
+    },
+    {
+      "conditions": [
+        "critical_fail"
+      ],
+      "expected": "REJECT"
+    },
+    {
+      "conditions": [
+        "warning_fail"
+      ],
+      "expected": "REVIEW"
+    },
+    {
+      "conditions": [],
+      "expected": "READY"
+    },
+    {
+      "conditions": [
+        "info_fail"
+      ],
+      "expected": "READY"
+    }
+  ],
+  "stage_key": {
+    "config": {
+      "format": "robo_collector.stage_config",
+      "format_version": 1,
+      "max_checkpoint_payload_bytes": "1048576",
+      "max_record_content_bytes": "67108864",
+      "require_data_crc": true,
+      "require_summary": true,
+      "stage_name": "validate_landing",
+      "validation_profile": "landing_v1"
+    },
+    "config_sha256": "32e0664dc9f8fa9795268b332718b2433136775799a1143527d64cad00cef682",
+    "preimage": {
+      "config_sha256": "32e0664dc9f8fa9795268b332718b2433136775799a1143527d64cad00cef682",
+      "implementation_id": "robo-collector-1+tree-deadbeef",
+      "input_hashes": [
+        {
+          "name": "checkpoint_journal",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "name": "collection_manifest",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        {
+          "name": "landing_mcap",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      ],
+      "output_schema_version": "1",
+      "stage_name": "validate_landing",
+      "stage_version": "1"
+    },
+    "stage_key_sha256": "412b362d2ecbc239440799cba1461b29079ebaaeb5e096711795853db2f38a75"
+  }
+}

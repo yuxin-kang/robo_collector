@@ -18,13 +18,32 @@ PROVENANCE_SCHEMA = "robo_collector.conversion_provenance.v1"
 
 
 def is_raw_episode(path: Path) -> bool:
-    """Return whether ``path`` is a sealed Raw Episode rather than LeRobot data."""
+    """Return whether ``path`` is a sealed Raw v1 Episode."""
+    return (
+        (path / "manifest.json").is_file()
+        and not is_mcap_episode(path)
+        and not (path / "meta" / "info.json").is_file()
+    )
 
-    return (path / "manifest.json").is_file() and not (path / "meta" / "info.json").is_file()
+
+def is_mcap_episode(path: Path) -> bool:
+    """Return whether ``path`` is an explicit sealed MCAP landing manifest."""
+    try:
+        value = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(value, Mapping) and value.get("format") == "robo_collector.mcap_landing"
 
 
 def validate_raw_source_ready(source_episode: Path) -> Mapping[str, Any]:
     """Read and enforce the durable raw/QC gate used by every converter path."""
+    if is_mcap_episode(source_episode):
+        from .mcap_episode import McapEpisodeReader
+        reader = McapEpisodeReader(source_episode)
+        reader.validate()
+        if reader.manifest.get("status") not in {"RAW_CLOSED", "READY"}:
+            raise ValueError("MCAP source manifest is not publishable")
+        return reader.manifest
     try:
         manifest = json.loads(
             (source_episode / "manifest.json").read_text(encoding="utf-8")
@@ -82,9 +101,16 @@ def materialize_raw_source(
 ) -> tuple[Path, Path]:
     """Replay a Raw Episode into a temporary LeRobot dataset for conversion."""
 
-    manifest = validate_raw_source_ready(source_episode)
+    if is_mcap_episode(source_episode):
+        from .mcap_episode import McapEpisodeReader
+        reader = McapEpisodeReader(source_episode)
+        reader.validate()
+        manifest = reader.manifest
+        metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), Mapping) else {}
+    else:
+        manifest = validate_raw_source_ready(source_episode)
+        metadata = manifest.get("metadata")
 
-    metadata = manifest.get("metadata")
     metadata = metadata if isinstance(metadata, Mapping) else {}
     raw_fps = manifest.get("fps", metadata.get("fps", default_fps))
     try:
@@ -94,11 +120,10 @@ def materialize_raw_source(
     if fps <= 0:
         raise ValueError("raw source is missing a positive fps")
 
-    streams = [
-        path.name
-        for path in sorted((source_episode / "camera").iterdir())
-        if path.is_dir() and any(path.glob("*.raw"))
-    ] if (source_episode / "camera").is_dir() else []
+    if is_mcap_episode(source_episode):
+        streams = list(getattr(reader, "camera_streams", ()))
+    else:
+        streams = [path.name for path in sorted((source_episode / "camera").iterdir()) if path.is_dir() and any(path.glob("*.raw"))] if (source_episode / "camera").is_dir() else []
     if not streams:
         raise ValueError("raw source has no camera streams")
 
@@ -109,7 +134,10 @@ def materialize_raw_source(
         # job state relative to its input. Replay a private copy so even a
         # future materializer change cannot mutate the published raw source.
         ephemeral_source = temporary_root / "source"
-        shutil.copytree(source_episode, ephemeral_source)
+        if is_mcap_episode(source_episode):
+            ephemeral_source = source_episode
+        else:
+            shutil.copytree(source_episode, ephemeral_source)
         materialization_root = temporary_root / "materialized"
     except Exception:
         shutil.rmtree(temporary_root, ignore_errors=True)
@@ -225,6 +253,7 @@ def write_conversion_provenance(
         "source_manifest_hash": source["source_manifest_hash"],
         "source_manifest_hashes": source["source_manifest_hashes"],
         "source_manifest_type": source["source_manifest_type"],
+        "source_bundle_hash": source.get("source_bundle_hash"),
         "source_dataset": str(source_dataset),
         "converter_version": converter_version,
         "conversion_config_hash": config_hash,
@@ -279,22 +308,25 @@ def _source_provenance(source_dataset: Path) -> dict[str, Any]:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"cannot read raw source manifest: {source_dataset}") from exc
-        if not isinstance(manifest, Mapping) or not manifest.get("episode_id"):
-            raise ValueError("raw source manifest is missing episode_id")
+        if not isinstance(manifest, Mapping):
+            raise ValueError("raw source manifest must be an object")
+        identity = manifest.get("identity")
+        episode_id = manifest.get("episode_id") or (identity.get("episode_id") if isinstance(identity, Mapping) else None) or source_dataset.name
         source_hash = manifest.get("raw_manifest_hash", manifest.get("manifest_hash"))
         if not isinstance(source_hash, str) or not source_hash:
             source_hash = hashlib.sha256(
                 json.dumps(dict(manifest), sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
         return {
-            "source_episode_id": str(manifest["episode_id"]),
-            "source_episode_ids": [str(manifest["episode_id"])],
+            "source_episode_id": str(episode_id),
+            "source_episode_ids": [str(episode_id)],
             "source_manifest_hash": source_hash,
             "source_manifest_hashes": [source_hash],
-            "source_manifest_type": "raw_episode",
+            "source_manifest_type": ("mcap_manifest" if manifest.get("format") == "robo_collector.mcap_landing" else "raw_episode"),
+            "source_bundle_hash": (manifest.get("bundle_hash") or manifest.get("identity", {}).get("bundle_hash")) if isinstance(manifest.get("identity"), Mapping) else manifest.get("bundle_hash"),
             "raw_provenance": {},
             "episode_provenance": [{
-                "source_episode_id": str(manifest["episode_id"]),
+                "source_episode_id": str(episode_id),
                 "source_manifest_hash": source_hash,
             }],
         }
